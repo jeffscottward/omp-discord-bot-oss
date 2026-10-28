@@ -1,0 +1,10 @@
+[Unit]
+Description=FIRSTMATE in-progress sweep: one OMP session for idle tracker cards (idle.json from fm-autoclear R10)
+
+[Service]
+Type=oneshot
+Nice=10
+WorkingDirectory=@FM_DIR@
+Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=50min
+ExecStart=/usr/bin/flock -n %t/firstmate-sweep.lock @KIT@/bin/firstmate-sweep

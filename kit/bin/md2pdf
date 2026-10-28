@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# md2pdf <input.md> [output.pdf]
+# Owner preference 2026-10-15: reports for Discord/phone are PDFs (they open in the iOS viewer).
+# Needs bunx (bun) and Chrome/Chromium. Settings: CHROME_BIN (environment).
+# Markdown -> HTML (marked, GFM tables) -> PDF (headless Chrome, A4-ish phone-friendly layout).
+set -euo pipefail
+in=${1:?usage: md2pdf input.md [output.pdf]}
+out=${2:-${in%.*}.pdf}
+# Chrome/Chromium binary: $CHROME_BIN (kit.env), else the first one found on PATH.
+CHROME=${CHROME_BIN:-$(command -v google-chrome-stable || command -v chromium || command -v google-chrome || echo chromium)}
+tmp=$(mktemp -d /tmp/md2pdf.XXXXXX)
+trap 'rm -rf "$tmp"' EXIT
+title=$(grep -m1 '^# ' "$in" | sed 's/^# //' || basename "$in")
+body=$(bunx --bun marked@15 --gfm < "$in")
+cat > "$tmp/doc.html" <<EOF
+<!doctype html><html><head><meta charset="utf-8"><title>${title//</&lt;}</title>
+<style>
+ @page { size: A4; margin: 14mm 12mm; }
+ body { font-family: "Noto Sans", "DejaVu Sans", sans-serif; font-size: 10.5pt; line-height: 1.45; color: #1d1d1f; }
+ h1 { font-size: 18pt; border-bottom: 2px solid #5865f2; padding-bottom: 4px; }
+ h2 { font-size: 13.5pt; margin-top: 18px; color: #2b2d31; border-bottom: 1px solid #ddd; padding-bottom: 2px; }
+ h3 { font-size: 11.5pt; margin-top: 14px; }
+ table { border-collapse: collapse; width: 100%; font-size: 8.5pt; margin: 6px 0; }
+ th, td { border: 1px solid #ccc; padding: 3px 5px; text-align: left; vertical-align: top; word-break: break-word; }
+ th { background: #f0f1f5; }
+ tr:nth-child(even) td { background: #fafafa; }
+ code { font-family: "DejaVu Sans Mono", monospace; font-size: 8.8pt; background: #f2f2f2; padding: 0 3px; border-radius: 3px; }
+ ul { padding-left: 18px; } li { margin: 2px 0; }
+ h2, h3 { break-after: avoid; } tr { break-inside: avoid; }
+</style></head><body>
+$body
+</body></html>
+EOF
+"$CHROME" --headless=new --disable-gpu --no-pdf-header-footer \
+  --user-data-dir="$tmp/chrome" --print-to-pdf="$out" "file://$tmp/doc.html" >/dev/null 2>&1
+test -s "$out" && echo "$out"

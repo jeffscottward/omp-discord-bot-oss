@@ -1,0 +1,101 @@
+{
+  "//": "Copy to ~/.config/omp-discord/config.json (or set OMP_BOT_CONFIG). Discord: User Settings \u2192 Advanced \u2192 Developer Mode, then right-click \u2192 Copy ID. Keys that start with // are comments.",
+  "ownerId": "<YOUR_DISCORD_USER_ID>",
+  "guildId": "<YOUR_SERVER_ID>",
+  "//channels": "Text channels that start agent runs: channel id \u2192 name and working folder.",
+  "channels": {
+    "<GENERAL_CHANNEL_ID>": {
+      "name": "general",
+      "cwd": "~/Github"
+    }
+  },
+  "//alertChannels": "Post-only channels (the loopback /post endpoint can write there; messages never start runs).",
+  "alertChannels": {
+    "<OMP_ALERTS_CHANNEL_ID>": {
+      "name": "omp-alerts"
+    },
+    "<VOICE_TRANSCRIPT_CHANNEL_ID>": {
+      "name": "voice-transcript"
+    },
+    "<LONG_RUNNING_JOBS_CHANNEL_ID>": {
+      "name": "long-running-jobs"
+    },
+    "<NEEDS_YOU_CHANNEL_ID>": {
+      "name": "needs-you"
+    }
+  },
+  "alertsChannelId": "<OMP_ALERTS_CHANNEL_ID>",
+  "//firstmateChannelId": "Channel of the main coordinating session (FIRSTMATE). Usually a mirrored Herdr channel; spoken turns and Shortcut prompts go here.",
+  "firstmateChannelId": "<FIRSTMATE_CHANNEL_ID>",
+  "voiceChannelId": "<VOICE_CHANNEL_ID>",
+  "voiceTranscriptChannelId": "<VOICE_TRANSCRIPT_CHANNEL_ID>",
+  "longJobsChannelId": "<LONG_RUNNING_JOBS_CHANNEL_ID>",
+  "//needsYouChannelId": "Optional post-only channel that keeps one live \u270d\ufe0f Needs you board (FIRSTMATE cards waiting on the owner) as its last message. Also list it in alertChannels. Empty: off.",
+  "needsYouChannelId": "",
+  "radioChannelId": "",
+  "//localModelChannelId": "Optional channel whose owner messages go only to a local llama.cpp model (src/localmodel.ts). Empty: off.",
+  "localModelChannelId": "",
+  "//localOmpChannelId": "Optional channel whose owner messages run one OMP turn with the local model and tools (src/localomp.ts). Empty: off.",
+  "localOmpChannelId": "",
+  "//localOmpTools": "Tools for that channel. Default read,grep,glob,write,edit (writes only in ~/discord-scratch/local-omp). Add ,bash to allow commands; they still run in the bwrap sandbox.",
+  "localOmpTools": "read,grep,glob,write,edit",
+  "//localOmpChannelIds": "More local-omp channels (same handler, own session and work dir each). localOmpChannelId is always included.",
+  "localOmpChannelIds": [],
+  "//mirror": "Herdr tab \u2194 Discord channel mirror. Empty local category turns mirroring off. peers: an optional second machine reached over ssh (alias from ~/.ssh/config).",
+  "mirror": {
+    "categories": {
+      "local": "<THIS_MACHINE_CATEGORY_ID>",
+      "peer": "",
+      "archive": "<ARCHIVE_CATEGORY_ID>"
+    },
+    "archives": [],
+    "//overflow": "More category ids for this machine's live pane channels, used in order when the local category holds 50 channels.",
+    "overflow": [],
+    "peers": []
+  },
+  "//dashboardUrl": "FIRSTMATE dashboard base URL that your phone can open, e.g. https://<host>.<tailnet>.ts.net/reports/firstmate/ . Empty: replies carry no dashboard link.",
+  "dashboardUrl": "",
+  "//fmDir": "Dashboard folder (items.json + web files). Must match FM_DIR in ~/.config/omp-discord/kit.env.",
+  "fmDir": "~/.local/share/omp-discord/reports-web/firstmate",
+  "hostLabel": "my-pc",
+  "workingEmoji": "\u2699\ufe0f",
+  "//heeler": "Optional: HEELER iOS app links. redirect = your deployed heeler-link worker (https://\u2026/open). Empty: no buttons.",
+  "heeler": {
+    "host": "",
+    "redirect": ""
+  },
+  "//optionalCommands": "Owner-specific slash commands; leave empty unless you have the matching hardware/accounts: rgb, nest, blinds, positions, newsletter, stream, second.",
+  "optionalCommands": [],
+  "features": {
+    "newsletterLogin": false
+  },
+  "timeLimitContinueChannelIds": [],
+  "//router": "FIRSTMATE fan-out router (src/router.ts): owner messages in the FIRSTMATE channel go to a domain stack thread (rules, then the JEV judge). channelIds: topic channels whose jobs carry that stack's tag. Omit the key for the defaults (on, 4 stacks in parallel).",
+  "router": {
+    "enabled": true,
+    "maxParallelStacks": 4,
+    "judgeMinConfidence": 0.6,
+    "judgeTimeoutMs": 4000,
+    "fallback": "firstmate",
+    "stacks": [
+      {
+        "name": "finance",
+        "channelIds": [
+          "<TRADING_CHANNEL_ID>"
+        ]
+      },
+      {
+        "name": "realestate",
+        "channelIds": [
+          "<CLIENT_CHANNEL_ID>"
+        ]
+      },
+      {
+        "name": "infra",
+        "channelIds": [
+          "<DEV_CHANNEL_ID>"
+        ]
+      }
+    ]
+  }
+}

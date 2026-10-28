@@ -1,0 +1,68 @@
+{
+  "ownerId": "100000000000000001",
+  "guildId": "100000000000000002",
+  "channels": {
+    "100000000000000003": {
+      "name": "general",
+      "cwd": "~/Github"
+    },
+    "100000000000000004": {
+      "name": "clientco",
+      "cwd": "~/Github/realestate"
+    },
+    "100000000000000005": {
+      "name": "finance",
+      "cwd": "~/Github/finance"
+    },
+    "100000000000000006": {
+      "name": "dev",
+      "cwd": "~/Github"
+    }
+  },
+  "alertChannels": {
+    "100000000000000007": {
+      "name": "omp-alerts"
+    },
+    "100000000000000008": {
+      "name": "voice-transcript"
+    },
+    "100000000000000009": {
+      "name": "long-running-jobs"
+    },
+    "100000000000000010": {
+      "name": "debates"
+    }
+  },
+  "alertsChannelId": "100000000000000007",
+  "firstmateChannelId": "100000000000000011",
+  "voiceChannelId": "100000000000000012",
+  "voiceTranscriptChannelId": "100000000000000008",
+  "longJobsChannelId": "100000000000000009",
+  "radioChannelId": "100000000000000013",
+  "mirror": {
+    "categories": {
+      "local": "100000000000000014",
+      "peer": "100000000000000015",
+      "archive": "100000000000000016"
+    },
+    "peers": [
+      {
+        "machine": "second",
+        "ssh": "peer-host",
+        "herdr": "~/.local/bin/herdr"
+      }
+    ]
+  },
+  "dashboardUrl": "https://dashboard.example.ts.net/reports/firstmate/",
+  "hostLabel": "test-host",
+  "heeler": {
+    "host": "test-host",
+    "redirect": "https://heeler.example.com/open"
+  },
+  "optionalCommands": [],
+  "sandbox": {
+    "denyIps": [
+      "1.2.3.4"
+    ]
+  }
+}

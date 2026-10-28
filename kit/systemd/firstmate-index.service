@@ -1,0 +1,6 @@
+[Unit]
+Description=FIRSTMATE dashboard index (reports.json + changes.json)
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/bin/env python3 @KIT@/dashboard/build-index.py

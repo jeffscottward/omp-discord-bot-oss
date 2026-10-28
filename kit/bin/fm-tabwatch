@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""fm-tabwatch: close finished fm-spawn tabs; alert on tab and sign-in pile-ups (card auth-loop-guard, owner 2026-10-19).
+Run every 2 min by fm-tabwatch.timer. Usage: fm-tabwatch [--dry-run] [--list-closable [--json]] [--test]
+
+T1 close a finished tab. Only tabs that fm-spawn made (~/.local/state/fm-spawn/spawned.jsonl, older ones from the
+   "spawned" lines of fm-spawn.log). The tab closes only when ALL of these hold:
+   - its card has a done or failed worker receipt (firstmate/receipts/<card>.json) written after the spawn;
+   - the card is not running/waiting/open/blocked (fm-autoclear has applied the receipt), and no OTHER card that
+     is not done names the tab or one of its panes in `job`;
+   - the tab still has its spawn label, is not the workspace's active tab, and no pane in it is focused;
+   - the spawn's root pane is in the tab and is idle: no OMP spinner in its title, Herdr status not working/blocked,
+     and its OMP session's last message entry is a final assistant reply (stopReason "stop"), with no session
+     write for 3 min (or OMP has exited and the pane is a plain shell);
+   - every other pane is the idle "Terminal" layout pane (.bashrc): its foreground process is its own shell.
+   Then `herdr tab close <tab>`, and the card note gets "🧹 tab closed (<label>, HH:MM)" (fm, FM_AUTO).
+   Never closes the owner's own tabs, a tab with a sign-in pane or any other extra pane, a tab of a live card, or a
+   tab of a finance card or time gate (fm-autoclear's finance() rule).
+A1 alert once in the alerts channel (OMP_NOTIFY sender, default fm-notify) when a Herdr workspace has more than 25 tabs; re-armed at <= 22.
+A2 alert once when more than 3 sign-in panes were opened within 15 min: auth-pane "opened" events plus panes
+   this watcher sees running a `login` command or labeled 🔐/sign-in/login; re-armed when the count is <= 3.
+--list-closable: tabs T1 would close now, plus tabs that only look finished (Herdr status done, not focused;
+   not FIRSTMATE): those need a human or FIRSTMATE check. fm-spawn uses --list-closable --json when it refuses.
+Log: $FM_DIR/tabwatch.log (settings: ~/.config/omp-discord/kit.env). State: ~/.local/state/fm-tabwatch/state.json.
+Env (tests): FM_TABWATCH_HERDR, FM_TABWATCH_FM, FM_TABWATCH_NOTIFY_CMD (JSON argv), FM_TABWATCH_HERE (firstmate dir),
+FM_TABWATCH_SPAWN_STATE, FM_TABWATCH_AUTH_STATE, FM_TABWATCH_STATE, FM_TABWATCH_QUIET_S.
+"""
+import json, os, re, subprocess, sys, tempfile, time
+
+
+def _kit_env():
+    """Read the kit settings file (KEY=VALUE lines; the shell kit scripts read the same file).
+    File: $OMP_KIT_ENV, else ~/.config/omp-discord/kit.env. A variable that is already set in the environment wins."""
+    path = os.environ.get("OMP_KIT_ENV") or os.path.expanduser("~/.config/omp-discord/kit.env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or line.startswith("#") or not key.isidentifier() or key in os.environ:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] == "'":
+            val = val[1:-1]
+        else:
+            if len(val) >= 2 and val[0] == val[-1] == '"':
+                val = val[1:-1]
+            val = os.path.expanduser(os.path.expandvars(val))
+        os.environ[key] = val
+
+
+_kit_env()
+
+
+def _herdr_bin():
+    """Herdr CLI: $HERDR_BIN, else ~/.local/bin/herdr, else herdr on PATH."""
+    import shutil
+    own = os.path.expanduser("~/.local/bin/herdr")
+    return os.environ.get("HERDR_BIN") or (own if os.access(own, os.X_OK) else (shutil.which("herdr") or "herdr"))
+
+
+def _notify_cmd():
+    """Alert sender argv (same arguments as fm-notify: --kind, --summary, --action): $OMP_NOTIFY (a command line),
+    else fm-notify next to this script (posts to $FM_ALERTS_CHANNEL through the bot's loopback /post)."""
+    import shlex
+    if os.environ.get("OMP_NOTIFY"):
+        return shlex.split(os.environ["OMP_NOTIFY"])
+    return [os.path.join(os.path.dirname(os.path.realpath(__file__)), "fm-notify")]
+
+HOME = os.path.expanduser("~")
+HERDR = os.environ.get("FM_TABWATCH_HERDR") or _herdr_bin()
+FM = os.environ.get("FM_TABWATCH_FM") or os.environ.get("FM_BIN") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "fm")
+NOTIFY_CMD = json.loads(os.environ["FM_TABWATCH_NOTIFY_CMD"]) if os.environ.get("FM_TABWATCH_NOTIFY_CMD") else _notify_cmd()
+_WEB = os.environ.get("REPORTS_WEB_DIR") or os.path.join(HOME, ".local/share/omp-discord/reports-web")
+HERE = os.environ.get("FM_TABWATCH_HERE") or os.environ.get("FM_DIR") or os.path.join(_WEB, "firstmate")
+SPAWN_STATE = os.environ.get("FM_TABWATCH_SPAWN_STATE") or os.path.join(HOME, ".local/state/fm-spawn")
+AUTH_STATE = os.environ.get("FM_TABWATCH_AUTH_STATE") or os.path.join(HOME, ".local/state/auth-pane")
+STATE = os.environ.get("FM_TABWATCH_STATE") or os.path.join(HOME, ".local/state/fm-tabwatch")
+ITEMS = os.path.join(HERE, "items.json")
+RECEIPTS = os.path.join(HERE, "receipts")
+LOG = os.path.join(HERE, "tabwatch.log")
+QUIET_S = int(os.environ.get("FM_TABWATCH_QUIET_S") or 180)
+TABS_ALERT, TABS_REARM = 25, 22
+SIGNIN_ALERT, SIGNIN_WINDOW_S = 3, 15 * 60
+LIVE = {"running", "waiting", "open", "blocked"}
+# Same rule as fm-autoclear: cards in these areas / with these title words, and time gates, are never touched.
+SKIP_AREAS = {x.strip().lower() for x in (os.environ.get("FM_SKIP_AREAS") or "finance").split(",") if x.strip()}
+SKIP_WORDS = re.compile(r"\b(" + (os.environ.get("FM_SKIP_WORDS") or "order|trade|finance") + r")\b", re.I)
+SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
+SPINNER = re.compile("[\u2801-\u28ff]")  # OMP's braille spinner in the terminal title while it works
+SIGNIN_LABEL = re.compile(r"🔐|sign[- ]?in|\blog ?in\b", re.I)
+LEGACY = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) spawned (.+): tab (\S+) pane (\S+) cwd (.+) card (\S+)$")
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def read_json(p, default=None):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(p, data):
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".tmp-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, p)
+
+
+def log(line, dry):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {'DRY ' if dry else ''}{line}"
+    print(line)
+    if not dry:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+
+
+def herdr(*args):
+    try:
+        r = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=30)
+        return json.loads(r.stdout) if r.stdout.strip() else {}
+    except Exception:
+        return {}
+
+
+# ---------- facts ----------
+
+def spawns():
+    """fm-spawn tabs: spawned.jsonl entries, plus older ones from fm-spawn.log (before the registry existed)."""
+    out, seen = [], set()
+    try:
+        for l in open(os.path.join(SPAWN_STATE, "spawned.jsonl")):
+            try:
+                e = json.loads(l)
+            except ValueError:
+                continue
+            if e.get("tab") and e.get("pane"):
+                out.append(e)
+                seen.add((e["tab"], e["pane"]))
+    except OSError:
+        pass
+    try:
+        for l in open(os.path.join(SPAWN_STATE, "fm-spawn.log")):
+            m = LEGACY.match(l.rstrip("\n"))
+            if m and (m.group(3), m.group(4)) not in seen:
+                ms = int(time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")) * 1000)
+                out.append({"tsMs": ms, "label": m.group(2), "tab": m.group(3), "pane": m.group(4),
+                            "card": None if m.group(6) == "-" else m.group(6), "legacy": True})
+                seen.add((m.group(3), m.group(4)))
+    except OSError:
+        pass
+    return out
+
+
+def session_final(path):
+    """(final, quiet_s): final = the last message entry is an assistant reply that ended the turn (stopReason stop)."""
+    try:
+        st = os.stat(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, st.st_size - 512_000))
+            tail = f.read().decode(errors="replace")
+    except OSError:
+        return False, 0
+    quiet = time.time() - st.st_mtime
+    if not tail.endswith("\n"):
+        return False, quiet
+    for l in reversed([x for x in tail.split("\n") if x.strip()]):
+        try:
+            e = json.loads(l)
+        except ValueError:
+            return False, quiet  # cut first line of the tail, or a broken entry: not provably final
+        if e.get("type") != "message" or not isinstance(e.get("message"), dict):
+            continue
+        m = e["message"]
+        return m.get("role") == "assistant" and m.get("stopReason") == "stop", quiet
+    return False, quiet
+
+
+def fg_procs(pane):
+    pi = herdr("pane", "process-info", "--pane", pane).get("result", {}).get("process_info") or {}
+    return pi, pi.get("foreground_processes") or []
+
+
+def plain_shell(pane):
+    pi, fg = fg_procs(pane)
+    return bool(fg) and all(p.get("name") in SHELLS and p.get("pid") == pi.get("shell_pid") for p in fg)
+
+
+def norm(s):
+    return (s or "").strip().lower()
+
+
+def finance(it):
+    """fm-autoclear's finance() rule: finance cards and time gates are never touched (no tab close, no note)."""
+    if it.get("until") or str(it.get("id", "")).startswith("gate-"):
+        return True
+    return str(it.get("area", "")).lower() in SKIP_AREAS or bool(SKIP_WORDS.search(it.get("t", "")))
+
+
+def job_refs(it):
+    j = it.get("job")
+    return {norm(x) for x in (j if isinstance(j, list) else str(j or "").split(",")) if norm(x)}
+
+
+# ---------- T1 ----------
+
+def check_tab(sp, tab, tab_panes, ws_active, items, receipt):
+    """(close?, reason) for one fm-spawn tab. Pure apart from session-file and process-info reads."""
+    card = sp.get("card")
+    if not card:
+        return False, "no card"
+    rec = receipt(card)
+    if not rec or rec.get("result") not in ("done", "failed"):
+        return False, f"no done/failed receipt for {card}"
+    if (rec.get("tsMs") or 0) <= (sp.get("tsMs") or 0):
+        return False, "receipt is older than this spawn"
+    it = next((i for i in items if i.get("id") == card), None)
+    if it and finance(it):
+        return False, f"finance card {card}: never touched"
+    if it and it.get("s") in LIVE:
+        return False, f"card {card} is {it.get('s')}"
+    refs = {norm(tab["tab_id"]), norm(tab.get("label"))} | {norm(p["pane_id"]) for p in tab_panes}
+    other = [i.get("id") for i in items if i.get("id") != card and (i.get("s") != "done" or finance(i)) and job_refs(i) & refs]
+    if other:
+        return False, f"live card(s) {', '.join(map(str, other[:3]))} name this tab in job"
+    if norm(tab.get("label")) != norm(sp.get("label")):
+        return False, "tab label changed since the spawn"
+    if tab.get("focused") or tab["tab_id"] == ws_active or any(p.get("focused") for p in tab_panes):
+        return False, "focused or active tab"
+    root = next((p for p in tab_panes if p["pane_id"] == sp["pane"]), None)
+    if not root:
+        return False, f"root pane {sp['pane']} not in the tab"
+    for p in tab_panes:
+        if p is root:
+            continue
+        if p.get("label") != "Terminal" or p.get("agent") or not plain_shell(p["pane_id"]):
+            return False, f"extra pane {p['pane_id']} ({p.get('label') or 'no label'}) is not an idle Terminal pane"
+    if root.get("agent_status") in ("working", "blocked") or SPINNER.search(root.get("terminal_title") or ""):
+        return False, "OMP is working (status or spinner)"
+    sess = (root.get("agent_session") or {}).get("value") if (root.get("agent_session") or {}).get("kind") == "path" else None
+    if root.get("agent") == "omp" or sess:
+        if not sess:
+            return False, "no OMP session file for the root pane"
+        final, quiet = session_final(sess)
+        if not final:
+            return False, "OMP session does not end with a final reply"
+        if quiet < QUIET_S:
+            return False, f"OMP session written {int(quiet)} s ago (< {QUIET_S} s)"
+    elif not plain_shell(root["pane_id"]):
+        return False, "root pane runs something other than OMP or a shell"
+    return True, f"receipt {rec.get('result')} for {card}; panes idle"
+
+
+def real_receipt(card):
+    if not card or "/" in card:
+        return None
+    return read_json(os.path.join(RECEIPTS, card + ".json"))
+
+
+def snapshot():
+    """(workspaces, tabs, panes), or ([], [], []) when ANY Herdr read failed (socket hiccup, server restart): a partial
+    view must not close tabs, re-arm alerts (0 tabs) or reset sign-in first-seen state."""
+    wl = herdr("workspace", "list")
+    pl = herdr("pane", "list")
+    if "workspaces" not in wl.get("result", {}) or "panes" not in pl.get("result", {}):
+        return [], [], []
+    ws, tabs = wl["result"]["workspaces"] or [], []
+    for w in ws:
+        tl = herdr("tab", "list", "--workspace", w["workspace_id"])
+        if "tabs" not in tl.get("result", {}):
+            return [], [], []
+        tabs += tl["result"]["tabs"] or []
+    return ws, tabs, pl["result"]["panes"] or []
+
+
+def evaluate(ws, tabs, panes, items):
+    """[(spawn, tab, close?, reason)] for every live fm-spawn tab (newest spawn per tab)."""
+    by_tab = {t["tab_id"]: t for t in tabs}
+    active = {w["workspace_id"]: w.get("active_tab_id") for w in ws}
+    latest = {}
+    for sp in spawns():
+        if sp["tab"] in by_tab and (sp["tab"] not in latest or sp.get("tsMs", 0) > latest[sp["tab"]].get("tsMs", 0)):
+            latest[sp["tab"]] = sp
+    out = []
+    for tid, sp in latest.items():
+        tab = by_tab[tid]
+        tp = [p for p in panes if p.get("tab_id") == tid]
+        try:
+            ok, why = check_tab(sp, tab, tp, active.get(tab.get("workspace_id")), items, real_receipt)
+        except Exception as e:
+            ok, why = False, f"check failed: {e}"
+        out.append((sp, tab, ok, why))
+    return out
+
+
+def looks_finished(tab, tab_panes, ws_active):
+    if tab.get("focused") or tab["tab_id"] == ws_active or any(p.get("focused") for p in tab_panes):
+        return False
+    if norm(tab.get("label")) == "firstmate":
+        return False
+    if any(p.get("agent_status") in ("working", "blocked") or SPINNER.search(p.get("terminal_title") or "") for p in tab_panes):
+        return False
+    return tab.get("agent_status") == "done"  # "idle" tabs are often the owner's own long-lived tabs: never suggested
+
+
+def closable(ws, tabs, panes, items):
+    ev = evaluate(ws, tabs, panes, items)
+    sure = [{"tab": t["tab_id"], "label": t.get("label"), "card": sp.get("card"), "why": why} for sp, t, ok, why in ev if ok]
+    sure_ids = {x["tab"] for x in sure}
+    active = {w["workspace_id"]: w.get("active_tab_id") for w in ws}
+    maybe = [{"tab": t["tab_id"], "label": t.get("label"), "status": t.get("agent_status")} for t in tabs
+             if t["tab_id"] not in sure_ids and looks_finished(t, [p for p in panes if p.get("tab_id") == t["tab_id"]], active.get(t.get("workspace_id")))]
+    return ev, sure, maybe
+
+
+# ---------- alerts ----------
+
+def notify(summary, action, dry):
+    if dry:
+        print(f"DRY alert: {summary} | {action}")
+        return True
+    try:
+        r = subprocess.run([*NOTIFY_CMD, "--kind", "error", "--summary", summary[:240], "--action", action[:240]],
+                           capture_output=True, text=True, timeout=40)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def signin_panes(panes):
+    """Pane ids that look like sign-in panes now: label/title, or a foreground `... login` command (non-OMP panes)."""
+    hits = {}
+    for p in panes:
+        if p.get("agent") == "omp":
+            continue
+        lbl = f"{p.get('label') or ''} {p.get('terminal_title') or ''}"
+        if SIGNIN_LABEL.search(p.get("label") or ""):
+            hits[p["pane_id"]] = (p.get("label") or "")[:40]
+            continue
+        _, fg = fg_procs(p["pane_id"])
+        for f in fg:
+            cmd = " ".join(f.get("argv") or [f.get("cmdline") or ""])
+            if f.get("name") not in SHELLS and re.search(r"(^|\s)login(\s|$)", cmd):
+                hits[p["pane_id"]] = (" ".join((f.get("argv") or [])[:3]) or lbl)[:40]
+                break
+    return hits
+
+
+def alerts(ws, tabs, panes, items, sure, maybe, dry):
+    st = read_json(os.path.join(STATE, "state.json"), None)
+    first = st is None
+    st = st or {}
+    tabs_alerted = st.setdefault("tabsAlerted", {})
+    for w in ws:
+        n = sum(1 for t in tabs if t.get("workspace_id") == w["workspace_id"]) or w.get("tab_count", 0)
+        wid = w["workspace_id"]
+        if n > TABS_ALERT and not tabs_alerted.get(wid):
+            auto = [x["label"] for x in sure if x["tab"].startswith(wid + ":")]
+            look = [x["label"] for x in maybe if x["tab"].startswith(wid + ":")]
+            summary = (f"Herdr workspace {w.get('label') or wid} has {n} tabs (> {TABS_ALERT}). "
+                       f"{len(auto)} finished fm-spawn tab(s) close automatically; {len(look)} more look finished.")
+            action = ("Close finished tabs (list: fm-tabwatch --list-closable): " + ", ".join(look[:6]))[:240] if look else \
+                "Check the workspace for tabs to close. fm-spawn refuses new jobs above 30 tabs."
+            if notify(summary, action, dry):
+                tabs_alerted[wid] = now_ms()
+                log(f"A1 alert: {summary}", dry)
+        elif n <= TABS_REARM and tabs_alerted.get(wid):
+            tabs_alerted.pop(wid)
+            log(f"A1 re-armed: {wid} has {n} tabs", dry)
+    # A2 sign-in panes
+    seen = st.setdefault("signinSeen", {})
+    cur = signin_panes(panes)
+    for pid, what in cur.items():
+        if pid not in seen:
+            seen[pid] = {"ms": 0 if first else now_ms(), "what": what}
+    cutoff = now_ms() - SIGNIN_WINDOW_S * 1000
+    recent = {pid: v["what"] for pid, v in seen.items() if v["ms"] >= cutoff}
+    try:
+        for l in open(os.path.join(AUTH_STATE, "events.jsonl")):
+            try:
+                e = json.loads(l)
+            except ValueError:
+                continue
+            if e.get("event") == "opened" and e.get("tsMs", 0) >= cutoff:
+                recent.setdefault(e.get("pane") or f"auth:{e.get('attempt')}", e.get("op") or "?")
+    except OSError:
+        pass
+    for pid in [p for p, v in seen.items() if v["ms"] and v["ms"] < now_ms() - 86400_000]:
+        seen.pop(pid)
+    if len(recent) > SIGNIN_ALERT and not st.get("signinAlerted"):
+        whats = sorted(set(recent.values()))
+        summary = f"Sign-in loop? {len(recent)} sign-in panes opened in 15 min ({', '.join(whats[:4])})."
+        action = ("Check the jobs that opened them; give the job a non-browser credential or stop it. "
+                  "auth-pane allows 2 attempts per login per hour.")
+        if notify(summary, action, dry):
+            st["signinAlerted"] = now_ms()
+            log(f"A2 alert: {summary} panes {', '.join(sorted(recent))[:200]}", dry)
+    elif len(recent) <= SIGNIN_ALERT and st.get("signinAlerted"):
+        st.pop("signinAlerted")
+        log("A2 re-armed", dry)
+    if not dry:
+        write_json(os.path.join(STATE, "state.json"), st)
+
+
+# ---------- main ----------
+
+def close_tab(sp, tab, why, dry):
+    log(f"T1 close {tab['tab_id']} ({tab.get('label')}) card {sp.get('card')}: {why}", dry)
+    if dry:
+        return
+    herdr("tab", "close", tab["tab_id"])
+    gone, deadline = False, time.time() + 10
+    while not gone and time.time() < deadline:  # Herdr removes the tab after its panes exit (not instantly)
+        time.sleep(0.5)
+        tl = herdr("tab", "list", "--workspace", tab.get("workspace_id") or tab["tab_id"].split(":")[0])
+        gone = "result" in tl and not any(t.get("tab_id") == tab["tab_id"] for t in tl["result"].get("tabs") or [])
+    if not gone:
+        log(f"T1 FAILED: tab {tab['tab_id']} still exists 10 s after close", dry)
+        return
+    card = sp.get("card")
+    it = json.loads(subprocess.run([FM, "get", card], capture_output=True, text=True).stdout or "null") if card else None
+    if it and "🧹 tab closed" not in (it.get("n") or ""):
+        note = f"{(it.get('n') or '').rstrip()} 🧹 tab closed ({tab.get('label')}, {time.strftime('%H:%M')})".strip()
+        r = subprocess.run([FM, "set", card, it["s"], note], capture_output=True, text=True,
+                           env={**os.environ, "FM_AUTO": "tabwatch T1: finished tab closed"})
+        if r.returncode != 0:
+            log(f"T1 note FAILED for {card}: {r.stderr.strip()[:200]}", dry)
+
+
+def main(dry):
+    ws, tabs, panes = snapshot()
+    if not ws or not panes:
+        print("fm-tabwatch: no Herdr data (server down?); nothing done")
+        return 0
+    items = (read_json(ITEMS, {}) or {}).get("items", [])
+    ev, sure, maybe = closable(ws, tabs, panes, items)
+    for sp, tab, ok, why in ev:
+        if ok:
+            close_tab(sp, tab, why, dry)
+    if any(ok for *_, ok, _w in ev) and not dry:  # counts after this run's closes
+        ws, tabs, panes = snapshot()
+        sure = []
+        maybe = closable(ws, tabs, panes, items)[2]
+    alerts(ws, tabs, panes, items, sure, maybe, dry)
+    return 0
+
+
+def list_closable(as_json):
+    ws, tabs, panes = snapshot()
+    items = (read_json(ITEMS, {}) or {}).get("items", [])
+    ev, sure, maybe = closable(ws, tabs, panes, items)
+    if as_json:
+        print(json.dumps({"tabs": len(tabs), "closable": sure, "look_finished": maybe,
+                          "kept": [{"tab": t["tab_id"], "label": t.get("label"), "why": why} for sp, t, ok, why in ev if not ok]},
+                         ensure_ascii=False))
+        return 0
+    print(f"{len(tabs)} tabs")
+    for x in sure:
+        print(f"closes automatically: {x['tab']} {x['label']} ({x['why']})")
+    for sp, t, ok, why in ev:
+        if not ok:
+            print(f"fm-spawn tab kept: {t['tab_id']} {t.get('label')} ({why})")
+    for x in maybe:
+        print(f"looks finished (check before closing): {x['tab']} {x['label']} [{x['status']}]")
+    return 0
+
+
+# ---------- tests ----------
+
+def selftest():
+    """Pure checks of check_tab/session_final/alerts with fake data (no Herdr, no fm, no Discord)."""
+    import shutil
+    global STATE, AUTH_STATE, LOG, NOTIFY_CMD, plain_shell, fg_procs
+    d = tempfile.mkdtemp(prefix="fm-tabwatch-test-")
+    fails = []
+
+    def check(name, cond, info=""):
+        print(("PASS " if cond else "FAIL ") + name + ("" if cond else f"  [{str(info)[:300]}]"))
+        if not cond:
+            fails.append(name)
+    try:
+        STATE, AUTH_STATE, LOG = os.path.join(d, "st"), os.path.join(d, "auth"), os.path.join(d, "tabwatch.log")
+        os.makedirs(AUTH_STATE)
+        open(os.path.join(d, "notify"), "w").write(f"#!/bin/bash\nprintf '%s\\n' \"$*\" >> {d}/notify.log\n")
+        os.chmod(os.path.join(d, "notify"), 0o755)
+        NOTIFY_CMD = [os.path.join(d, "notify")]
+        shells = {"wT:p2"}
+        plain_shell = lambda pane: pane in shells
+        fg_procs = lambda pane: ({}, [{"name": "pscale", "argv": ["pscale", "auth", "login"]}] if pane.startswith("wT:L") else [])
+        sess = os.path.join(d, "s.jsonl")
+        final = json.dumps({"type": "message", "message": {"role": "assistant", "stopReason": "stop"}}) + "\n"
+        tool = json.dumps({"type": "message", "message": {"role": "toolResult"}}) + "\n"
+        old = time.time() - 600
+
+        def write_sess(txt, mtime=old):
+            open(sess, "w").write(json.dumps({"type": "session"}) + "\n" + txt)
+            os.utime(sess, (mtime, mtime))
+        t0 = now_ms() - 3600_000
+        sp = {"tsMs": t0, "label": "🧪 job", "tab": "wT:t1", "pane": "wT:p1", "card": "c1"}
+        tab = {"tab_id": "wT:t1", "label": "🧪 job", "focused": False, "workspace_id": "wT"}
+        root = {"pane_id": "wT:p1", "tab_id": "wT:t1", "agent": "omp", "agent_status": "done", "terminal_title": "π > JOB",
+                "agent_session": {"kind": "path", "value": sess}, "label": "OMP"}
+        term = {"pane_id": "wT:p2", "tab_id": "wT:t1", "label": "Terminal", "agent_status": "unknown"}
+        rec = {"c1": {"result": "done", "tsMs": now_ms()}}
+        items = [{"id": "c1", "s": "done"}]
+        ct = lambda **kw: check_tab(kw.get("sp", sp), kw.get("tab", tab), kw.get("panes", [root, term]), kw.get("active", "wT:t9"),
+                                    kw.get("items", items), lambda c: kw.get("rec", rec).get(c))
+        write_sess(final)
+        check("T1 finished tab closes", ct()[0], ct())
+        check("T1 failed receipt also closes", ct(rec={"c1": {"result": "failed", "tsMs": now_ms()}}, items=[{"id": "c1", "s": "partial"}])[0])
+        check("T1 blocked receipt keeps", not ct(rec={"c1": {"result": "blocked", "tsMs": now_ms()}})[0])
+        check("T1 no receipt keeps", not ct(rec={})[0])
+        check("T1 receipt older than the spawn keeps", not ct(rec={"c1": {"result": "done", "tsMs": t0 - 1}})[0])
+        check("T1 card still running (receipt not applied) keeps", not ct(items=[{"id": "c1", "s": "running"}])[0])
+        check("T1 another live card names the tab keeps", not ct(items=items + [{"id": "c2", "s": "partial", "job": "wT:p1"}])[0])
+        check("T1 a done card naming the tab does not block", ct(items=items + [{"id": "c2", "s": "done", "job": "wT:p1"}])[0])
+        check("T1 focused tab keeps", not ct(tab={**tab, "focused": True})[0])
+        check("T1 active tab keeps", not ct(active="wT:t1")[0])
+        check("T1 focused pane keeps", not ct(panes=[root, {**term, "focused": True}])[0])
+        check("T1 renamed tab keeps", not ct(tab={**tab, "label": "owner's"})[0])
+        check("T1 extra sign-in pane keeps", not ct(panes=[root, term, {"pane_id": "wT:p3", "tab_id": "wT:t1", "label": "🔐 x"}])[0])
+        check("T1 Terminal pane running a command keeps", not ct(panes=[root, {**term, "pane_id": "wT:p4"}])[0])
+        check("T1 spinner in title keeps", not ct(panes=[{**root, "terminal_title": "π \u283c JOB"}, term])[0])
+        check("T1 Herdr status working keeps", not ct(panes=[{**root, "agent_status": "working"}, term])[0])
+        write_sess(final + tool)
+        check("T1 session ends with a tool result keeps", not ct()[0])
+        write_sess(final, time.time() - 30)
+        check("T1 session written 30 s ago keeps", not ct()[0])
+        write_sess(final[:-5])
+        check("T1 half-written last line keeps", not ct()[0])
+        write_sess(final + json.dumps({"type": "custom"}) + "\n")
+        check("T1 non-message entries after the final reply are skipped", ct()[0])
+        check("T1 no card keeps", not ct(sp={**sp, "card": None})[0])
+        check("T1 finance card keeps (area finance)", not ct(items=[{"id": "c1", "s": "done", "area": "finance"}])[0])
+        check("T1 finance card keeps (title words)", not ct(items=[{"id": "c1", "s": "done", "t": "Video reel to trade decision"}])[0])
+        check("T1 a done finance card naming the tab keeps", not ct(items=items + [{"id": "c2", "s": "done", "area": "finance", "job": "wT:t1"}])[0])
+        # registry: legacy log + jsonl
+        global SPAWN_STATE
+        SPAWN_STATE = os.path.join(d, "spawn")
+        os.makedirs(SPAWN_STATE)
+        open(os.path.join(SPAWN_STATE, "fm-spawn.log"), "w").write(
+            "2026-10-19 11:18:29 spawned 📈 Trade reel ingest: tab wB:t5Q pane wB:pAX cwd /home/x/Github/finance card trade-reel\n"
+            "2026-10-19 11:02:10 spawned 🧪 a: tab wB:t5M pane wB:pAQ cwd /tmp/s card -\n"
+            "2026-10-19 11:02:38 cleanup removed /tmp/x (ws/x)\n")
+        open(os.path.join(SPAWN_STATE, "spawned.jsonl"), "w").write(json.dumps({"tsMs": 1, "label": "n", "tab": "wB:t9", "pane": "wB:p9", "card": "k"}) + "\n")
+        s = spawns()
+        check("registry: jsonl + legacy log lines", {(x["tab"], x["card"]) for x in s} == {("wB:t9", "k"), ("wB:t5Q", "trade-reel"), ("wB:t5M", None)}, s)
+        # A1 / A2
+        ws = [{"workspace_id": "wT", "label": "Github", "tab_count": 26, "active_tab_id": "wT:t0"}]
+        tabs26 = [{"tab_id": f"wT:t{i}", "workspace_id": "wT", "label": f"t{i}"} for i in range(26)]
+        nlog = lambda: len(open(os.path.join(d, "notify.log")).read().splitlines()) if os.path.exists(os.path.join(d, "notify.log")) else 0
+        alerts(ws, tabs26, [], [], [], [], False)
+        check("A1 26 tabs: one alert", nlog() == 1, nlog())
+        alerts(ws, tabs26, [], [], [], [], False)
+        check("A1 still 26 tabs: no second alert", nlog() == 1, nlog())
+        alerts(ws, tabs26[:22], [], [], [], [], False)
+        alerts(ws, tabs26, [], [], [], [], False)
+        check("A1 re-armed at 22 tabs, alerts again at 26", nlog() == 2, nlog())
+        with open(os.path.join(AUTH_STATE, "events.jsonl"), "w") as f:
+            for i in range(3):
+                f.write(json.dumps({"tsMs": now_ms() - 60_000, "op": "pscale-x", "event": "opened", "pane": f"wT:a{i}"}) + "\n")
+            f.write(json.dumps({"tsMs": now_ms() - 3600_000, "op": "old", "event": "opened", "pane": "wT:old"}) + "\n")
+        alerts(ws, tabs26[:5], [], [], [], [], False)
+        check("A2 3 sign-ins in 15 min: no alert", nlog() == 2, nlog())
+        login_pane = {"pane_id": "wT:L1", "tab_id": "wT:t1", "label": "", "agent_status": "unknown"}
+        alerts(ws, tabs26[:5], [login_pane], [], [], [], False)
+        check("A2 a 4th (raw pane running `pscale auth login`): one alert", nlog() == 3 and "Sign-in loop" in open(os.path.join(d, "notify.log")).read(), nlog())
+        alerts(ws, tabs26[:5], [login_pane], [], [], [], False)
+        check("A2 no repeat while the burst lasts", nlog() == 3, nlog())
+        st_file = os.path.join(STATE, "state.json")
+        shutil.rmtree(STATE)
+        os.remove(os.path.join(AUTH_STATE, "events.jsonl"))
+        alerts(ws, tabs26[:5], [login_pane, {**login_pane, "pane_id": "wT:L2"}, {**login_pane, "pane_id": "wT:L3"},
+                                {**login_pane, "pane_id": "wT:L4"}], [], [], [], False)
+        check("A2 first run baselines existing sign-in panes (no false burst)", nlog() == 3 and os.path.exists(st_file), nlog())
+        global herdr
+        real_herdr = herdr
+        fake = {"workspace list": {"result": {"workspaces": [{"workspace_id": "wT"}]}}, "pane list": {"result": {"panes": []}}}
+        herdr = lambda *a: fake.get(" ".join(a[:2]), {})  # tab list fails (no result)
+        check("snapshot: a failed tab list skips the whole run", snapshot() == ([], [], []))
+        fake["tab list"] = {"result": {"tabs": [{"tab_id": "wT:t1"}]}}
+        check("snapshot: complete reads pass through", len(snapshot()[1]) == 1)
+        herdr = real_herdr
+        check("looks_finished: done tab yes, idle no, FIRSTMATE no, working no",
+              looks_finished({"tab_id": "a", "agent_status": "done"}, [], "x")
+              and not looks_finished({"tab_id": "d", "agent_status": "idle"}, [], "x")
+              and not looks_finished({"tab_id": "b", "agent_status": "idle", "label": "FIRSTMATE"}, [], "x")
+              and not looks_finished({"tab_id": "c", "agent_status": "done"}, [{"agent_status": "working"}], "x"))
+    finally:
+        if not fails:
+            shutil.rmtree(d, ignore_errors=True)
+        else:
+            print(f"kept {d}")
+    print("ALL PASS" if not fails else f"{len(fails)} FAILED")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if "--test" in a:
+        sys.exit(selftest())
+    if "--list-closable" in a:
+        sys.exit(list_closable("--json" in a))
+    if a and a[0] not in ("--dry-run",):
+        sys.exit(__doc__)
+    sys.exit(main("--dry-run" in a))

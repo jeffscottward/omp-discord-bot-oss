@@ -1,0 +1,25 @@
+{
+  "name": "omp-discord-bot",
+  "module": "src/main.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun src/main.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p .",
+    "lint:mentions": "bash scripts/check-mentions.sh"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "xstate": "^5.33.3"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "chrono-node": "2",
+    "discord.js": "^14.27.0",
+    "prism-media": "^1.3.5"
+  }
+}

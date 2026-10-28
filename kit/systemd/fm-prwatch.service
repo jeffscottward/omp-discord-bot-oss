@@ -1,0 +1,8 @@
+[Unit]
+Description=FIRSTMATE: close cards whose GitHub PR merged (fm-prwatch)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@KIT@/bin/fm-prwatch
+TimeoutStartSec=120

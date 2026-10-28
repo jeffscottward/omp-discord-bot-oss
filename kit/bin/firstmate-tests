@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# firstmate-tests (card dashboard-vike, owner 2026-10-19): run every FIRSTMATE UI<->function contract test.
+# Contracts: kit/dashboard/docs/deeplink-contract.md (installed as $FM_DIR/deeplink-contract.md).
+# Never changes the live items.json: fm tests use FM_ITEMS fixtures; browser tests serve a temp copy of the app
+# with kit/dashboard/fixtures, or (live mode) read the live page and replace its data in the browser only.
+# Usage: firstmate-tests [--alert] [--live]
+#   --alert  post once per incident to the alerts channel ($OMP_NOTIFY, default fm-notify) + a recovery notice.
+#   --live   browser tests read the live dashboard ($FM_DASHBOARD_URL). Default: FM_TESTS_LIVE=1 in kit.env.
+# Settings: ~/.config/omp-discord/kit.env (FM_DIR, FM_DASHBOARD_URL, FM_TESTS_LIVE, OMP_NOTIFY, PUPPETEER_CORE, CHROME_BIN).
+set -u
+
+# Read kit.env (KEY=VALUE). A variable that is already set in the environment wins.
+kit_env() {
+  local f="${OMP_KIT_ENV:-$HOME/.config/omp-discord/kit.env}" line k
+  [ -r "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line#export }"
+    case "$line" in ''|'#'*) continue ;; esac
+    k="${line%%=*}"
+    [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [ -n "${!k+x}" ] && continue
+    eval "export $line"
+  done < "$f"
+}
+kit_env
+
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+KIT=$(dirname "$BIN")
+TESTS="$KIT/dashboard/tests"
+WEB_DIR="${REPORTS_WEB_DIR:-$HOME/.local/share/omp-discord/reports-web}"
+HERE="${FM_DIR:-$WEB_DIR/firstmate}"
+STATE="$HOME/.local/state/firstmate-tests"; mkdir -p "$STATE"
+LOG="$STATE/last.log"; : > "$LOG"
+ALERT=0; LIVE="${FM_TESTS_LIVE:-0}"
+for a in "$@"; do
+  case "$a" in
+    --alert) ALERT=1 ;;
+    --live) LIVE=1 ;;
+    *) echo "usage: firstmate-tests [--alert] [--live]" >&2; exit 2 ;;
+  esac
+done
+# The browser tests copy the installed app (FM_DIR) when it is there, else the kit copy.
+if [ -z "${FM_WEB_DIR:-}" ] && [ -f "$HERE/app.js" ]; then export FM_WEB_DIR="$HERE"; fi
+fail=(); pass=0
+t() { local name=$1; shift
+  if timeout 240 "$@" >>"$LOG" 2>&1; then pass=$((pass+1)); echo "ok   $name"; else fail+=("$name"); echo "FAIL $name"; fi
+  echo "---- end $name" >>"$LOG"; }
+cd "$TESTS" || exit 2
+t fm-unit env FM_BIN="$BIN/fm" python3 "$TESTS/fm-unit-test.py"
+t fm-autoclear "$BIN/fm-autoclear" --test
+for f in "$TESTS"/*-e2e.cjs; do
+  name=$(basename "$f")
+  # queued-state always uses its own fixture; the others read the live page in live mode.
+  if [ "$LIVE" = 1 ] && [ "$name" != queued-state-e2e.cjs ]; then
+    t "$name" env BASE="${FM_DASHBOARD_URL:-http://127.0.0.1:${REPORTS_PORT:-8790}/firstmate/}" node "$f"
+  else
+    t "$name" env -u BASE node "$f"
+  fi
+done
+n=${#fail[@]}
+echo "$(date -Is) pass=$pass fail=$n ${fail[*]:-}" >>"$STATE/history.log"
+if [ $ALERT = 1 ]; then
+  if [ -n "${OMP_NOTIFY:-}" ]; then read -r -a N <<<"$OMP_NOTIFY"; else N=("$BIN/fm-notify"); fi
+  if [ "$n" -gt 0 ] && [ ! -e "$STATE/alerted" ]; then
+    "${N[@]}" --kind error --summary "FIRSTMATE dashboard tests failing: ${fail[*]}" --action "See $LOG on $(hostname -s); run firstmate-tests" && touch "$STATE/alerted"
+  elif [ "$n" -eq 0 ] && [ -e "$STATE/alerted" ]; then
+    "${N[@]}" --kind completion --summary "FIRSTMATE dashboard tests pass again ($pass suites)" && rm -f "$STATE/alerted"
+  fi
+fi
+echo "$([ "$n" = 0 ] && echo PASS || echo FAIL): $pass passed, $n failed${fail[*]:+ (${fail[*]})}; log $LOG"
+[ "$n" = 0 ]

@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""fm-prwatch (owner 2026-10-19): every minute, check GitHub for PRs linked from open FIRSTMATE cards.
+A card whose PR is MERGED becomes done ("✅ PR merged <sha> at <time>"); a PR CLOSED without merge
+becomes partial "PR closed without merge; needs check". PR link sources: the card's `l` field first,
+then `src`, `q`, the note `n`. Finance cards are only logged. Writes go through `fm` (lock, `by`).
+Usage: fm-prwatch [--dry-run]
+Settings: ~/.config/omp-discord/kit.env (FM_DIR, REPORTS_WEB_DIR, FM_SKIP_AREAS, FM_BIN). Needs a logged-in `gh`."""
+import json, os, re, subprocess, sys, time
+
+
+
+def _kit_env():
+    """Read the kit settings file (KEY=VALUE lines). File: $OMP_KIT_ENV, else ~/.config/omp-discord/kit.env.
+    A variable that is already set in the environment wins."""
+    path = os.environ.get("OMP_KIT_ENV") or os.path.expanduser("~/.config/omp-discord/kit.env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or line.startswith("#") or not key.isidentifier() or key in os.environ:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] == "'":
+            val = val[1:-1]
+        else:
+            if len(val) >= 2 and val[0] == val[-1] == '"':
+                val = val[1:-1]
+            val = os.path.expanduser(os.path.expandvars(val))
+        os.environ[key] = val
+
+
+_kit_env()
+WEB = os.environ.get("REPORTS_WEB_DIR") or os.path.expanduser("~/.local/share/omp-discord/reports-web")
+FM_DIR = os.environ.get("FM_DIR") or os.path.join(WEB, "firstmate")
+ITEMS = os.path.join(FM_DIR, "items.json")
+LOG = os.path.join(FM_DIR, "prwatch.log")
+FM_BIN = os.environ.get("FM_BIN") or "fm"
+SKIP_AREAS = {a.strip().lower() for a in os.environ.get("FM_SKIP_AREAS", "finance").split(",") if a.strip()}
+PR = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
+DRY = "--dry-run" in sys.argv
+
+
+def log(msg):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+    print(line)
+    if not DRY:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+
+
+def pr_of(item):
+    for k in ("l", "src", "q", "n"):
+        m = PR.search(str(item.get(k) or ""))
+        if m:
+            return m.group(1), m.group(2), k
+    return None
+
+
+def main():
+    items = json.load(open(ITEMS)).get("items", [])
+    for it in items:
+        if it.get("s") == "done":
+            continue
+        pr = pr_of(it)
+        if not pr:
+            continue
+        repo, num, field = pr
+        r = subprocess.run(["gh", "pr", "view", num, "-R", repo, "--json", "state,mergedAt,mergeCommit"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            log(f"{it['id']}: gh error for {repo}#{num}: {r.stderr.strip()[:120]}")
+            continue
+        d = json.loads(r.stdout)
+        st = d.get("state")
+        if st == "OPEN":
+            continue
+        finance = str(it.get("area", "")).lower() in SKIP_AREAS
+        if st == "MERGED":
+            sha = ((d.get("mergeCommit") or {}).get("oid") or "")[:7]
+            note = f"✅ PR {repo}#{num} merged {sha} at {d.get('mergedAt','')} (fm-prwatch)"
+            target = "done"
+        else:
+            note = f"PR {repo}#{num} closed without merge; needs check (fm-prwatch)"
+            target = "partial"
+        if finance:
+            log(f"{it['id']}: skipped area, not changed: {note}")
+            continue
+        # A PR found only in the note may not be the card's own deliverable: log only.
+        if field == "n":
+            log(f"{it['id']}: PR only in note, not changed: {note}")
+            continue
+        # A live job may still have steps after the merge (deploy, verify): never close it here.
+        if it.get("s") == "running" or it.get("job"):
+            log(f"{it['id']}: running/job card, not changed: {note}")
+            continue
+        # Do not rewrite the same result every minute.
+        if str(it.get("n") or "").startswith(note.split(" (fm-prwatch)")[0].replace("✅ ", "✅ ")) or (target == "partial" and "closed without merge" in str(it.get("n") or "")):
+            continue
+        log(f"{it['id']}: {it.get('s')} -> {target}: {note}")
+        if not DRY:
+            subprocess.run([FM_BIN, "set", it["id"], target, note], env={**os.environ, "FM_AUTO": "fm-prwatch", "FM_BY": "fm-prwatch"},
+                           capture_output=True, text=True, timeout=30)
+
+
+if __name__ == "__main__":
+    main()

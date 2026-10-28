@@ -1,0 +1,11 @@
+[Unit]
+Description=Run FIRSTMATE dashboard tests after fm/app.js changes
+
+[Path]
+PathChanged=@KIT@/bin/fm
+PathChanged=@FM_DIR@/app.js
+PathChanged=@FM_DIR@/index.html
+Unit=firstmate-tests.service
+
+[Install]
+WantedBy=default.target

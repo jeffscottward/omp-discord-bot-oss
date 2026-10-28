@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the FIRSTMATE in-progress sweep every 2 h (starts a session only when idle.json lists cards)
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=2h
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""firstmate-sweep: start ONE OMP sweep session for idle tracker cards (owner rule 2026-10-18).
+Run by firstmate-sweep.timer every 2 h. Usage: firstmate-sweep [--dry-run]
+
+1. Reads idle.json (written every minute by fm-autoclear, rule R10). Nothing idle -> log and exit.
+2. A Herdr tab labeled "🧹 FIRSTMATE sweep" already exists -> log and exit (one sweep at a time).
+3. Creates that tab (no focus) in the workspace of the tab labeled $FM_SWEEP_HOME_TAB (default FIRSTMATE), checks that OMP started, and prompts it
+   with sweep-task.md plus a run id and receipt file.
+4. Waits for the receipt (sweep-runs/<run id>.done) or for the agent to finish, then closes ONLY its own tab.
+   Deadline 45 min: closes the tab, logs it and alerts the owner once (alerts channel via $OMP_NOTIFY / fm-notify).
+Log: $FM_DIR/sweep.log (settings: ~/.config/omp-discord/kit.env).
+"""
+import json, os, subprocess, sys, time
+
+
+def _kit_env():
+    """Read the kit settings file (KEY=VALUE lines; the shell kit scripts read the same file).
+    File: $OMP_KIT_ENV, else ~/.config/omp-discord/kit.env. A variable that is already set in the environment wins."""
+    path = os.environ.get("OMP_KIT_ENV") or os.path.expanduser("~/.config/omp-discord/kit.env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or line.startswith("#") or not key.isidentifier() or key in os.environ:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] == "'":
+            val = val[1:-1]
+        else:
+            if len(val) >= 2 and val[0] == val[-1] == '"':
+                val = val[1:-1]
+            val = os.path.expanduser(os.path.expandvars(val))
+        os.environ[key] = val
+
+
+_kit_env()
+
+
+def _herdr_bin():
+    """Herdr CLI: $HERDR_BIN, else ~/.local/bin/herdr, else herdr on PATH."""
+    import shutil
+    own = os.path.expanduser("~/.local/bin/herdr")
+    return os.environ.get("HERDR_BIN") or (own if os.access(own, os.X_OK) else (shutil.which("herdr") or "herdr"))
+
+
+def _notify_cmd():
+    """Alert sender argv (same arguments as fm-notify: --kind, --summary, --action): $OMP_NOTIFY (a command line),
+    else fm-notify next to this script (posts to $FM_ALERTS_CHANNEL through the bot's loopback /post)."""
+    import shlex
+    if os.environ.get("OMP_NOTIFY"):
+        return shlex.split(os.environ["OMP_NOTIFY"])
+    return [os.path.join(os.path.dirname(os.path.realpath(__file__)), "fm-notify")]
+
+HOME = os.path.expanduser("~")
+HERE = os.environ.get("FM_DIR") or os.path.join(os.environ.get("REPORTS_WEB_DIR") or os.path.join(HOME, ".local/share/omp-discord/reports-web"), "firstmate")
+IDLE = os.environ.get("FIRSTMATE_SWEEP_IDLE") or os.path.join(HERE, "idle.json")  # env overrides: tests only
+LOG = os.path.join(HERE, "sweep.log")
+STALE_IDLE_S = 600  # idle.json older than this means fm-autoclear is not running
+RUNS = os.path.join(HERE, "sweep-runs")
+TASK = os.environ.get("FIRSTMATE_SWEEP_TASK") or os.path.join(HERE, "sweep-task.md")
+LABEL = os.environ.get("FIRSTMATE_SWEEP_LABEL") or "🧹 FIRSTMATE sweep"
+DEADLINE_S = int(os.environ.get("FIRSTMATE_SWEEP_DEADLINE_S") or 45 * 60)
+HERDR = _herdr_bin()
+HOME_TAB = os.environ.get("FM_SWEEP_HOME_TAB") or "FIRSTMATE"  # the new tab goes into this tab's workspace
+
+
+def log(msg):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    print(line)
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+
+
+def herdr(*args, check=True):
+    r = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=30)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"herdr {' '.join(args[:2])} failed: {(r.stderr or r.stdout).strip()[:200]}")
+    try:
+        return json.loads(r.stdout) if r.stdout.strip() else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def tabs():
+    out = []
+    for w in herdr("workspace", "list").get("result", {}).get("workspaces", []):
+        for t in herdr("tab", "list", "--workspace", w["workspace_id"]).get("result", {}).get("tabs", []):
+            out.append(t)
+    return out
+
+
+def notify(summary):
+    try:
+        subprocess.run([*_notify_cmd(), "--kind", "error", "--summary", summary[:240]],
+                       capture_output=True, timeout=60)
+    except Exception as e:
+        log(f"notify failed: {e}")
+
+
+def main(dry):
+    try:
+        idle = json.load(open(IDLE))
+        age = time.time() - os.path.getmtime(IDLE)
+    except Exception as e:
+        log(f"skip: cannot read idle.json ({e})")
+        return 0
+    items = idle.get("items") or []
+    if age > STALE_IDLE_S:
+        log(f"skip: idle.json is {int(age)} s old (fm-autoclear not running?)")
+        return 0
+    if not items:
+        log("skip: no idle cards")
+        return 0
+    all_tabs = tabs()
+    old = [t for t in all_tabs if t.get("label") == LABEL]
+    if old:
+        age = time.time() - last_start()
+        if age < DEADLINE_S + 300:
+            log("skip: a sweep tab is already open")
+            return 0
+        for t in old:  # no launcher watches it any more (crash, kill, reboot resume): close only that tab
+            if not dry:
+                herdr("tab", "close", t["tab_id"], check=False)
+            log(f"{'DRY ' if dry else ''}closed stale sweep tab {t['tab_id']} (last start {int(age / 60)} min ago)")
+    ids = [i["id"] for i in items]
+    ws = next((t["workspace_id"] for t in all_tabs if t.get("label") == HOME_TAB), None) or \
+        (all_tabs[0]["workspace_id"] if all_tabs else None)
+    if not ws:
+        log("skip: no Herdr workspace found")
+        return 0
+    run_id = time.strftime("%Y%m%dT%H%M%S")
+    receipt = os.path.join(RUNS, f"{run_id}.done")
+    if dry:
+        log(f"DRY would start sweep {run_id} in {ws} for {len(ids)} card(s): {', '.join(ids)}")
+        return 0
+    os.makedirs(RUNS, exist_ok=True)
+    r = herdr("tab", "create", "--workspace", ws, "--cwd", HERE, "--label", LABEL, "--no-focus")
+    res = r.get("result", {})
+    tab_id = (res.get("tab") or {}).get("tab_id") or res.get("tab_id")
+    pane = (res.get("root_pane") or {}).get("pane_id") or res.get("pane_id")
+    if not pane:
+        pane = next((p.get("pane_id") for p in (res.get("panes") or [])), None)
+    if not (tab_id and pane):
+        log(f"FAILED: tab create returned no tab/pane id: {json.dumps(r)[:300]}")
+        return 1
+    log(f"RUN {run_id} start: tab {tab_id} pane {pane}; cards: {', '.join(ids)}")
+    started = time.time()
+    try:
+        ok = False
+        for _ in range(20):  # OMP auto-starts in new Herdr panes (.bashrc)
+            time.sleep(3)
+            info = json.dumps(herdr("pane", "process-info", "--pane", pane, check=False))
+            if '"name":"omp"' in info.replace(" ", ""):
+                ok = True
+                break
+        if not ok:
+            log(f"RUN {run_id} FAILED: OMP did not start in pane {pane}; closing tab")
+            herdr("tab", "close", tab_id, check=False)
+            return 1
+        time.sleep(3)
+        herdr("agent", "prompt", pane,
+              f"Read {TASK} and carry it out fully. Run id: {run_id}. Idle cards: {', '.join(ids)}. "
+              f"Receipt file: {receipt}. Deadline: 45 min.")
+        seen_work, quiet = False, 0
+        while time.time() - started < DEADLINE_S:
+            time.sleep(30)
+            if os.path.exists(receipt):
+                time.sleep(20)  # let the agent finish its reply
+                log(f"RUN {run_id} done: {open(receipt).read().strip()[:200]}")
+                return 0
+            st = herdr("agent", "get", pane, check=False).get("result", {})
+            st = (st.get("agent") or st).get("agent_status") or st.get("status")
+            if st is None and not any(t.get("tab_id") == tab_id for t in tabs()):
+                log(f"RUN {run_id} ended: tab {tab_id} was closed by someone else; no receipt")
+                tab_id = None
+                return 0
+            if st == "working":
+                seen_work, quiet = True, 0
+            elif seen_work and st in ("done", "idle"):
+                quiet += 1
+                # 10 min without work after the agent worked: finished without a receipt. Long on purpose:
+                # an OMP agent waiting for a background job also shows idle.
+                if quiet >= 20:
+                    log(f"RUN {run_id} ended without a receipt (agent {st} for 10 min); closing tab")
+                    return 0
+        log(f"RUN {run_id} DEADLINE: {DEADLINE_S // 60} min passed without a receipt; closing tab {tab_id}")
+        notify(f"FIRSTMATE sweep {run_id} hit its {DEADLINE_S // 60} min deadline without finishing (cards: {', '.join(ids)[:150]}). Tab closed; see sweep.log.")
+        return 0
+    except Exception as e:
+        log(f"RUN {run_id} ERROR: {e}")
+        return 1
+    finally:
+        if tab_id:  # every exit path closes ONLY this run's tab, so a failure never blocks later sweeps
+            try:
+                herdr("tab", "close", tab_id, check=False)
+            except Exception as e:
+                log(f"RUN {run_id} could not close tab {tab_id}: {e} (the next run closes it as stale)")
+
+
+def last_start():
+    """Epoch time of the newest 'RUN <id> start' line in sweep.log (0 when none)."""
+    try:
+        lines = [l for l in open(LOG) if " start: tab " in l and " RUN " in l]
+        return time.mktime(time.strptime(lines[-1][:19], "%Y-%m-%d %H:%M:%S")) if lines else 0.0
+    except Exception:
+        return 0.0
+
+
+if __name__ == "__main__":
+    sys.exit(main("--dry-run" in sys.argv))
