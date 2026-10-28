@@ -1,0 +1,10 @@
+[Unit]
+Description=iOS Reminders inbox (iPhone Shortcut posts here; bind/port: REMINDERS_* in kit.env)
+After=network-online.target tailscaled.service
+[Service]
+WorkingDirectory=@KIT@/reminders-inbox
+ExecStart=@BUN@ server.ts
+Restart=on-failure
+RestartSec=10
+[Install]
+WantedBy=default.target

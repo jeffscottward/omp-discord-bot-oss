@@ -1,0 +1,7 @@
+[Unit]
+Description=Static report pages + FIRSTMATE dashboard (loopback; publish with tailscale serve /reports). Settings: REPORTS_* in kit.env
+[Service]
+ExecStart=/usr/bin/env python3 @KIT@/web/serve.py
+Restart=on-failure
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+{
+  // Copy to wrangler.jsonc (untracked), set your account id and domain, then: cd heeler-link && bunx wrangler deploy
+  "name": "heeler-link",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-01",
+  "account_id": "<YOUR_CLOUDFLARE_ACCOUNT_ID>",
+  "workers_dev": false,
+  "routes": [{ "pattern": "heeler.<your-domain>", "custom_domain": true }],
+  "observability": { "enabled": false }
+}

@@ -1,0 +1,854 @@
+#!/usr/bin/env python3
+"""fm-spawn: FIRSTMATE fan-out helper (Orca #7, owner pick 2026-10-19, main). Installed as ~/.local/bin/fm-spawn.
+
+Start a side session:
+  fm-spawn --label TEXT --cwd DIR --task FILE [--card ID] [--stack NAME] [--slug S] [--base REF] [--workspace WS] [--no-worktree] [--dry-run]
+       Worktrees start from origin/<default branch> (after git fetch origin) unless --base REF is given.
+    1. If DIR is inside a git repo AND another live Herdr pane already works in that repo (pane cwd or
+       foreground cwd inside the repo's main working tree), it creates the worktree <repo>-wt-<slug> on
+       the new branch ws/<slug> from the repo's current HEAD, and starts the tab there (same subfolder).
+       Otherwise the tab starts in DIR directly.
+    2. Creates a Herdr tab (--no-focus), checks that OMP started in it, and prompts OMP with the task file.
+       With a worktree, the prompt also states the merge-back steps.
+    3. With --card: `fm field <card> job <pane id>`, `fm field <card> stack <stack>` and `fm set <card> running`.
+       Stack (owner 2026-10-24): --stack NAME (finance, webapp, realestate, infra, kb, personal, firstmate); without it,
+       the card's `area` mapped like the bot's router (src/router.ts DEFAULT_STACKS), else firstmate.
+    4. Starts a detached waiter (owner 2026-10-24): it waits up to 2 min until the bot's mirror lists the new pane
+       with a Discord channel in agents.json, then posts the task text there through the bot's loopback /post
+       (AGENTS.md "Start side sessions from their Discord channel"). Log: ~/.local/state/fm-spawn/fm-spawn.log.
+    Prints one JSON line: {label, tab, pane, cwd, worktree, branch, base, reason, stack}.
+    Refuses (exit 4, nothing created) when the workspace already has more than 30 tabs (auth-loop-guard,
+    owner 2026-10-19), and prints the tabs that fm-tabwatch closes automatically or that look finished.
+    Every spawned tab is recorded in ~/.local/state/fm-spawn/spawned.jsonl; fm-tabwatch closes it after
+    the card's done/failed receipt once its panes are idle.
+
+Adopt live terminal jobs (owner 2026-10-24 addendum: terminal jobs that so far had no channel):
+  fm-spawn --adopt PANE [--card ID] [--stack NAME] [--label TEXT] [--dry-run]
+    Sets the card's job + stack (area, else firstmate) and posts one note in the pane's mirrored channel once the
+    bot's mirror has made it (the mirror makes a channel for every live OMP pane by itself).
+  fm-spawn --adopt-all [--dry-run]
+    The same for every open card whose `job` is a live Herdr pane/tab. Repeatable: missing stacks are set, and
+    panes already noted (~/.local/state/fm-spawn/adopted.json) get no second post. Waits (up to 2 min) in-process,
+    so it also works from a systemd one-shot unit.
+
+Clean up:
+  fm-spawn --cleanup [--dry-run]
+    Lists the worktrees fm-spawn made (registry ~/.local/state/fm-spawn/worktrees.json) plus other ws/*
+    worktrees of the same repos. Removes one only when ALL are true: no uncommitted or untracked files,
+    branch merged into its base, and no live Herdr pane works in it. Removal uses `git worktree remove`
+    (no --force) and `git branch -d` (refuses unmerged work). Never deletes unmerged work.
+    Shared links (node_modules/.venv/data symlinks) are unlinked first; their targets in the main
+    checkout are never touched.
+
+Shared dependencies (owner 2026-10-23, safety rule): every new worktree gets its OWN node_modules/.venv,
+installed with hard links from content-addressed shared stores (bun cache --backend=hardlink, pnpm store
+--package-import-method=hardlink, uv cache UV_LINK_MODE=hardlink). Never a symlink to the main
+checkout's writable folders. npm (package-lock) uses its cache only.
+  fm-spawn --share-existing [--dry-run] [--root DIR]   convert idle worktrees (drop writable links,
+                                                        store install, typecheck/build/test).
+  fm-spawn --share WORKTREE [--no-install]              share into one worktree (used by tests).
+
+Env (tests): FM_SPAWN_HERDR, FM_SPAWN_FM, FM_SPAWN_TABWATCH (binaries), FM_SPAWN_STATE (state dir), FM_SPAWN_OMP_WAIT_S,
+FM_SPAWN_FAST, FM_SPAWN_MAX_TABS, FM_SPAWN_AGENTS (bot agents.json), FM_SPAWN_POST_URL (bot /post),
+FM_SPAWN_CHANNEL_WAIT_S (channel wait; 0 = no waiter).
+"""
+import argparse, fcntl, json, os, re, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+HERDR = os.environ.get("FM_SPAWN_HERDR") or os.path.join(HOME, ".local/bin/herdr")
+FM = os.environ.get("FM_SPAWN_FM") or os.path.join(HOME, ".local/bin/fm")
+STATE = os.environ.get("FM_SPAWN_STATE") or os.path.join(HOME, ".local/state/fm-spawn")
+REG = os.path.join(STATE, "worktrees.json")
+LOG = os.path.join(STATE, "fm-spawn.log")
+SPAWNED = os.path.join(STATE, "spawned.jsonl")  # read by fm-tabwatch (closes finished tabs)
+TABWATCH = os.environ.get("FM_SPAWN_TABWATCH") or os.path.join(HOME, ".local/bin/fm-tabwatch")
+MAX_TABS = int(os.environ.get("FM_SPAWN_MAX_TABS") or 30)
+OMP_WAIT_S = int(os.environ.get("FM_SPAWN_OMP_WAIT_S") or 60)
+PAUSE = 0.05 if os.environ.get("FM_SPAWN_FAST") else 1.0  # tests: short sleeps
+AGENTS = os.environ.get("FM_SPAWN_AGENTS") or os.path.join(HOME, ".local/share/omp-discord-bot/agents.json")
+POST_URL = os.environ.get("FM_SPAWN_POST_URL") or f"http://127.0.0.1:{os.environ.get('OMP_BOT_HTTP_PORT') or 47821}/post"
+CHANNEL_WAIT_S = int(os.environ.get("FM_SPAWN_CHANNEL_WAIT_S") or 120)
+
+# Card area -> stack. Same as DEFAULT_STACKS[].areas in src/router.ts (test/fm-spawn.test.ts checks they match).
+STACK_AREAS = {
+    "finance": ["finance"],
+    "webapp": ["webapp"],
+    "realestate": ["client co"],
+    "infra": ["tools", "ops", "discord", "discord bot", "discord/herdr", "omp", "infra", "ai"],
+    "kb": ["knowledge bases", "research", "transcription"],
+    "fun": ["fun", "apps"],
+    "personal": ["personal", "home", "reminders", "taxes"],
+    "firstmate": ["questions"],
+}
+# Stacks added with scripts/stack-add.ts live in the bot config (router.stacks); merge their areas (owner 2026-10-24).
+try:
+    import json as _json, os as _os
+    _cfg = _json.load(open(_os.environ.get("OMP_BOT_CONFIG", _os.path.expanduser("~/.config/omp-discord/config.json"))))
+    # null/odd values (e.g. "router": null, "areas": null) must not break every fm-spawn command at import
+    for _s in ((_cfg.get("router") or {}).get("stacks") or []) if isinstance(_cfg, dict) else []:
+        if isinstance(_s, dict) and _s.get("name"):
+            STACK_AREAS[_s["name"]] = sorted(set(STACK_AREAS.get(_s["name"], [])) | {str(x).lower() for x in (_s.get("areas") or [])})
+except (OSError, ValueError, AttributeError, TypeError):
+    pass
+
+
+def stack_of_area(area):
+    """Stack for a card area (case-insensitive; 'Client Co: ...' counts as 'client co'); firstmate when unknown."""
+    a = (area or "").strip().lower()
+    for cand in (a, a.split(":", 1)[0].strip()):
+        for stack, areas in STACK_AREAS.items():
+            if cand and (cand == stack or cand in areas):
+                return stack
+    return "firstmate"
+
+
+def log(msg):
+    os.makedirs(STATE, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+
+
+def run(cmd, cwd=None, check=True):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=60)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd[:4])} failed: {(r.stderr or r.stdout).strip()[:300]}")
+    return r
+
+
+def git(repo, *args, check=True):
+    return run(["git", "-C", repo, *args], check=check)
+
+
+def herdr(*args, check=True):
+    r = run([HERDR, *args], check=check)
+    try:
+        return json.loads(r.stdout) if r.stdout.strip() else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def real(p):
+    return os.path.realpath(os.path.expanduser(p))
+
+
+def inside(path, root):
+    path, root = real(path), real(root)
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+# ---------- git helpers ----------
+
+def repo_info(cwd):
+    """(main working tree, top of cwd's working tree) or None when cwd is not in a git repo."""
+    r = git(cwd, "rev-parse", "--show-toplevel", check=False)
+    if r.returncode != 0:
+        return None
+    top = real(r.stdout.strip())
+    wl = git(cwd, "worktree", "list", "--porcelain").stdout
+    main = next((l[9:] for l in wl.splitlines() if l.startswith("worktree ")), top)
+    return real(main), top
+
+
+def worktrees(repo):
+    """[{path, branch}] for every working tree of repo (the first one is the main tree)."""
+    out, cur = [], None
+    for l in git(repo, "worktree", "list", "--porcelain").stdout.splitlines():
+        if l.startswith("worktree "):
+            cur = {"path": real(l[9:]), "branch": None}
+            out.append(cur)
+        elif l.startswith("branch ") and cur:
+            cur["branch"] = l[7:].removeprefix("refs/heads/")
+    return out
+
+
+def slugify(s):
+    s = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+    return (s[:40].strip("-")) or "session"
+
+
+def free_slug(repo, slug):
+    """slug, slug-2, slug-3, ...: the first one with no existing path and no existing branch."""
+    for n in range(1, 100):
+        s = slug if n == 1 else f"{slug}-{n}"
+        path = f"{repo}-wt-{s}"
+        if not os.path.exists(path) and git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/ws/{s}", check=False).returncode != 0:
+            return s
+    raise RuntimeError(f"no free worktree name for {slug}")
+
+
+# ---------- Herdr helpers ----------
+
+def panes():
+    return herdr("pane", "list").get("result", {}).get("panes", [])
+
+
+def panes_in(root, all_panes, other_trees=()):
+    """Panes whose cwd or foreground cwd is inside root, but not inside one of other_trees (nested worktrees)."""
+    hits = []
+    for p in all_panes:
+        for c in {p.get("cwd"), p.get("foreground_cwd")} - {None, ""}:
+            if inside(c, root) and not any(inside(c, o) for o in other_trees if real(o) != real(root)):
+                hits.append(p)
+                break
+    return hits
+
+
+def pick_workspace(all_panes, wanted):
+    if wanted:
+        return wanted
+    me = os.environ.get("HERDR_PANE_ID")
+    ws = next((p.get("workspace_id") for p in all_panes if me and p.get("pane_id") == me), None)
+    return ws or next((p.get("workspace_id") for p in all_panes), None)
+
+
+# ---------- registry ----------
+
+def reg_update(fn):
+    os.makedirs(STATE, exist_ok=True)
+    with open(REG + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            data = json.load(open(REG))
+        except Exception:
+            data = {"worktrees": []}
+        fn(data)
+        tmp = REG + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, REG)
+        return data
+
+
+def reg_read():
+    try:
+        return json.load(open(REG)).get("worktrees", [])
+    except Exception:
+        return []
+
+
+# ---------- spawn ----------
+
+def merge_target(base):
+    """Local branch the worker merges into: origin/main -> main; a local --base stays as is."""
+    return base.split("/", 1)[1] if base.startswith("origin/") else base
+
+
+def merge_steps(repo, wt, branch, base):
+    lock = f"/tmp/{os.path.basename(repo)}-integrate.lock"
+    target = merge_target(base)
+    return (f"WORKTREE: another Herdr session already works in {repo}, so you work in the git worktree {wt} "
+            f"on branch {branch} (made from {base}). Edit files only in {wt}. Merge back when the work is done and tested: "
+            f"1) commit everything on {branch}; "
+            f"2) git -C {wt} rebase {target} (fix conflicts, run the tests again); "
+            f"3) merge into the local branch {target} (NOT whatever branch {repo} has checked out): "
+            f"if `git -C {repo} branch --show-current` prints {target}, run flock {lock} git -C {repo} merge --ff-only {branch}; "
+            f"otherwise run flock {lock} git -C {repo} fetch . {branch}:{target} (fast-forward-only ref update; "
+            f"if either fails, rebase again and retry); "
+            f"4) if the repo's service must restart, do that inside the same flock; "
+            f"never force-push, never rewrite other commits, and do not push to a remote unless the task says so; "
+            f"5) leave the worktree in place: `fm-spawn --cleanup` removes it after it is merged, clean and idle.")
+
+def default_base(repo):
+    """origin/<default branch> after a fetch; never the main checkout's current HEAD (bug 2026-10-19)."""
+    if git(repo, "remote", "get-url", "origin", check=False).returncode == 0:
+        git(repo, "fetch", "--quiet", "origin", check=False)
+        r = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+        if r.returncode != 0:
+            git(repo, "remote", "set-head", "origin", "--auto", check=False)
+            r = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+        for b in ("main", "master"):
+            if git(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{b}", check=False).returncode == 0:
+                return f"origin/{b}"
+    for b in ("main", "master"):
+        if git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}", check=False).returncode == 0:
+            return b
+    raise RuntimeError(f"cannot find the default branch of {repo}; pass --base <ref>")
+
+
+
+def plan(args, all_panes):
+    """Pure decision (testable): where the tab starts and whether a worktree is needed."""
+    cwd = real(args.cwd)
+    info = repo_info(cwd)
+    if not info:
+        return {"cwd": cwd, "worktree": None, "reason": "not a git repo"}
+    repo, top = info
+    if args.no_worktree:
+        return {"cwd": cwd, "repo": repo, "worktree": None, "reason": "--no-worktree"}
+    trees = [w["path"] for w in worktrees(repo)]
+    busy = panes_in(top, all_panes, trees)
+    if not busy:
+        return {"cwd": cwd, "repo": repo, "worktree": None, "reason": f"no live pane works in {top}"}
+    slug = free_slug(repo, slugify(args.slug or args.label))
+    wt = f"{repo}-wt-{slug}"
+    rel = os.path.relpath(cwd, top)
+    base = args.base or default_base(repo)
+    ids = ", ".join(p.get("pane_id", "?") for p in busy[:6])
+    return {"cwd": os.path.normpath(os.path.join(wt, rel)), "repo": repo, "from": top, "worktree": wt,
+            "branch": f"ws/{slug}", "base": base, "reason": f"{len(busy)} live pane(s) in {top}: {ids}"}
+
+
+def tab_cap(ws):
+    """None when the workspace may get another tab; else the refusal text (auth-loop-guard, owner 2026-10-19)."""
+    if not ws:
+        return None
+    tabs = herdr("tab", "list", "--workspace", ws, check=False).get("result", {}).get("tabs") or []
+    if len(tabs) <= MAX_TABS:
+        return None
+    lines = [f"fm-spawn: refused: Herdr workspace {ws} already has {len(tabs)} tabs (max {MAX_TABS}). "
+             f"Nothing was created. Close finished tabs first, then start the job again."]
+    try:
+        r = subprocess.run([TABWATCH, "--list-closable", "--json"], capture_output=True, text=True, timeout=60)
+        c = json.loads(r.stdout)
+        for x in c.get("closable") or []:
+            lines.append(f"  closes automatically (fm-tabwatch, finished + receipt): {x['tab']} {x['label']}")
+        for x in c.get("look_finished") or []:
+            lines.append(f"  looks finished, check then `herdr tab close {x['tab']}`: {x['label']} [{x['status']}]")
+        if len(lines) == 1:
+            lines.append("  no tab looks finished; ask FIRSTMATE/the owner which tabs to close")
+    except Exception as e:
+        lines.append(f"  (could not list closable tabs: {e}; run fm-tabwatch --list-closable)")
+    return "\n".join(lines)
+
+
+# Brief lint (pstack orchestrate brief template, 2026-10-25): a side session without a goal, a done check or a
+# verify step drifts. Warn only (the owner's task files stay free-form); the gaps also go into the prompt.
+BRIEF_PARTS = (
+    ("goal", re.compile(r"(?im)^\s*(#+\s*)?(goal|target|task\b|objective|what to do)|^#\s+\S")),
+    ("done check", re.compile(r"(?i)\b(acceptance|done check|definition of done|deliverables?|success|pass when|(stop|finish|done|complete)( only)? (when|if|after|condition))")),
+    ("verify step", re.compile(r"(?i)\b(verify|verification|test(s|ed)?\b|prove|check that|evidence)")),
+)
+
+
+def brief_gaps(text):
+    """Missing brief parts (goal / done check / verify step) in a task file's text."""
+    return [name for name, rx in BRIEF_PARTS if not rx.search(text or "")]
+
+
+def spawn(args):
+    task = real(args.task)
+    if not os.path.isfile(task):
+        sys.exit(f"fm-spawn: task file not found: {task}")
+    try:
+        gaps = brief_gaps(open(task, encoding="utf-8", errors="replace").read(200_000))
+    except OSError:
+        gaps = []
+    if gaps:
+        print(f"fm-spawn: warning: task file has no {', '.join(gaps)} (brief lint)", file=sys.stderr)
+    if not os.path.isdir(real(args.cwd)):
+        sys.exit(f"fm-spawn: --cwd is not a folder: {args.cwd}")
+    all_panes = panes()
+    ws = pick_workspace(all_panes, args.workspace)
+    refusal = tab_cap(ws)
+    if refusal:
+        log(f"REFUSED {args.label}: workspace {ws} over {MAX_TABS} tabs")
+        print(refusal, file=sys.stderr)
+        return 4
+    p = plan(args, all_panes)
+    stack = pick_stack(args)
+    out = {"label": args.label, "workspace": ws, **{k: p.get(k) for k in ("cwd", "worktree", "branch", "base", "reason")},
+           "stack": stack}
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, **out}))
+        return 0
+    if not ws:
+        sys.exit("fm-spawn: no Herdr workspace found")
+    if p["worktree"]:
+        git(p["from"], "worktree", "add", "-b", p["branch"], p["worktree"], p["base"])
+        reg_update(lambda d: d["worktrees"].append({
+            "repo": p["repo"], "path": p["worktree"], "branch": p["branch"], "base": p["base"],
+            "label": args.label, "card": args.card, "task": task, "created": time.strftime("%Y-%m-%d %H:%M:%S")}))
+        log(f"worktree {p['worktree']} branch {p['branch']} base {p['base']} ({p['reason']})")
+        try:
+            for line in share_into(p["repo"], p["worktree"]):
+                log(f"share: {line}")
+                print(f"fm-spawn share: {line}", file=sys.stderr)
+        except Exception as e:  # sharing must never block the spawn
+            log(f"share failed for {p['worktree']}: {e}")
+    r = herdr("tab", "create", "--workspace", ws, "--cwd", p["cwd"], "--label", args.label, "--no-focus")
+    res = r.get("result", {})
+    tab = (res.get("tab") or {}).get("tab_id") or res.get("tab_id")
+    pane = (res.get("root_pane") or {}).get("pane_id") or res.get("pane_id") or \
+        next((x.get("pane_id") for x in (res.get("panes") or [])), None)
+    if not (tab and pane):
+        log(f"FAILED tab create for {args.label}: {json.dumps(r)[:300]}")
+        sys.exit(f"fm-spawn: tab create returned no tab/pane id (worktree kept: {p['worktree']})")
+    out.update(tab=tab, pane=pane)
+    os.makedirs(STATE, exist_ok=True)
+    with open(SPAWNED, "a") as f:
+        f.write(json.dumps({"tsMs": int(time.time() * 1000), "label": args.label, "tab": tab, "pane": pane,
+                            "card": args.card, "cwd": p["cwd"], "worktree": p["worktree"], "workspace": ws},
+                           ensure_ascii=False) + "\n")
+    if p["worktree"]:
+        reg_update(lambda d: [w.update(tab=tab, pane=pane) for w in d["worktrees"] if w["path"] == p["worktree"]])
+    ok, deadline = False, time.time() + OMP_WAIT_S
+    while time.time() < deadline:  # OMP auto-starts in new Herdr panes (.bashrc)
+        time.sleep(2 * PAUSE)
+        info = json.dumps(herdr("pane", "process-info", "--pane", pane, check=False)).replace(" ", "")
+        if '"name":"omp"' in info:
+            ok = True
+            break
+    if not ok:
+        log(f"FAILED: OMP did not start in {pane} ({args.label}); tab {tab} left open")
+        sys.exit(f"fm-spawn: OMP did not start in pane {pane} within {OMP_WAIT_S} s (tab {tab} left open)")
+    time.sleep(3 * PAUSE)  # let the OMP editor take input
+    msg = f"Read {task} and do the task."
+    msg += (" Owner questions: ONLY as a fenced ```ask JSON block posted via the bot /post (buttons), never as a numbered list;"
+            " last option \"✏️ Other (type or dictate a reply)\"; read the message back and confirm it has buttons.")
+    if args.card:
+        msg += (f" Card: {args.card} (update it with fm set/fm field)."
+                f" Last step: write the worker-done receipt with fm receipt {args.card} done|failed|blocked"
+                f" \"<summary>\" --verified live|tests|typecheck|none --evidence <commit/file/URL>;"
+                f" run fm beat {args.card} during long silent work.")
+    if gaps:
+        msg += f" The task file names no {', '.join(gaps)}: write your own before you start and report against it."
+    msg += " For engineering work follow skill pstack (playbook + principles)."
+    if p["worktree"]:
+        msg += " " + merge_steps(p["repo"], p["worktree"], p["branch"], p["base"])
+    herdr("agent", "prompt", pane, msg)
+    if args.card:
+        run([FM, "field", args.card, "job", pane], check=False)
+        run([FM, "field", args.card, "stack", stack], check=False)
+        where = f"worktree {p['worktree']} ({p['branch']})" if p["worktree"] else p["cwd"]
+        run([FM, "set", args.card, "running", f"fm-spawn: tab {args.label} ({pane}) in {where}"], check=False)
+    start_waiter(pane, args.label, stack, args.card, task)  # detached: the caller does not wait for the mirror sync
+    log(f"spawned {args.label}: tab {tab} pane {pane} cwd {p['cwd']} card {args.card or '-'} stack {stack}")
+    print(json.dumps(out))
+    return 0
+
+
+# ---------- stack and Discord channel (owner 2026-10-24) ----------
+
+def pick_stack(args):
+    """--stack, else the card's area mapped to a stack, else firstmate."""
+    if args.stack:
+        return args.stack
+    if not args.card:
+        return "firstmate"
+    r = run([FM, "get", args.card], check=False)
+    try:
+        return stack_of_area(json.loads(r.stdout).get("area"))
+    except Exception:
+        return "firstmate"
+
+
+def pane_channel(pane):
+    """Discord channel id the bot's mirror made for this pane (or tab) id (agents.json), or None."""
+    try:
+        entries = json.load(open(AGENTS))
+    except Exception:
+        return None
+    return next((e["channelId"] for e in entries
+                 if pane in (e.get("paneId"), e.get("tabId")) and e.get("channelId") and not e.get("archived")
+                 and e.get("machine", "main") == "main"), None)  # Herdr ids are per host; fm-spawn runs on the main host
+
+
+def post(channel, text):
+    """Bot loopback /post. Returns (ok, detail)."""
+    import urllib.error, urllib.request
+    req = urllib.request.Request(POST_URL, data=json.dumps({"channel": channel, "text": text}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return True, json.loads(r.read() or b"{}").get("url", "")
+    except urllib.error.HTTPError as e:
+        return False, f"{e.code} {e.read().decode(errors='replace')[:200]}"
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def channel_text(label, card, stack, task, full=True, pane=None):
+    if not task:  # --adopt: a terminal job that started without fm-spawn
+        return (f"📌 **Terminal job** (fm-spawn --adopt): {label}\nCard: `{card or '-'}` · stack: {stack}\n"
+                f"This channel mirrors Herdr pane `{pane}`.")
+    head = f"📝 **Task** (fm-spawn): {label}\nCard: `{card or '-'}` · stack: {stack}\n"
+    if not full:
+        return head + f"Task file: `{task}`"
+    try:
+        body = open(task).read().strip()
+    except Exception:
+        body = ""
+    body = body.replace("```ask", "```text")  # the task text must not become an owner menu
+    if len(body) > 1500:
+        body = body[:1500].rstrip() + "\n…"
+    return head + (f"\n{body}\n\n" if body else "") + f"Task file: `{task}`"
+
+
+def await_channel(args):
+    """Wait until the mirror lists the pane with a channel, then post the task text there."""
+    pane, deadline = args.await_channel, time.time() + CHANNEL_WAIT_S
+    ch = pane_channel(pane)
+    while not ch and time.time() < deadline:
+        time.sleep(5 * PAUSE)
+        ch = pane_channel(pane)
+    if not ch:
+        log(f"channel: no mirrored channel for {pane} ({args.label}) within {CHANNEL_WAIT_S} s; task not posted")
+        return 3
+    ok, detail = post(ch, channel_text(args.label, args.card, args.stack, args.task, pane=pane))
+    if not ok and args.task:  # e.g. the bot refused the text: post the short form
+        log(f"channel: full task post to {ch} failed ({detail}); posting the short form")
+        ok, detail = post(ch, channel_text(args.label, args.card, args.stack, args.task, full=False))
+    log(f"channel: {pane} ({args.label}) -> {ch}: {'posted ' + detail if ok else 'post failed: ' + detail}")
+    if ok and not args.task:
+        adopted_update(lambda d: d.__setitem__(pane, {"card": args.card, "channel": ch, "tsMs": int(time.time() * 1000)}))
+    return 0 if ok else 2
+
+
+# ---------- adopt live terminal jobs (owner 2026-10-24 addendum) ----------
+
+ITEMS = os.environ.get("FM_SPAWN_ITEMS") or os.path.join(HOME, "Documents/reports/web/firstmate/items.json")
+ADOPTED = os.path.join(STATE, "adopted.json")  # panes whose channel already got the adopt post
+HERDR_ID = re.compile(r"^w[A-Za-z0-9]+:[pt][A-Za-z0-9]+$")
+
+
+def adopted_update(fn):
+    os.makedirs(STATE, exist_ok=True)
+    with open(ADOPTED + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            data = json.load(open(ADOPTED))
+        except Exception:
+            data = {}
+        fn(data)
+        with open(ADOPTED + ".tmp", "w") as f:
+            json.dump(data, f, indent=1)
+        os.replace(ADOPTED + ".tmp", ADOPTED)
+        return data
+
+
+def start_waiter(pane, label, stack, card=None, task=None):
+    if CHANNEL_WAIT_S <= 0:
+        return
+    cmd = [sys.executable, os.path.realpath(__file__), "--await-channel", pane, "--label", label, "--stack", stack]
+    cmd += (["--card", card] if card else []) + (["--task", task] if task else [])
+    os.makedirs(STATE, exist_ok=True)
+    with open(LOG, "a") as lf:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, start_new_session=True)
+
+
+def adopt(pane, card, stack, label, dry_run=False):
+    """Give a live terminal job its stack (on the card) and post a note in its mirrored channel once it has one.
+    The bot's mirror makes the channel for every live OMP pane by itself; this links card, stack and channel."""
+    if not stack:
+        stack = pick_stack(argparse.Namespace(stack=None, card=card))
+    label = label or card or pane
+    out = {"pane": pane, "card": card, "stack": stack, "channel": pane_channel(pane)}
+    if dry_run:
+        print(json.dumps({"dry_run": True, **out}, ensure_ascii=False))
+        return 0
+    if card:
+        run([FM, "field", card, "job", pane], check=False)
+        run([FM, "field", card, "stack", stack], check=False)
+    start_waiter(pane, label, stack, card)
+    log(f"adopt {pane} card {card or '-'} stack {stack} channel {out['channel'] or 'pending'}")
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+def adopt_all(dry_run=False):
+    """Adopt every open card whose `job` is a live Herdr pane/tab: set a missing stack (area, else firstmate) and
+    post one note per pane in its channel. Repeatable: panes already noted (adopted.json) are skipped."""
+    try:
+        data = json.load(open(ITEMS))
+    except Exception as e:
+        sys.exit(f"fm-spawn --adopt-all: cannot read {ITEMS}: {e}")
+    items = data if isinstance(data, list) else data.get("items", [])
+    live = set()
+    for p in panes():
+        live.update(x for x in (p.get("pane_id"), p.get("tab_id")) if x)
+    try:
+        done = json.load(open(ADOPTED))
+    except Exception:
+        done = {}
+    n, started, waits = 0, set(), []
+    noted_channels = {v.get("channel") for v in done.values() if isinstance(v, dict)}
+    for c in items:
+        job = c.get("job")
+        job = str((job[0] if job else "") if isinstance(job, list) else (job or "")).strip()
+        if c.get("s") == "done" or not HERDR_ID.match(job) or job not in live:
+            continue
+        stack = c.get("stack") or stack_of_area(c.get("area"))
+        ch = pane_channel(job)
+        # one note per pane/channel, even when several cards link it (or one links the pane, another its tab)
+        posted = job in done or job in started or (ch and (ch in started or ch in noted_channels))
+        print(f"{'DRY ' if dry_run else ''}adopt {job} card {c.get('id')} stack {stack}"
+              f"{'' if c.get('stack') else ' (set)'} channel {ch or 'pending'}"
+              f"{' (already noted)' if posted else ''}")
+        n += 1
+        if not posted:
+            started.update(x for x in (job, ch) if x)
+        if dry_run:
+            continue
+        if not c.get("stack"):
+            run([FM, "field", c["id"], "stack", stack], check=False)
+        if not posted:
+            # Finance cards: no title in Discord (it can carry positions or account data), as on the master queue.
+            # Any card on the finance stack counts ("Finance: ..." areas map there too), not only area == "finance".
+            label = f"Finance card {c['id']}" if stack == "finance" else (c.get("t") or c["id"])
+            waits.append(argparse.Namespace(await_channel=job, label=label, stack=stack, card=c["id"], task=None))
+    log(f"adopt-all: {n} live terminal job(s){' (dry run)' if dry_run else ''}")
+    # In-process waits, joined: a detached child would die with a systemd one-shot unit's cgroup.
+    if waits and CHANNEL_WAIT_S > 0:
+        import threading
+        ts = [threading.Thread(target=await_channel, args=(w,)) for w in waits]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+    if not n:
+        print("fm-spawn --adopt-all: no open card links a live terminal pane")
+    return 0
+
+
+# ---------- shared dependencies ----------
+
+LOCKS = ("bun.lock", "bun.lockb", "pnpm-lock.yaml", "package-lock.json", "yarn.lock")
+PY_LOCKS = ("uv.lock",)
+DEP_NAMES = ("node_modules", ".venv")
+SKIP_WALK = {"node_modules", ".git", ".venv", "dist", "build", ".next", ".cache"}
+# Owner safety rule 2026-10-23: never symlink a writable node_modules/.venv into a worktree (an install
+# there would write through the link into the main checkout). Each worktree gets its OWN dependency
+# folders, built from content-addressed shared stores with hard links: bun's global cache, the pnpm
+# store, the uv cache. Files are shared on disk; the folders are not.
+STORE_ENV = {"UV_LINK_MODE": "hardlink"}
+
+
+def install_cmd(lock):
+    return {"bun.lock": ["bun", "install", "--frozen-lockfile", "--backend=hardlink"],
+            "bun.lockb": ["bun", "install", "--frozen-lockfile", "--backend=hardlink"],
+            "pnpm-lock.yaml": ["pnpm", "install", "--frozen-lockfile", "--package-import-method=hardlink"],
+            "package-lock.json": ["npm", "ci", "--prefer-offline"],  # npm has no store; cache only
+            "yarn.lock": ["yarn", "install", "--frozen-lockfile"],
+            "uv.lock": ["uv", "sync", "--frozen"]}.get(lock)
+
+
+def main_of(wt):
+    wl = git(wt, "worktree", "list", "--porcelain").stdout
+    return next(l[9:] for l in wl.splitlines() if l.startswith("worktree "))
+
+
+def lock_of(d, names):
+    return next((n for n in names if os.path.isfile(os.path.join(d, n))), None)
+
+
+def lock_roots(tree, names=LOCKS):
+    """Relative dirs (depth <= 3) of tree that hold a lockfile, outermost first; nested workspace
+    packages under a root lock are covered by the root install."""
+    out = []
+    for cur, dirs, _ in os.walk(tree):
+        rel = os.path.relpath(cur, tree)
+        if lock_of(cur, names) and not any(rel == r or rel.startswith(r + os.sep) for r in out if r != ".") \
+                and not ("." in out and names is LOCKS):
+            out.append(rel)
+        dirs[:] = [d for d in dirs if d not in SKIP_WALK and not d.startswith(".")]
+        if cur.count(os.sep) - tree.count(os.sep) >= 3:
+            dirs[:] = []
+    return out
+
+
+def store_install(wt, rel, lock, timeout=900):
+    cmd = install_cmd(lock)
+    if not cmd:
+        return f"{rel}: no store install for {lock}"
+    try:
+        r = subprocess.run(cmd, cwd=os.path.join(wt, rel), capture_output=True, text=True, timeout=timeout,
+                           env={**os.environ, **STORE_ENV, "CI": "1"})
+        return f"{rel}: {' '.join(cmd[:2])} exit {r.returncode}" + ("" if r.returncode == 0 else
+                                                                   f" ({(r.stderr or r.stdout).strip()[-160:]})")
+    except Exception as e:
+        return f"{rel}: {' '.join(cmd[:2])} failed ({e})"
+
+
+def unlink_shared(wt):
+    """Remove dependency/data symlinks that point outside the worktree. Never follows them."""
+    wt, gone = real(wt), []
+    for cur, dirs, files in os.walk(wt):
+        for n in list(dirs) + files:
+            p = os.path.join(cur, n)
+            if os.path.islink(p) and n in (*DEP_NAMES, "data", ".cache", "models") and not inside(real(p), wt):
+                os.unlink(p)
+                gone.append(os.path.relpath(p, wt))
+        dirs[:] = [d for d in dirs if d not in SKIP_WALK and not os.path.islink(os.path.join(cur, d))]
+    return gone
+
+
+def share_into(main, wt, install=True):
+    """Give the worktree its own node_modules/.venv from the shared stores. Returns report lines."""
+    main, wt, out = real(main), real(wt), []
+    if main == wt:
+        return ["main checkout; nothing to share"]
+    for rel in unlink_shared(wt):
+        out.append(f"{rel}: removed writable shared link")
+    for rel in lock_roots(wt):
+        lock = lock_of(os.path.join(wt, rel), LOCKS)
+        out.append(store_install(wt, rel, lock) if install else f"{rel}: would run {' '.join(install_cmd(lock)[:2])}")
+    for rel in lock_roots(wt, PY_LOCKS):
+        out.append(store_install(wt, rel, "uv.lock") if install else f"{rel}: would run uv sync (UV_LINK_MODE=hardlink)")
+    return out or ["no lockfile; nothing to install"]
+
+
+def run_check(wt):
+    """Typecheck (or build/test) once after a conversion. Returns a report line."""
+    for rel in lock_roots(wt)[:1]:
+        pj = os.path.join(wt, rel, "package.json")
+        try:
+            scripts = json.load(open(pj)).get("scripts", {})
+        except Exception:
+            return f"{rel}: no package.json check"
+        name = next((n for n in ("typecheck", "build", "test") if n in scripts), None)
+        if not name:
+            return f"{rel}: no typecheck/build/test script"
+        pm = {"bun.lock": "bun", "bun.lockb": "bun", "pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn"}.get(
+            lock_of(os.path.join(wt, rel), LOCKS), "npm")
+        try:
+            r = subprocess.run([pm, "run", name], cwd=os.path.join(wt, rel), capture_output=True, text=True, timeout=900)
+            return f"{rel}: {pm} run {name} exit {r.returncode}"
+        except Exception as e:
+            return f"{rel}: {pm} run {name} failed ({e})"
+    return "no node check"
+
+
+def share_existing(args):
+    """Convert idle worktrees: remove writable shared links, reinstall from the shared stores, run a check."""
+    all_panes = panes() if not os.environ.get("FM_SPAWN_NO_PANES") else []
+    mains, seen = set(), set()
+    for cur, dirs, _ in os.walk(args.root):
+        if ".git" in dirs or os.path.isfile(os.path.join(cur, ".git")):
+            mains.add(cur)
+        dirs[:] = [d for d in dirs if (d not in SKIP_WALK and not d.startswith(".")) or d == ".worktrees"]
+        if cur.count(os.sep) - args.root.count(os.sep) >= 3:
+            dirs[:] = []
+    for m in sorted(mains):
+        try:
+            trees = worktrees(m)
+        except Exception:
+            continue
+        if not trees or real(trees[0]["path"]) in seen:
+            continue
+        seen.add(real(trees[0]["path"]))
+        for t in trees[1:]:
+            wt = real(t["path"])
+            if not os.path.isdir(wt) or not any(os.path.lexists(os.path.join(wt, r, "node_modules"))
+                                                 or os.path.lexists(os.path.join(wt, r, ".venv"))
+                                                 for r in lock_roots(wt) + lock_roots(wt, PY_LOCKS)):
+                continue
+            if panes_in(wt, all_panes):
+                print(f"KEEP (live pane): {wt}")
+                continue
+            if args.dry_run:
+                print(f"DRY would convert: {wt}")
+                continue
+            lines = share_into(trees[0]["path"], wt) + [run_check(wt)]
+            log(f"share-existing {wt}: {'; '.join(lines)}")
+            print(f"converted: {wt}\n  " + "\n  ".join(lines))
+    return 0
+
+
+# ---------- cleanup ----------
+
+def check_tree(w, all_panes):
+    """Return (removable, reason). Pure apart from git/pane reads."""
+    path, branch, repo = w["path"], w.get("branch"), w["repo"]
+    if not os.path.isdir(path):
+        return False, "gone (path missing; run git worktree prune)"
+    dirty = "\n".join(l for l in git(path, "status", "--porcelain").stdout.splitlines()
+                      if not (l.startswith("?? ") and os.path.basename(l[3:].rstrip("/")) in DEP_NAMES
+                              and os.path.islink(os.path.join(path, l[3:].rstrip("/")))))
+    if dirty:
+        return False, f"KEEP: {len(dirty.splitlines())} uncommitted/untracked file(s)"
+    base = merge_target(w.get("base") or default_base(repo))
+    if not branch:
+        return False, "KEEP: detached HEAD (no branch to check)"
+    if git(repo, "merge-base", "--is-ancestor", f"refs/heads/{branch}", base, check=False).returncode != 0:
+        ahead = git(repo, "rev-list", "--count", f"{base}..refs/heads/{branch}", check=False).stdout.strip() or "?"
+        return False, f"KEEP: not merged into {base} ({ahead} commit(s) ahead)"
+    busy = panes_in(path, all_panes)
+    if busy:
+        return False, f"KEEP: live pane(s) {', '.join(x.get('pane_id', '?') for x in busy[:4])} work in it"
+    return True, f"merged into {base}, clean, idle"
+
+
+def cleanup(args):
+    reg = reg_read()
+    repos = sorted({w["repo"] for w in reg if os.path.isdir(w["repo"])})
+    trees = {w["path"]: w for w in reg}
+    for repo in repos:  # also ws/* worktrees made by hand with the same convention
+        for t in worktrees(repo)[1:]:
+            if t["path"] not in trees and (t["branch"] or "").startswith("ws/"):
+                trees[t["path"]] = {"repo": repo, "path": t["path"], "branch": t["branch"], "base": None}
+    if not trees:
+        print("fm-spawn --cleanup: no fm-spawn worktrees")
+        return 0
+    all_panes = panes()
+    removed = []
+    for path, w in sorted(trees.items()):
+        try:
+            ok, why = check_tree(w, all_panes)
+        except Exception as e:
+            ok, why = False, f"KEEP: check failed ({e})"
+        if ok and not args.dry_run:
+            unlink_shared(path)  # only for trees that will be removed; kept trees keep their deps
+            r = git(w["repo"], "worktree", "remove", path, check=False)  # no --force: git refuses a dirty tree
+            if r.returncode != 0:
+                ok, why = False, f"KEEP: git worktree remove refused: {r.stderr.strip()[:200]}"
+            else:
+                b = git(w["repo"], "branch", "-d", w["branch"], check=False)  # -d refuses unmerged branches
+                why += "; removed" + ("" if b.returncode == 0 else f" (branch kept: {b.stderr.strip()[:120]})")
+                removed.append(path)
+                log(f"cleanup removed {path} ({w['branch']})")
+        elif why.startswith("gone") and not args.dry_run:
+            git(w["repo"], "worktree", "prune", check=False)
+            removed.append(path)
+        tag = "DRY would remove" if ok and args.dry_run else ("removed" if path in removed else "keep")
+        print(f"{tag}: {path} [{w.get('branch')}] {why}")
+    if removed:
+        reg_update(lambda d: d.update(worktrees=[w for w in d["worktrees"] if w["path"] not in removed]))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="fm-spawn", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--label")
+    ap.add_argument("--cwd")
+    ap.add_argument("--task")
+    ap.add_argument("--card")
+    ap.add_argument("--slug")
+    ap.add_argument("--base")
+    ap.add_argument("--workspace")
+    ap.add_argument("--no-worktree", action="store_true")
+    ap.add_argument("--stack", choices=sorted(STACK_AREAS))
+    ap.add_argument("--adopt", metavar="PANE", help="give a live terminal job (Herdr pane/tab id) its stack + channel post")
+    ap.add_argument("--adopt-all", action="store_true", help="adopt every live terminal job linked from an open card")
+    ap.add_argument("--await-channel", metavar="PANE", help=argparse.SUPPRESS)
+    ap.add_argument("--cleanup", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--share")
+    ap.add_argument("--share-existing", action="store_true")
+    ap.add_argument("--root", default=os.path.join(HOME, "Github"))
+    ap.add_argument("--no-install", action="store_true")
+    a = ap.parse_args()
+    if a.await_channel:
+        return await_channel(a)
+    if a.adopt:
+        return adopt(a.adopt, a.card, a.stack, a.label, a.dry_run)
+    if a.adopt_all:
+        return adopt_all(a.dry_run)
+    if a.share:
+        wt = real(a.share)
+        main_tree = main_of(wt)
+        for line in share_into(main_tree, wt, install=not a.no_install):
+            print(line)
+        return 0
+    if a.share_existing:
+        return share_existing(a)
+    if a.cleanup:
+        return cleanup(a)
+    if not (a.label and a.cwd and a.task):
+        ap.error("--label, --cwd and --task are required (or use --cleanup)")
+    return spawn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

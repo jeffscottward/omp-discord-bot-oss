@@ -1,0 +1,7 @@
+[Unit]
+Description=Delete Discord channels that sat in 📦 Archive for 24 h (owner 2026-10-19: OMP chat history is the record; JSON copy kept)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=900
+ExecStart=/usr/bin/python3 %h/Github/tools/omp-discord-bot/scripts/purge-archive.py --min-age-hours 24

@@ -1,0 +1,7 @@
+# gitleaks config: default rules plus one allowlist for fake secrets in the redaction tests.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Fake keys/tokens used to test the outbound and terminal redaction filters"
+paths = ['''test/quickreply\.test\.ts''', '''test/secretdrop\.test\.ts''']

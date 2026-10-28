@@ -1,0 +1,7 @@
+[Unit]
+Description=Daily to-do digest 8 AM
+[Timer]
+OnCalendar=*-*-* 08:00
+Persistent=true
+[Install]
+WantedBy=timers.target

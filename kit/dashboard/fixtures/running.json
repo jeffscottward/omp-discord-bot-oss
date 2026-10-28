@@ -1,0 +1,186 @@
+{
+ "generated": "2026-10-19T13:00:00+00:00",
+ "host": "example-host",
+ "hostLabel": "local",
+ "jobs": [
+  {
+   "id": "w1:p1",
+   "tab": "w1:t1",
+   "tabLabel": "🔧 Demo job",
+   "tabNumber": 2,
+   "title": "DEMO: demo job",
+   "code": "DEMO",
+   "status": "working",
+   "cwd": "~/Github",
+   "started": "2026-10-19T13:00:00+00:00",
+   "active": "2026-10-19T13:00:00+00:00",
+   "tasks": [],
+   "items": [
+    "demo-job"
+   ]
+  }
+ ],
+ "jobsOk": true,
+ "itemJobs": {
+  "demo-job": [
+   "w1:p1"
+  ]
+ },
+ "itemUnits": {
+  "nightly-build": [
+   "local:nightly-build.service"
+  ]
+ },
+ "services": [
+  {
+   "unit": "omp-discord-bot.service",
+   "host": "local",
+   "group": "Discord + OMP",
+   "desc": "OMP Discord bot",
+   "state": "running",
+   "active": "active",
+   "sub": "running",
+   "result": "success",
+   "enabled": "enabled",
+   "lastStart": "2026-10-19T13:00:00+00:00",
+   "lastExit": null,
+   "exitStatus": "0",
+   "since": "2026-10-19T13:00:00+00:00",
+   "timer": null,
+   "timerEnabled": null,
+   "next": null,
+   "logs": "journalctl --user -u omp-discord-bot",
+   "link": null
+  },
+  {
+   "unit": "omp-reports-web.service",
+   "host": "local",
+   "group": "Discord + OMP",
+   "desc": "Static report pages",
+   "state": "running",
+   "active": "active",
+   "sub": "running",
+   "result": "success",
+   "enabled": "enabled",
+   "lastStart": "2026-10-19T13:00:00+00:00",
+   "lastExit": null,
+   "exitStatus": "0",
+   "since": "2026-10-19T13:00:00+00:00",
+   "timer": null,
+   "timerEnabled": null,
+   "next": null,
+   "logs": "journalctl --user -u omp-reports-web",
+   "link": "/reports/"
+  },
+  {
+   "unit": "reminders-inbox.service",
+   "host": "local",
+   "group": "Reminders",
+   "desc": "iOS Reminders inbox",
+   "state": "running",
+   "active": "active",
+   "sub": "running",
+   "result": "success",
+   "enabled": "enabled",
+   "lastStart": "2026-10-19T13:00:00+00:00",
+   "lastExit": null,
+   "exitStatus": "0",
+   "since": "2026-10-19T13:00:00+00:00",
+   "timer": null,
+   "timerEnabled": null,
+   "next": null,
+   "logs": "journalctl --user -u reminders-inbox",
+   "link": null
+  },
+  {
+   "unit": "nightly-build.service",
+   "host": "local",
+   "group": "Builds",
+   "desc": "Nightly build (example)",
+   "state": "waiting",
+   "active": "inactive",
+   "sub": "dead",
+   "result": "success",
+   "enabled": "enabled",
+   "lastStart": "2026-10-19T13:00:00+00:00",
+   "lastExit": null,
+   "exitStatus": "0",
+   "since": "2026-10-19T13:00:00+00:00",
+   "timer": "nightly-build.timer",
+   "timerEnabled": "enabled",
+   "next": "2026-10-19T14:00:00+00:00",
+   "logs": "journalctl --user -u nightly-build",
+   "link": null,
+   "items": [
+    "nightly-build"
+   ]
+  },
+  {
+   "unit": "firstmate-index.service",
+   "host": "local",
+   "group": "Maintenance",
+   "desc": "FIRSTMATE dashboard index",
+   "state": "waiting",
+   "active": "inactive",
+   "sub": "dead",
+   "result": "success",
+   "enabled": "enabled",
+   "lastStart": "2026-10-19T13:00:00+00:00",
+   "lastExit": null,
+   "exitStatus": "0",
+   "since": "2026-10-19T13:00:00+00:00",
+   "timer": "firstmate-index.timer",
+   "timerEnabled": "enabled",
+   "next": "2026-10-19T14:00:00+00:00",
+   "logs": "journalctl --user -u firstmate-index",
+   "link": null
+  },
+  {
+   "unit": "fm-autoclear.service",
+   "host": "local",
+   "group": "Maintenance",
+   "desc": "FIRSTMATE tracker auto-clear",
+   "state": "waiting",
+   "active": "inactive",
+   "sub": "dead",
+   "result": "success",
+   "enabled": "enabled",
+   "lastStart": "2026-10-19T13:00:00+00:00",
+   "lastExit": null,
+   "exitStatus": "0",
+   "since": "2026-10-19T13:00:00+00:00",
+   "timer": "fm-autoclear.timer",
+   "timerEnabled": "enabled",
+   "next": "2026-10-19T14:00:00+00:00",
+   "logs": "journalctl --user -u fm-autoclear",
+   "link": null
+  },
+  {
+   "unit": "report-sync.service",
+   "host": "peer",
+   "group": "Peer host",
+   "desc": "Report sync on the peer host (example)",
+   "state": "waiting",
+   "active": "inactive",
+   "sub": "dead",
+   "result": "success",
+   "enabled": "enabled",
+   "lastStart": "2026-10-19T13:00:00+00:00",
+   "lastExit": null,
+   "exitStatus": "0",
+   "since": "2026-10-19T13:00:00+00:00",
+   "timer": "report-sync.timer",
+   "timerEnabled": "enabled",
+   "next": "2026-10-19T14:00:00+00:00",
+   "logs": "ssh peer journalctl -u report-sync",
+   "link": null
+  }
+ ],
+ "peer": {
+  "host": "peer",
+  "group": "Peer host",
+  "ok": true,
+  "checked": "2026-10-19T13:00:00+00:00",
+  "lastOk": "2026-10-19T13:00:00+00:00"
+ }
+}

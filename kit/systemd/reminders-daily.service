@@ -1,0 +1,5 @@
+[Unit]
+Description=Daily to-do + reminders digest to Discord
+[Service]
+Type=oneshot
+ExecStart=@BUN@ @KIT@/reminders-inbox/daily.ts

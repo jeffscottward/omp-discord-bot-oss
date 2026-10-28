@@ -1,0 +1,13 @@
+[Unit]
+Description=Lofi Radio Discord bot (📻 Lofi Radio voice channel)
+After=network-online.target
+ConditionPathExists=%h/.config/omp-discord/radio.env
+
+[Service]
+WorkingDirectory=%h/Github/tools/omp-discord-bot
+ExecStart=%h/.local/share/mise/shims/bun scripts/radio.ts
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

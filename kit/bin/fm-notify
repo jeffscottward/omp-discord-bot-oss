@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""fm-notify: post one alert to the alerts channel through the bot's loopback /post (the default kit alert sender).
+Usage: fm-notify --kind KIND --summary TEXT [--action TEXT] [--workspace NAME] [--tab NAME] [--channel CH] [--dry-run]
+  KIND: error | authentication | completion | progress | test (any word; it selects the emoji).
+Settings (~/.config/omp-discord/kit.env): OMP_BOT_POST_URL (default http://127.0.0.1:47821/post),
+FM_ALERTS_CHANNEL (channel id or name known to the bot; default omp-alerts).
+The kit scripts (fm-tabwatch, auth-pane, firstmate-sweep, firstmate-tests) call the command in $OMP_NOTIFY with the
+same arguments; when OMP_NOTIFY is not set, they call this script.
+Exit 0 when the bot accepted the post, 1 when it did not, 2 on usage errors. Never send secrets in the text.
+"""
+import argparse, json, os, sys, urllib.request
+
+
+def _kit_env():
+    """Read the kit settings file (KEY=VALUE lines; the shell kit scripts read the same file).
+    File: $OMP_KIT_ENV, else ~/.config/omp-discord/kit.env. A variable that is already set in the environment wins."""
+    path = os.environ.get("OMP_KIT_ENV") or os.path.expanduser("~/.config/omp-discord/kit.env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or line.startswith("#") or not key.isidentifier() or key in os.environ:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] == "'":
+            val = val[1:-1]
+        else:
+            if len(val) >= 2 and val[0] == val[-1] == '"':
+                val = val[1:-1]
+            val = os.path.expanduser(os.path.expandvars(val))
+        os.environ[key] = val
+
+
+_kit_env()
+EMOJI = {"error": "🚨", "authentication": "🔐", "completion": "✅", "progress": "⏳", "test": "🧪"}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Post one alert to the alerts channel through the bot.")
+    ap.add_argument("--kind", default="progress")
+    ap.add_argument("--summary", required=True)
+    ap.add_argument("--action")
+    ap.add_argument("--workspace")
+    ap.add_argument("--tab")
+    ap.add_argument("--channel", default=os.environ.get("FM_ALERTS_CHANNEL") or "omp-alerts")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    clean = lambda s, n: " ".join(str(s or "").split())[:n]
+    where = " / ".join(x for x in (clean(a.workspace, 80), clean(a.tab, 80)) if x)
+    text = f"{EMOJI.get(a.kind, '🔔')} **{clean(a.kind, 20)}**{f' ({where})' if where else ''}: {clean(a.summary, 240)}"
+    if a.action:
+        text += f"\n➡️ {clean(a.action, 240)}"
+    body = {"channel": a.channel, "text": text}
+    url = os.environ.get("OMP_BOT_POST_URL") or "http://127.0.0.1:47821/post"
+    if a.dry_run:
+        print(json.dumps({"url": url, **body}, ensure_ascii=False))
+        return 0
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            ok = 200 <= r.status < 300
+            print("published" if ok else f"post failed: HTTP {r.status}")
+            return 0 if ok else 1
+    except Exception as e:
+        print(f"post failed: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""auth-pane: open ONE Herdr sign-in pane for a login (card auth-loop-guard, owner 2026-10-19).
+
+Why: on 2026-10-19 a job ran `pscale auth login` in 5 new sign-in panes within 12 min; each opened a browser
+tab and pinged the owner, and each failed (rc 2, CI=true / TERM=dumb inherited). This helper allows one open
+sign-in per operation and at most 2 attempts per operation per hour.
+
+Open a sign-in pane (below the caller's pane, never focused):
+  auth-pane --op NAME [--caller PANE] [--host HOST] [--label TEXT] [--cwd DIR] [--no-notify] -- COMMAND [ARGS...]
+    NAME: one login, e.g. pscale-myapp (lower case, digits, . _ -). Use one NAME per login and host.
+    The pane runs COMMAND exactly (argv, no shell) with `env -u CI TERM=xterm-256color`, a 20 min timeout,
+    and closes itself when the command ends (10 s delay after a failure so the error is readable).
+    The result goes to ~/.local/state/auth-pane/NAME.rc ({attempt, rc, reason, started, ended}).
+    --host other than this machine: runs `ssh -t HOST env -u CI TERM=xterm-256color COMMAND` after checking
+    that `ssh HOST hostname` prints HOST (strict host keys). Never put secrets in COMMAND.
+    Sends ONE authentication notice ($OMP_NOTIFY, default fm-notify) per opened pane unless --no-notify; callers must not
+    send another one for the same sign-in.
+  auth-pane --wait NAME [--wait-s 1260]   wait (bounded) for the current attempt; exit status = its rc
+                                          (124 = still open at the deadline, 1 = pane closed without a result)
+  auth-pane --status NAME                 JSON: open sign-in (pane), attempts in the last hour, last result
+  auth-pane --reset-cap NAME              forget the attempt history (ONLY when the owner asks for a new try)
+  auth-pane --test                        self-test with a fake herdr and fake login commands
+
+Refusals (nothing opens, nothing is sent):
+  exit 3: a sign-in for NAME is still open (lock held: its pane exists and is < 20 min old, or its runner is
+          alive), or a process with exactly the same COMMAND argv is alive. Prints the existing pane id.
+  exit 4: 2 attempts for NAME in the last hour. Ask the owner for a non-browser credential instead.
+Other exits: 0 opened, 1 error, 2 usage.
+State: ~/.local/state/auth-pane/ (NAME.lock, NAME.attempts.json, NAME.rc, events.jsonl for fm-tabwatch).
+Env (tests): AUTH_PANE_STATE, AUTH_PANE_HERDR, AUTH_PANE_NOTIFY_CMD (JSON argv prefix), AUTH_PANE_TIMEOUT_S,
+AUTH_PANE_FAIL_HOLD_S, AUTH_PANE_SHELL_WAIT_S.
+"""
+import argparse, fcntl, json, os, re, shlex, signal, socket, subprocess, sys, tempfile, time
+
+
+def _kit_env():
+    """Read the kit settings file (KEY=VALUE lines; the shell kit scripts read the same file).
+    File: $OMP_KIT_ENV, else ~/.config/omp-discord/kit.env. A variable that is already set in the environment wins."""
+    path = os.environ.get("OMP_KIT_ENV") or os.path.expanduser("~/.config/omp-discord/kit.env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or line.startswith("#") or not key.isidentifier() or key in os.environ:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] == "'":
+            val = val[1:-1]
+        else:
+            if len(val) >= 2 and val[0] == val[-1] == '"':
+                val = val[1:-1]
+            val = os.path.expanduser(os.path.expandvars(val))
+        os.environ[key] = val
+
+
+_kit_env()
+
+
+def _herdr_bin():
+    """Herdr CLI: $HERDR_BIN, else ~/.local/bin/herdr, else herdr on PATH."""
+    import shutil
+    own = os.path.expanduser("~/.local/bin/herdr")
+    return os.environ.get("HERDR_BIN") or (own if os.access(own, os.X_OK) else (shutil.which("herdr") or "herdr"))
+
+
+def _notify_cmd():
+    """Alert sender argv (same arguments as fm-notify: --kind, --summary, --action): $OMP_NOTIFY (a command line),
+    else fm-notify next to this script (posts to $FM_ALERTS_CHANNEL through the bot's loopback /post)."""
+    import shlex
+    if os.environ.get("OMP_NOTIFY"):
+        return shlex.split(os.environ["OMP_NOTIFY"])
+    return [os.path.join(os.path.dirname(os.path.realpath(__file__)), "fm-notify")]
+
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("AUTH_PANE_STATE") or os.path.join(HOME, ".local/state/auth-pane")
+HERDR = os.environ.get("AUTH_PANE_HERDR") or _herdr_bin()
+# Sign-in waits notify through the alert sender ($OMP_NOTIFY, default fm-notify; same args and exit codes).
+NOTIFY_CMD = json.loads(os.environ["AUTH_PANE_NOTIFY_CMD"]) if os.environ.get("AUTH_PANE_NOTIFY_CMD") else _notify_cmd()
+LOCK_S = 20 * 60
+TIMEOUT_S = float(os.environ.get("AUTH_PANE_TIMEOUT_S") or LOCK_S)
+FAIL_HOLD_S = float(os.environ.get("AUTH_PANE_FAIL_HOLD_S") or 10)
+SHELL_WAIT_S = float(os.environ.get("AUTH_PANE_SHELL_WAIT_S") or 15)
+MAX_ATTEMPTS = 2
+WINDOW_S = 3600
+OP_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
+NONBROWSER = "ask the owner for a non-browser credential (API or service token) instead of another browser sign-in"
+SELF = os.path.realpath(__file__)
+
+
+def events_path():
+    return os.path.join(STATE, "events.jsonl")
+
+
+def path(op, ext):
+    return os.path.join(STATE, f"{op}.{ext}")
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def stamp(ms):
+    return time.strftime("%H:%M:%S", time.localtime(ms / 1000))
+
+
+def read_json(p, default=None):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(p, data):
+    os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".tmp-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, p)
+
+
+def event(op, kind, **kw):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    with open(events_path(), "a") as f:
+        f.write(json.dumps({"tsMs": now_ms(), "op": op, "event": kind, **kw}) + "\n")
+
+
+class OpLock:
+    """flock on NAME.flock: check-and-open is atomic, so two parallel calls cannot both open a pane."""
+    def __init__(self, op):
+        os.makedirs(STATE, mode=0o700, exist_ok=True)
+        self.f = open(path(op, "flock"), "w")
+
+    def __enter__(self):
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+# ---------- Herdr ----------
+
+def herdr(*args, check=True):
+    r = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=30)
+    try:
+        out = json.loads(r.stdout) if r.stdout.strip() else {}
+    except ValueError:
+        out = {}
+    if check and (r.returncode != 0 or "error" in out):
+        raise RuntimeError(f"herdr {' '.join(args[:2])} failed: {(r.stderr or r.stdout).strip()[:300]}")
+    return out
+
+
+def pane_info(pane):
+    if not pane:
+        return None
+    try:
+        return herdr("pane", "get", pane, check=False).get("result", {}).get("pane")
+    except Exception:
+        return None
+
+
+def plain_shell(pane):
+    """True when the pane's foreground process is its own shell (bash/zsh/...), i.e. no OMP and no command."""
+    pi = herdr("pane", "process-info", "--pane", pane, check=False).get("result", {}).get("process_info") or {}
+    fg = pi.get("foreground_processes") or []
+    return bool(fg) and all(p.get("name") in SHELLS and p.get("pid") == pi.get("shell_pid") for p in fg), fg
+
+
+def shell_ready(pane):
+    """Handshake before the exec line: a new pane's shell may drop input typed while .bashrc still runs (seen
+    2026-10-19: the exec line was echoed but never ran). Send a harmless marker until its OUTPUT appears
+    (the printed line differs from the typed one), then the shell reads input. Only before the login starts."""
+    token = f"{os.getpid()}-{int(time.time())}"
+    deadline = time.time() + SHELL_WAIT_S
+    while time.time() < deadline:
+        herdr("pane", "run", pane, f"printf 'AUTHPANE-%s\\n' READY-{token}", check=False)
+        r = subprocess.run([HERDR, "pane", "wait-output", pane, "--match", f"AUTHPANE-READY-{token}",
+                            "--timeout", "2500"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and "error" not in r.stdout:
+            return True
+    return False
+
+
+# ---------- processes ----------
+
+def proc_start(pid):
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[19]  # field 22: start time in clock ticks
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def alive(pid, start):
+    return bool(pid) and start is not None and proc_start(pid) == start
+
+
+def login_procs(argv):
+    """Local pids (this user) running the same command: same arguments, and the same program name (argv[0]
+    may be resolved, e.g. a mise shim execs /usr/bin/python3; a script may run as `node /path/script ...`).
+    Never this process or its parents."""
+    me, skip = os.getuid(), set()
+    p = os.getpid()
+    while p > 1:
+        skip.add(p)
+        try:
+            with open(f"/proc/{p}/stat") as f:
+                p = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    name, rest = os.path.basename(argv[0]), list(argv[1:])
+    hits = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) in skip:
+            continue
+        try:
+            if os.stat(f"/proc/{d}").st_uid != me:
+                continue
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                cmd = f.read().decode(errors="replace").split("\0")[:-1]
+        except OSError:
+            continue
+        if cmd and ((os.path.basename(cmd[0]) == name and cmd[1:] == rest) or
+                    (len(cmd) > 1 and os.path.basename(cmd[1]) == name and cmd[2:] == rest)):
+            hits.append(int(d))
+    return hits
+
+
+# ---------- lock and attempts ----------
+
+def held(op):
+    """The open sign-in for op, or None. Held = its runner is alive, or the lock is < 20 min old and its pane
+    still exists (the runner may not have started yet). A dead runner closes its pane (exec), so a crash frees it."""
+    lk = read_json(path(op, "lock"))
+    if not lk:
+        return None
+    if alive(lk.get("pid"), lk.get("start")):
+        return lk
+    if time.time() * 1000 < lk.get("expiresMs", 0) and pane_info(lk.get("pane")):
+        return lk
+    return None
+
+
+def attempts(op):
+    """Attempts of op, oldest first (finish() re-saves an attempt, so file order is not time order)."""
+    got = read_json(path(op, "attempts.json"), {"attempts": []}).get("attempts", [])
+    return sorted((a for a in got if isinstance(a, dict)), key=lambda a: a.get("tsMs", 0))
+
+
+def save_attempt(op, att):
+    data = read_json(path(op, "attempts.json"), {"attempts": []})
+    keep = [a for a in data.get("attempts", []) if a.get("id") != att["id"] and now_ms() - a.get("tsMs", 0) < 86400_000]
+    data["attempts"] = keep + [att]
+    write_json(path(op, "attempts.json"), data)
+
+
+def recent(op):
+    return [a for a in attempts(op) if now_ms() - a.get("tsMs", 0) < WINDOW_S * 1000]
+
+
+def clear_stale(op):
+    """Lock exists but is not held: close out its attempt (no result = pane closed or timed out) and drop it."""
+    lk = read_json(path(op, "lock"))
+    if not lk:
+        return
+    for a in attempts(op):
+        if a.get("id") == lk.get("attempt") and "rc" not in a:
+            a.update(rc=None, reason="pane closed or lock expired without a result", endedMs=now_ms())
+            save_attempt(op, a)
+            event(op, "stale", pane=lk.get("pane"), attempt=lk.get("attempt"))
+    try:
+        os.remove(path(op, "lock"))
+    except OSError:
+        pass
+
+
+def refuse(code, msg, **extra):
+    print(json.dumps({"ok": False, "refused": code, "message": msg, **extra}))
+    print(f"auth-pane: {msg}", file=sys.stderr)
+    return code
+
+
+# ---------- open ----------
+
+def notify(op, label, host, caller, n):
+    summary = f"Sign-in needed: {label} on {host} (attempt {n} of {MAX_ATTEMPTS} this hour)"
+    action = (f"Finish the sign-in in the 🔐 pane below pane {caller}. No second pane opens while it is open; "
+              f"it closes itself when the login ends.")
+    try:
+        args = [*NOTIFY_CMD, "--kind", "authentication", "--summary", summary[:240], "--action", action[:240]]
+        # Optional preferred transport for sign-in notices (AUTH_PANE_NOTIFY_TRANSPORT, e.g. ntfy): the sender gets
+        # OMP_NOTIFY_TRANSPORT=<value> first; when that fails or does not publish, the default sender runs once.
+        pref = os.environ.get("AUTH_PANE_NOTIFY_TRANSPORT", "").strip()
+        if pref:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=40, env={**os.environ, "OMP_NOTIFY_TRANSPORT": pref})
+            try:
+                st = json.loads(r.stdout.strip().splitlines()[-1]).get("status") if r.stdout.strip() else "published"
+            except Exception:
+                st = "published" if r.returncode == 0 else "error"
+            if r.returncode == 0 and st == "published":
+                return True
+        r = subprocess.run(args, capture_output=True, text=True, timeout=40)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def open_pane(a):
+    op, argv = a.op, a.command
+    if not OP_RE.match(op or ""):
+        print("auth-pane: --op must be lower case letters, digits, . _ - (max 64)", file=sys.stderr)
+        return 2
+    if not argv:
+        print("auth-pane: give the exact login command after --", file=sys.stderr)
+        return 2
+    host = a.host or socket.gethostname()
+    local = host == socket.gethostname()
+    caller = a.caller or os.environ.get("HERDR_PANE_ID")
+    if not caller:
+        print("auth-pane: no caller pane: run inside Herdr or pass --caller PANE", file=sys.stderr)
+        return 2
+    cwd = os.path.realpath(a.cwd or os.getcwd())
+    label = (a.label or f"{op} sign-in")[:60]
+    with OpLock(op):
+        lk = held(op)
+        if lk:
+            age = int((now_ms() - lk.get("tsMs", now_ms())) / 60000)
+            event(op, "refused-open", pane=lk.get("pane"))
+            return refuse(3, f"refused: the sign-in for {op} is already open in pane {lk.get('pane')} (tab {lk.get('tab')}, "
+                             f"opened {age} min ago). Use that pane; do not open another one.",
+                          pane=lk.get("pane"), tab=lk.get("tab"), attempt=lk.get("attempt"))
+        clear_stale(op)
+        pids = login_procs(argv) if local else []
+        if pids:
+            event(op, "refused-running", pids=pids)
+            return refuse(3, f"refused: the same login command already runs (pid {', '.join(map(str, pids))}). "
+                             f"Wait for it or finish it; do not start another one.", pids=pids)
+        rec = recent(op)
+        if len(rec) >= MAX_ATTEMPTS:
+            nxt = min(x.get("tsMs", 0) for x in rec) + WINDOW_S * 1000
+            last = rec[-1]
+            event(op, "refused-cap", n=len(rec))
+            return refuse(4, f"refused: {len(rec)} sign-in attempts for {op} in the last hour (max {MAX_ATTEMPTS}; last rc "
+                             f"{last.get('rc', 'open')}). Stop and {NONBROWSER}. Next browser attempt allowed after {stamp(nxt)}.",
+                          next_allowed_ms=nxt)
+        cp = pane_info(caller)
+        if not cp:
+            print(f"auth-pane: caller pane {caller} not found", file=sys.stderr)
+            return 1
+        r = herdr("pane", "split", "--pane", caller, "--direction", "down", "--no-focus",
+                  "--env", "OMP_AUTO_START=0", "--cwd", cwd)
+        pane = (r.get("result", {}).get("pane") or {}).get("pane_id")
+        if not pane:
+            print(f"auth-pane: pane split returned no pane id: {json.dumps(r)[:300]}", file=sys.stderr)
+            return 1
+        ok, fg, deadline = False, [], time.time() + SHELL_WAIT_S
+        while time.time() < deadline:
+            ok, fg = plain_shell(pane)
+            if ok or any(p.get("name") == "omp" for p in fg):
+                break
+            time.sleep(0.3)
+        if ok and not shell_ready(pane):
+            ok, fg = False, [{"name": "shell did not answer the ready marker"}]
+        if not ok:
+            herdr("pane", "close", pane, check=False)  # our own new pane only
+            print(f"auth-pane: new pane {pane} has no ready plain shell ({[p.get('name') for p in fg]}); closed it", file=sys.stderr)
+            return 1
+        herdr("pane", "rename", pane, f"🔐 {label}", check=False)
+        n = len(rec) + 1
+        aid = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+        att = {"id": aid, "tsMs": now_ms(), "op": op, "n": n, "pane": pane, "tab": cp.get("tab_id"),
+               "workspace": cp.get("workspace_id"), "caller": caller, "host": host, "local": local,
+               "argv": argv, "label": label, "cwd": cwd, "timeoutS": TIMEOUT_S, "failHoldS": FAIL_HOLD_S}
+        save_attempt(op, att)
+        write_json(path(op, "lock"), {"op": op, "attempt": aid, "pane": pane, "tab": cp.get("tab_id"), "caller": caller,
+                                      "tsMs": att["tsMs"], "expiresMs": att["tsMs"] + int(TIMEOUT_S * 1000) + 60_000})
+        # The pane's env comes from the Herdr server, not from this process: pass the state dir explicitly
+        # (timeout and failure delay travel in the attempt record).
+        herdr("pane", "run", pane, f"exec {shlex.quote(sys.executable)} {shlex.quote(SELF)} --run {op} {aid} {shlex.quote(STATE)}",
+              check=False)
+        event(op, "opened", pane=pane, tab=cp.get("tab_id"), caller=caller, host=host, label=label, attempt=aid, n=n)
+    started, deadline = False, time.time() + 10
+    while time.time() < deadline:
+        lk = read_json(path(op, "lock")) or {}
+        if lk.get("attempt") != aid or lk.get("pid") or os.path.exists(path(op, "rc")) and (read_json(path(op, "rc")) or {}).get("attempt") == aid:
+            started = True
+            break
+        time.sleep(0.3)
+    sent = False if a.no_notify or not started else notify(op, label, host, caller, n)
+    print(json.dumps({"ok": True, "op": op, "pane": pane, "tab": cp.get("tab_id"), "attempt": aid, "n": n,
+                      "max": MAX_ATTEMPTS, "started": started, "notified": sent, "result": path(op, "rc"),
+                      "next": f"auth-pane --wait {op}"}))
+    if not started:
+        print(f"auth-pane: WARNING: the runner did not start in pane {pane} within 10 s; check it (do not open another)", file=sys.stderr)
+    return 0
+
+
+# ---------- runner (inside the new pane) ----------
+
+def finish(op, aid, rc, reason, started_ms):
+    with OpLock(op):
+        res = {"op": op, "attempt": aid, "rc": rc, "reason": reason, "startedMs": started_ms, "endedMs": now_ms()}
+        write_json(path(op, "rc"), res)
+        for a in attempts(op):
+            if a.get("id") == aid:
+                a.update(rc=rc, reason=reason, endedMs=res["endedMs"])
+                save_attempt(op, a)
+        lk = read_json(path(op, "lock")) or {}
+        if lk.get("attempt") == aid:
+            os.remove(path(op, "lock"))
+        event(op, "finished", attempt=aid, rc=rc, reason=reason)
+
+
+def runner(op, aid):
+    global TIMEOUT_S, FAIL_HOLD_S
+    att = next((x for x in attempts(op) if x.get("id") == aid), None)
+    if att:
+        TIMEOUT_S = float(att.get("timeoutS") or TIMEOUT_S)
+        FAIL_HOLD_S = float(att.get("failHoldS") if att.get("failHoldS") is not None else FAIL_HOLD_S)
+    with OpLock(op):
+        lk = read_json(path(op, "lock")) or {}
+        if not att or lk.get("attempt") != aid:
+            print(f"auth-pane: attempt {aid} of {op} is not the open one; nothing to run.")
+            time.sleep(FAIL_HOLD_S)
+            return 1
+        lk.update(pid=os.getpid(), start=proc_start(os.getpid()))
+        write_json(path(op, "lock"), lk)
+    started = now_ms()
+    argv, host = att["argv"], att["host"]
+    print(f"🔐 Sign-in: {att['label']} on {host} (attempt {att['n']} of {MAX_ATTEMPTS} this hour)")
+    print(f"   Command: {shlex.join(argv)}")
+    print(f"   This pane closes when the command ends (timeout {int(TIMEOUT_S // 60)} min). Never type a secret into chat.\n")
+    env = dict(os.environ)
+    env.pop("CI", None)
+    env["TERM"] = "xterm-256color"
+    if att.get("local", True):
+        cmd = argv
+    else:
+        chk = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8",
+                              host, "hostname"], capture_output=True, text=True, timeout=30)
+        if chk.returncode != 0 or chk.stdout.strip() != host:
+            finish(op, aid, 125, f"host check failed: ssh {host} hostname -> {chk.stdout.strip()[:40] or chk.returncode}", started)
+            print(f"❌ {host} did not identify as {host}; nothing ran. Closing in {FAIL_HOLD_S:.0f} s.")
+            time.sleep(FAIL_HOLD_S)
+            return 125
+        cmd = ["ssh", "-t", "-o", "StrictHostKeyChecking=yes", host, "env -u CI TERM=xterm-256color " + shlex.join(argv)]
+    state = {"why": None}
+    child = subprocess.Popen(cmd, env=env, cwd=att.get("cwd") or None)
+
+    def on_signal(sig, _frame):  # function handlers reset on exec, so the child keeps default Ctrl+C behavior
+        if sig in (signal.SIGHUP, signal.SIGTERM):
+            state["why"] = "pane closed" if sig == signal.SIGHUP else "terminated"
+            try:
+                child.terminate()
+            except OSError:
+                pass
+    for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+        signal.signal(s, on_signal)
+    try:
+        rc = child.wait(timeout=TIMEOUT_S)
+        reason = state["why"] or ("ok" if rc == 0 else "login command failed")
+        if state["why"]:
+            rc = 129 if state["why"] == "pane closed" else 143
+    except subprocess.TimeoutExpired:
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+        rc, reason = 124, f"timeout after {int(TIMEOUT_S)} s"
+    finish(op, aid, rc, reason, started)
+    if state["why"] == "pane closed":
+        return rc
+    if rc == 0:
+        print("\n✅ The login command finished (rc 0). Closing this pane.")
+        time.sleep(min(1.0, FAIL_HOLD_S))
+    else:
+        print(f"\n❌ The login command ended with rc {rc} ({reason}). This pane closes in {FAIL_HOLD_S:.0f} s.")
+        time.sleep(FAIL_HOLD_S)
+    return rc
+
+
+# ---------- wait / status ----------
+
+def wait(op, wait_s):
+    rec = attempts(op)
+    if not rec:
+        print(json.dumps({"ok": False, "message": f"no attempt for {op}"}))
+        return 1
+    aid, deadline = rec[-1]["id"], time.time() + wait_s
+    while True:
+        res = read_json(path(op, "rc")) or {}
+        if res.get("attempt") == aid:
+            print(json.dumps(res))
+            return res["rc"] if isinstance(res.get("rc"), int) and 0 <= res["rc"] < 256 else 1
+        if not held(op):
+            with OpLock(op):
+                res = read_json(path(op, "rc")) or {}
+                if res.get("attempt") != aid:
+                    clear_stale(op)
+                    print(json.dumps({"ok": False, "attempt": aid, "message": "the sign-in pane closed without a result"}))
+                    return 1
+            continue
+        if time.time() >= deadline:
+            print(json.dumps({"ok": False, "attempt": aid, "message": f"still open after {wait_s} s"}))
+            return 124
+        time.sleep(1)
+
+
+def status(op):
+    lk = held(op)
+    rec = recent(op)
+    nxt = (min(x.get("tsMs", 0) for x in rec) + WINDOW_S * 1000) if len(rec) >= MAX_ATTEMPTS else None
+    print(json.dumps({"op": op, "open": bool(lk), "pane": lk.get("pane") if lk else None,
+                      "attempts_last_hour": len(rec), "max": MAX_ATTEMPTS,
+                      "next_allowed": stamp(nxt) if nxt else "now" if not lk else "after the open sign-in ends",
+                      "last": read_json(path(op, "rc"))}))
+    return 0
+
+
+def reset_cap(op):
+    with OpLock(op):
+        p = path(op, "attempts.json")
+        if os.path.exists(p):
+            os.replace(p, p + f".reset-{time.strftime('%Y%m%dT%H%M%S')}")
+        event(op, "reset-cap", by=os.environ.get("HERDR_PANE_ID") or "manual")
+    print(f"auth-pane: attempt history for {op} cleared (the open lock, if any, stays)")
+    return 0
+
+
+# ---------- self-test ----------
+
+FAKE_HERDR = r'''#!/usr/bin/env python3
+import fcntl, json, os, signal, subprocess, sys, time
+D = os.environ["FAKE_HERDR_DIR"]; P = D + "/panes.json"
+a = sys.argv[1:]
+with open(D + "/calls.log", "a") as f: f.write(" ".join(a) + "\n")
+def edit(fn):
+    with open(D + "/panes.lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = json.load(open(P)); out = fn(d); json.dump(d, open(P, "w")); return out
+def get(pid): return next((p for p in json.load(open(P))["panes"] if p["pane_id"] == pid), None)
+if a[:1] == ["_pane"]:  # simulated pane process: run the command, then the pane closes (like Herdr)
+    pid, cmd = a[1], a[2]
+    with open(D + f"/pane-{pid}.out", "w") as out:
+        penv = {k: v for k, v in os.environ.items() if not k.startswith("AUTH_PANE_")}  # pane env = server env
+        c = subprocess.Popen(["bash", "-c", cmd], stdout=out, stderr=out, start_new_session=False, env=penv)
+        edit(lambda d: [p.update(proc=c.pid) for p in d["panes"] if p["pane_id"] == pid])
+        c.wait()
+    edit(lambda d: d.update(panes=[p for p in d["panes"] if p["pane_id"] != pid]))
+elif a[:2] == ["pane", "get"]:
+    p = get(a[2]); print(json.dumps({"result": {"pane": p}} if p else {"error": {"code": "pane_not_found"}}))
+elif a[:2] == ["pane", "split"]:
+    caller = a[a.index("--pane") + 1]; c = get(caller)
+    def add(d):
+        d["n"] = d.get("n", 0) + 1; p = {"pane_id": f"wT:q{d['n']}", "tab_id": c["tab_id"], "workspace_id": "wT", "label": ""}
+        d["panes"].append(p); return p
+    print(json.dumps({"result": {"pane": edit(add)}}))
+elif a[:2] == ["pane", "process-info"]:
+    print(json.dumps({"result": {"process_info": {"shell_pid": 7, "foreground_processes": [{"name": "bash", "pid": 7}]}}}))
+elif a[:2] == ["pane", "rename"]:
+    edit(lambda d: [p.update(label=a[3]) for p in d["panes"] if p["pane_id"] == a[2]]); print("{}")
+elif a[:2] == ["pane", "run"] and a[3].startswith("printf 'AUTHPANE-"):  # ready marker: the fake shell answers it
+    n = int(open(D + "/ready-drop").read() or 0) if os.path.exists(D + "/ready-drop") else 0
+    if n > 0:  # simulate a shell that drops the first n lines typed while .bashrc runs
+        open(D + "/ready-drop", "w").write(str(n - 1))
+    else:
+        open(D + f"/screen-{a[2]}", "a").write("AUTHPANE-" + a[3].rsplit(" ", 1)[1] + "\n")
+elif a[:2] == ["pane", "wait-output"]:
+    want = a[a.index("--match") + 1]
+    f = D + f"/screen-{a[2]}"
+    sys.exit(0 if os.path.exists(f) and want in open(f).read() else 1)
+elif a[:2] == ["pane", "run"]:
+    subprocess.Popen([sys.executable, __file__, "_pane", a[2], a[3]], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+elif a[:2] == ["pane", "close"]:
+    p = get(a[2])
+    if p and p.get("proc"):
+        os.kill(p["proc"], signal.SIGHUP)
+    else:
+        edit(lambda d: d.update(panes=[x for x in d["panes"] if x["pane_id"] != a[2]]))
+'''
+
+
+def selftest():
+    import shutil
+    d = tempfile.mkdtemp(prefix="auth-pane-test-")
+    fails = []
+    try:
+        herd, notif = os.path.join(d, "herdr"), os.path.join(d, "notify")
+        open(herd, "w").write(FAKE_HERDR)
+        open(notif, "w").write(f"#!/bin/bash\nprintf '%s\\n' \"$*\" >> {d}/notify.log\n")
+        os.chmod(herd, 0o755)
+        os.chmod(notif, 0o755)
+        json.dump({"panes": [{"pane_id": "wT:p1", "tab_id": "wT:t1", "workspace_id": "wT", "label": "OMP"}]},
+                  open(os.path.join(d, "panes.json"), "w"))
+        env = {**os.environ, "AUTH_PANE_STATE": os.path.join(d, "state"), "AUTH_PANE_HERDR": herd,
+               "AUTH_PANE_NOTIFY_CMD": json.dumps([notif]), "AUTH_PANE_FAIL_HOLD_S": "0", "AUTH_PANE_SHELL_WAIT_S": "3",
+               "FAKE_HERDR_DIR": d, "HERDR_PANE_ID": "wT:p1", "CI": "true", "TERM": "dumb"}
+
+        def ap(*args, extra=None):
+            r = subprocess.run([sys.executable, SELF, *args], env={**env, **(extra or {})}, capture_output=True, text=True, timeout=120)
+            try:
+                j = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
+            except ValueError:
+                j = {}
+            return r.returncode, j, r.stdout + r.stderr
+
+        def check(name, cond, info=""):
+            print(("PASS " if cond else "FAIL ") + name + ("" if cond else f"  [{str(info)[:400]}]"))
+            if not cond:
+                fails.append(name)
+
+        splits = lambda: sum(1 for l in open(os.path.join(d, "calls.log")) if l.startswith("pane split"))
+        fake = lambda secs, rc, tag: ["python3", "-c", f"import os,sys,time; open('{d}/env-{tag}','w').write(repr((os.environ.get('CI'), os.environ.get('TERM')))); time.sleep({secs}); sys.exit({rc})"]
+
+        login1 = fake(5, 0, "a")
+        open(os.path.join(d, "ready-drop"), "w").write("1")  # the new shell drops the first typed line (seen live)
+        c, j, out = ap("--op", "t-login", "--label", "fake login", "--", *login1)
+        check("1 first call opens one pane below the caller", c == 0 and j.get("pane") == "wT:q1" and j.get("started"), out)
+        cl = open(os.path.join(d, "calls.log")).read().splitlines()
+        marks = [i for i, l in enumerate(cl) if l.startswith("pane run wT:q1 printf 'AUTHPANE-")]
+        execs = [i for i, l in enumerate(cl) if l.startswith("pane run wT:q1 exec ")]
+        check("1c ready handshake: marker re-sent after a dropped line, exec only after the shell answered",
+              len(marks) == 2 and len(execs) == 1 and execs[0] > marks[-1], cl)
+        check("1b split is below, unfocused, no OMP auto-start",
+              "pane split --pane wT:p1 --direction down --no-focus --env OMP_AUTO_START=0" in open(os.path.join(d, "calls.log")).read(), out)
+        c, j, out = ap("--op", "t-login", "--", *login1)
+        check("2 second call while open refuses (exit 3) and names the open pane", c == 3 and j.get("pane") == "wT:q1", out)
+        c, j, out = ap("--op", "t-other", "--", *login1)
+        check("3 same login argv already running refuses (exit 3)", c == 3 and j.get("pids"), out)
+        check("3b refusals opened no pane", splits() == 1, splits())
+        c, j, out = ap("--wait", "t-login", "--wait-s", "30")
+        check("4 --wait returns the login rc 0", c == 0 and j.get("rc") == 0, out)
+        envseen = open(os.path.join(d, "env-a")).read() if os.path.exists(os.path.join(d, "env-a")) else ""
+        check("4b login ran without CI and with TERM=xterm-256color", envseen == "(None, 'xterm-256color')", envseen)
+        check("4c lock released, pane closed", not os.path.exists(os.path.join(d, "state", "t-login.lock")), "")
+        c, j, out = ap("--op", "t-login", "--", *fake(0, 2, "b"))
+        check("5 second attempt (after the first ended) opens", c == 0 and j.get("n") == 2, out)
+        c, j, out = ap("--wait", "t-login", "--wait-s", "30")
+        check("5b --wait returns the failed rc 2", c == 2 and j.get("rc") == 2, out)
+        c, j, out = ap("--op", "t-login", "--", *fake(0, 0, "c"))
+        check("6 third attempt in an hour refuses (exit 4) and asks for a non-browser credential",
+              c == 4 and "non-browser credential" in out, out)
+        check("6b notices: one per opened pane, none for refusals",
+              len(open(os.path.join(d, "notify.log")).read().splitlines()) == 2, open(os.path.join(d, "notify.log")).read())
+        c, j, out = ap("--op", "t-time", "--", *fake(30, 0, "d"), extra={"AUTH_PANE_TIMEOUT_S": "2"})
+        c2, j2, out2 = ap("--wait", "t-time", "--wait-s", "30")
+        check("7 a login that hangs is stopped at the timeout (rc 124)", c == 0 and c2 == 124 and j2.get("rc") == 124, out + out2)
+        check("7b the hung login process is gone", not login_procs(fake(30, 0, "d")), "")
+        st = os.path.join(d, "state")
+        write_json(os.path.join(st, "t-stale.lock"), {"op": "t-stale", "attempt": "old", "pane": "wT:gone", "tsMs": now_ms() - 60_000,
+                                                      "expiresMs": now_ms() + 600_000, "pid": 999_999_999, "start": "1"})
+        c, j, out = ap("--op", "t-stale", "--no-notify", "--", *fake(0, 0, "e"))
+        check("8 a lock whose pane is gone and runner is dead is stale: a new attempt opens", c == 0, out)
+        write_json(os.path.join(st, "t-stale2.attempts.json"), {"attempts": [{"id": "old2", "tsMs": now_ms() - 60_000, "pane": "wT:gone"}]})
+        write_json(os.path.join(st, "t-stale2.lock"), {"op": "t-stale2", "attempt": "old2", "pane": "wT:gone", "tsMs": now_ms() - 60_000,
+                                                       "expiresMs": now_ms() + 600_000})
+        c, j, out = ap("--op", "t-stale2", "--no-notify", "--", *fake(0, 0, "e2"))
+        old2 = next((x for x in read_json(os.path.join(st, "t-stale2.attempts.json"), {}).get("attempts", []) if x.get("id") == "old2"), {})
+        check("8b the stale attempt is closed out with rc null and a reason", c == 0 and "rc" in old2 and old2["rc"] is None and old2.get("reason"), old2)
+        ap("--wait", "t-stale2", "--wait-s", "20")
+        ap("--wait", "t-stale", "--wait-s", "20")
+        before = splits()
+        procs = [subprocess.Popen([sys.executable, SELF, "--op", "t-race", "--no-notify", "--", *fake(2, 0, "f")],
+                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(3)]
+        codes = sorted(p.wait(timeout=60) for p in procs)
+        check("9 three parallel calls: exactly one opens", codes == [0, 3, 3] and splits() == before + 1, (codes, splits() - before))
+        ap("--wait", "t-race", "--wait-s", "20")
+        c, j, out = ap("--op", "t-hup", "--no-notify", "--", *fake(30, 0, "g"))
+        time.sleep(1)
+        subprocess.run([herd, "pane", "close", j.get("pane", "?")], env=env)
+        c2, j2, out2 = ap("--wait", "t-hup", "--wait-s", "20")
+        check("10 closing the pane ends the login and records rc 129", c2 == 129 and j2.get("reason") == "pane closed", out + out2)
+        check("10b no login process left after the pane closed", not login_procs(fake(30, 0, "g")), "")
+        c, j, out = ap("--status", "t-login")
+        check("11 --status shows the cap", c == 0 and j.get("attempts_last_hour") == 2 and not j.get("open"), out)
+        c, j, out = ap("--op", "Bad Name", "--", "true")
+        check("12 invalid op name is a usage error", c == 2, out)
+        ev = [json.loads(l)["event"] for l in open(os.path.join(st, "events.jsonl"))]
+        check("13 events.jsonl records opened/refused/finished", {"opened", "refused-open", "refused-cap", "finished"} <= set(ev), ev)
+    finally:
+        if not fails:
+            shutil.rmtree(d, ignore_errors=True)
+        else:
+            print(f"kept {d} for inspection")
+    print("ALL PASS" if not fails else f"{len(fails)} FAILED")
+    return 1 if fails else 0
+
+
+def main():
+    if len(sys.argv) in (4, 5) and sys.argv[1] == "--run":
+        global STATE
+        if len(sys.argv) == 5:
+            STATE = sys.argv[4]
+        return runner(sys.argv[2], sys.argv[3])
+    argv = sys.argv[1:]
+    cmd = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, cmd = argv[:i], argv[i + 1:]
+    ap = argparse.ArgumentParser(prog="auth-pane", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--op")
+    ap.add_argument("--caller")
+    ap.add_argument("--host")
+    ap.add_argument("--label")
+    ap.add_argument("--cwd")
+    ap.add_argument("--no-notify", action="store_true")
+    ap.add_argument("--wait", metavar="NAME")
+    ap.add_argument("--wait-s", type=int, default=LOCK_S + 60)
+    ap.add_argument("--status", metavar="NAME")
+    ap.add_argument("--reset-cap", metavar="NAME")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args(argv)
+    a.command = cmd
+    if a.test:
+        return selftest()
+    for name in (a.wait, a.status, a.reset_cap):
+        if name is not None and not OP_RE.match(name):
+            ap.error("NAME must be lower case letters, digits, . _ -")
+    if a.wait:
+        return wait(a.wait, a.wait_s)
+    if a.status:
+        return status(a.status)
+    if a.reset_cap:
+        return reset_cap(a.reset_cap)
+    if not a.op:
+        ap.error("--op NAME and -- COMMAND are required (or --wait/--status/--reset-cap/--test)")
+    return open_pane(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,15 @@
+# Overlay for trusted Discord turns on unrestricted/* models (src/omp.ts ompArgs, owner 2026-10-19).
+# Every role stays on Qwen and the advisor is off, so no Qwen transcript goes to Claude (protects the
+# main's Claude login from Anthropic safety checks). No auto thinking: the JEV judge does not run.
+defaultThinkingLevel: "off"
+advisor:
+  enabled: false
+modelRoles:
+  default: unrestricted/qwen3.8-27b-uncensored
+  smol: unrestricted/qwen3.8-27b-uncensored
+  slow: unrestricted/qwen3.8-27b-uncensored
+  plan: unrestricted/qwen3.8-27b-uncensored
+  commit: unrestricted/qwen3.8-27b-uncensored
+  title: unrestricted/qwen3.8-27b-uncensored
+  judge: unrestricted/qwen3.8-27b-uncensored
+  advisor: unrestricted/qwen3.8-27b-uncensored

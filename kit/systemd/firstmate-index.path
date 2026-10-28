@@ -1,0 +1,7 @@
+[Unit]
+Description=Rebuild FIRSTMATE dashboard index when items.json changes
+[Path]
+PathChanged=@FM_DIR@/items.json
+Unit=firstmate-index.service
+[Install]
+WantedBy=default.target

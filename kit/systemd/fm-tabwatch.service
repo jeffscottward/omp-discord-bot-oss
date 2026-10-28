@@ -1,0 +1,9 @@
+[Unit]
+Description=Close finished fm-spawn tabs; alert on tab and sign-in pile-ups (fm-tabwatch)
+
+[Service]
+Type=oneshot
+Nice=10
+TimeoutStartSec=120
+Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+ExecStart=@KIT@/bin/fm-tabwatch

@@ -1,0 +1,115 @@
+{
+ "updated": "2026-10-19 09:00 UTC",
+ "items": [
+  {
+   "area": "Example",
+   "n": "Add your Discord ids to config.json",
+   "changed": "2026-10-19 09:00",
+   "cts": 1792000060000,
+   "by": "manual",
+   "id": "finish-setup",
+   "t": "Finish the bot setup (example card)",
+   "s": "waiting",
+   "src": "https://discord.com/channels/1/2/101"
+  },
+  {
+   "area": "Example",
+   "n": "",
+   "changed": "2026-10-19 09:00",
+   "cts": 1792000120000,
+   "by": "manual",
+   "id": "pick-theme",
+   "t": "Which dashboard colour do you like? (example)",
+   "s": "open",
+   "q": "https://discord.com/channels/1/2/102"
+  },
+  {
+   "area": "Example",
+   "n": "working: 🔧 Demo job.",
+   "changed": "2026-10-19 09:00",
+   "cts": 1792000180000,
+   "by": "manual",
+   "id": "demo-job",
+   "t": "Demo job that works now (example)",
+   "s": "running",
+   "job": "DEMO",
+   "src": "https://discord.com/channels/1/2/103"
+  },
+  {
+   "area": "Example",
+   "n": "Waits for its timer.",
+   "changed": "2026-10-19 09:00",
+   "cts": 1792000240000,
+   "by": "manual",
+   "id": "nightly-build",
+   "t": "Nightly build timer (example)",
+   "s": "partial",
+   "job": "nightly-build.service"
+  },
+  {
+   "area": "Example",
+   "n": "",
+   "changed": "2026-10-19 09:00",
+   "cts": 1792000300000,
+   "by": "manual",
+   "id": "needs-your-step",
+   "t": "Blocked by your setup step (example)",
+   "s": "blocked",
+   "blockedBy": [
+    "finish-setup"
+   ],
+   "src": "https://discord.com/channels/1/2/104"
+  },
+  {
+   "area": "Example",
+   "n": "In progress.",
+   "changed": "2026-10-19 09:00",
+   "cts": 1792000360000,
+   "by": "manual",
+   "id": "plain-progress",
+   "t": "Write the welcome note (example)",
+   "s": "partial"
+  },
+  {
+   "area": "Example",
+   "n": "Done.",
+   "changed": "2026-10-19 09:00",
+   "cts": 1792000420000,
+   "by": "manual",
+   "id": "done-one",
+   "t": "Install the kit (example)",
+   "s": "done"
+  },
+  {
+   "area": "Example",
+   "n": "Done.",
+   "changed": "2026-10-19 09:00",
+   "cts": 1792000480000,
+   "by": "manual",
+   "id": "done-two",
+   "t": "Create the Discord app (example)",
+   "s": "done"
+  },
+  {
+   "area": "Example",
+   "n": "Done.",
+   "changed": "2026-10-19 09:00",
+   "cts": 1792000540000,
+   "by": "manual",
+   "id": "done-three",
+   "t": "Invite the bot (example)",
+   "s": "done"
+  },
+  {
+   "area": "Example",
+   "n": "Done.",
+   "changed": "2026-10-19 09:00",
+   "cts": 1792000600000,
+   "by": "manual",
+   "id": "done-four",
+   "t": "Start the dashboard (example)",
+   "s": "done",
+   "l": "/reports/firstmate/deeplink-contract.md"
+  }
+ ]
+}

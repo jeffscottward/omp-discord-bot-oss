@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# longjob: wrapper for the bot's gate/longjob.ts (status every 5 min in the long-running-jobs channel).
+# Usage: longjob <args for gate/longjob.ts>
+# Settings (~/.config/omp-discord/kit.env): OMP_BOT_REPO (default: the repo that holds this script).
+set -euo pipefail
+
+# Read kit.env (KEY=VALUE). A variable that is already set in the environment wins.
+kit_env() {
+  local f="${OMP_KIT_ENV:-$HOME/.config/omp-discord/kit.env}" line k
+  [ -r "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line#export }"
+    case "$line" in ''|'#'*) continue ;; esac
+    k="${line%%=*}"
+    [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [ -n "${!k+x}" ] && continue
+    eval "export $line"
+  done < "$f"
+}
+kit_env
+
+REPO="${OMP_BOT_REPO:-$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)}"
+BUN="$(command -v bun || echo "$HOME/.bun/bin/bun")"
+[ -x "$BUN" ] || BUN="$HOME/.local/share/mise/shims/bun"
+exec "$BUN" "$REPO/gate/longjob.ts" "$@"

@@ -1,0 +1,748 @@
+#!/usr/bin/env python3
+"""fm-autoclear: keep the FIRSTMATE tracker current with deterministic rules (no LLM calls).
+Run every minute by fm-autoclear.timer. Usage: fm-autoclear [--dry-run] [--test]
+
+States (owner 2026-10-18, final): waiting = owner action (hoisted); open = ONLY an unanswered owner question;
+partial = in progress (answered/accepted, queued, no live job); running = a live job works on it now (field `job`).
+
+Rules (each card is checked; finance cards are never touched; nothing is deleted):
+ R1 status file: the card's `l` names a *-status.md / *-summary.md / *-result.md report whose
+    "Result: ... done/complete" line exists and the file is newer than the card -> done, with evidence.
+ R2 owner answer: the card's open question (q) shows "✅ **N**" in Discord (owner picked option N)
+    -> remove q; a card that is still `waiting` or `open` becomes running (live job) or partial (queued).
+    Owner rule 2026-10-18: an answered card never stays `waiting` or `open`.
+ R3 live job: a partial card whose job works now (never a waiting card: that is an owner action) (Herdr pane working, or its unit is running)
+    -> running "working: <tab|unit>" (the job field is filled in when it was only linked by task file).
+ R4 ready report: a `waiting` card whose note says "proposal/report ready" with a /reports/ link -> done.
+ R5 ended job: a card tagged with a `job` that matches no Herdr pane and no unit any more, and with
+    no status file -> note "job ended without a report; needs check" (once); a running card goes back to partial.
+ R8 stopped job: a running card whose job still exists but has not worked for 10 min (pane idle/done,
+    unit not running, e.g. a timer waiting for its next run) -> partial "[job stopped; queued]".
+ R7 owner link: a waiting/blocked/owner card with neither q nor src, or an open card without q, gets a ⚠️ flag
+    in its note (finance cards: log line only, never edited).
+ R6 units: a card that names a *.service / *.timer gets the marker ⟨unit X: failed⟩ while the
+    --user unit is failed; the marker is removed when it is not failed.
+ R9 queued (owner 2026-10-18): a card with `queued` (the owner responded; set by the Discord bot) is never
+    moved back to waiting/open/blocked, also when this run read the card before the bot changed it (`fm` refuses too).
+ R10 idle (owner 2026-10-18, "nothing sits in In progress without moving"): a partial card with no job, not blocked
+    by an unfinished card, not a finance card, and unchanged for more than 2 h is listed as "⏳ idle" in idle.json
+    (the card itself is not edited). "No job" = no Herdr pane working or active in the last 10 min, and no tagged
+    unit that is running or waiting for its timer (a waiting timer = blocked on time). firstmate-sweep.timer
+    (every 2 h) starts one OMP sweep session when idle.json lists items.
+ R11 receipt (Orca #3, 2026-10-19): a new worker-done receipt firstmate/receipts/<card>.json (written by
+    `fm receipt`) closes the card by contract: done -> done; failed -> partial "needs check"; blocked with a q/src
+    link from the receipt -> blocked (owner step; the link is copied to the card); blocked without a link -> partial
+    with "[blocked by <cards>]" (+ blockedBy) or "[blocked; not an owner step]"; a queued card stays partial.
+    (partial when queued). failed/blocked also unlink the job. The card's `receipt` field records the applied
+    receipt (tsMs), so one receipt is applied once and a reopened card is not closed again. While a receipt is
+    newer than the card's last non-autoclear change, R3 does not move the card back to running.
+ R12 heartbeat (Orca #3): heartbeat = the newest of `fm beat` (field `beat`) and the job pane's session activity.
+    A running card whose job pane is still "working" but silent for more than 30 min gets the flag
+    "[silent 30 min; no receipt; needs check]" (it stays running; the flag goes when activity resumes).
+    A job pane that is gone (R5) or stopped (R8, pane jobs) without a receipt gets "no receipt; needs check".
+    A recent beat counts as activity for R8 and R10.
+Every write goes through `fm` (file lock) with FM_AUTO set, so the card shows "🤖 auto-updated".
+Changes are logged to $FM_DIR/autoclear.log. Settings: ~/.config/omp-discord/kit.env (see kit/kit.env.example):
+FM_DIR, REPORTS_WEB_DIR, FM_HOST_LABEL, FM_PEER_HOST, FM_SKIP_AREAS, FM_SKIP_WORDS, FM_BIN, OMP_BOT_ENV.
+"""
+import json, os, re, subprocess, sys, time, urllib.request
+from datetime import datetime
+
+
+def _kit_env():
+    """Read the kit settings file (KEY=VALUE lines; the shell kit scripts read the same file).
+    File: $OMP_KIT_ENV, else ~/.config/omp-discord/kit.env. A variable that is already set in the environment wins."""
+    path = os.environ.get("OMP_KIT_ENV") or os.path.expanduser("~/.config/omp-discord/kit.env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or line.startswith("#") or not key.isidentifier() or key in os.environ:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] == "'":
+            val = val[1:-1]
+        else:
+            if len(val) >= 2 and val[0] == val[-1] == '"':
+                val = val[1:-1]
+            val = os.path.expanduser(os.path.expandvars(val))
+        os.environ[key] = val
+
+
+_kit_env()
+
+HOME = os.path.expanduser("~")
+WEB = os.environ.get("REPORTS_WEB_DIR") or os.path.join(HOME, ".local/share/omp-discord/reports-web")
+HERE = os.environ.get("FM_DIR") or os.path.join(WEB, "firstmate")
+ITEMS = os.path.join(HERE, "items.json")
+RUNNING = os.path.join(HERE, "running.json")
+LOG = os.path.join(HERE, "autoclear.log")
+IDLE = os.path.join(HERE, "idle.json")
+IDLE_S = 2 * 3600  # R10: a partial card unchanged this long, with no job and no open blocker, is idle
+RECEIPTS = os.path.join(HERE, "receipts")
+RESULTS = ("done", "failed", "blocked")
+SILENT_S = 30 * 60  # R12: a working job pane with no activity and no beat for this long is silent
+RECEIPT_SLACK_S = 120  # R11: a receipt this close to the last real change still counts as the newest event
+QCACHE = os.path.join(HOME, ".cache/fm-autoclear/answers.json")
+FM = os.environ.get("FM_BIN") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "fm")
+BOT_ENV = os.environ.get("OMP_BOT_ENV") or os.path.join(HOME, ".config/omp-discord/bot.env")
+# Cards in these areas, or with these words in the title, are never changed automatically (log only).
+SKIP_AREAS = {x.strip().lower() for x in (os.environ.get("FM_SKIP_AREAS") or "finance").split(",") if x.strip()}
+SKIP_WORDS = re.compile(r"\b(" + (os.environ.get("FM_SKIP_WORDS") or "order|trade|finance") + r")\b", re.I)
+# Host labels in job tags ("<host>:<unit>"): this machine, plus the optional read-only peer host (build-running.py).
+LOCAL_HOST = os.environ.get("FM_HOST_LABEL") or "local"
+HOSTS = {LOCAL_HOST} | ({os.environ["FM_PEER_HOST"]} if os.environ.get("FM_PEER_HOST") else set())
+DONE_LINE = re.compile(r"^\**\s*result\**\s*:.*\b(done|complete|completed|finished)\b", re.I | re.M)
+READY = re.compile(r"\b(proposal|report)\s+(is\s+)?ready\b", re.I)
+REPORT_LINK = re.compile(r"(/reports/[\w./-]+)")
+UNIT = re.compile(r"\b([a-z0-9][\w@.-]*\.(?:service|timer))\b")
+NOLINK = "[⚠️ needs-owner card has no q/src link: add one with fm q / fm field src]"
+NOQ = "[⚠️ open card has no question link: add fm q, or change the state]"
+ENDED = "job ended; no receipt; needs check"
+ENDED_OLD = "job ended without a report; needs check"  # before 2026-10-19; still recognized, not rewritten
+STOPPED = "job stopped; queued"  # unit jobs (a timer waiting for its next run)
+STOPPED_NR = "job stopped; no receipt; needs check"  # pane jobs: the session stopped without fm receipt
+SILENT = "silent 30 min; no receipt; needs check"
+MARKS = re.compile(r"\s*\[(?:" + "|".join(re.escape(x) for x in (ENDED, ENDED_OLD, STOPPED, STOPPED_NR, SILENT)) + r")\]")
+WORKING = r"^working: .*?\.(?:\s+|$)"  # lead written by R2/R3; labels may contain dots (unit.service)
+RECENT_S = 600  # a pane that worked in the last 10 min still counts as its job (no flapping between turns)
+QUEUED_KEEP_OUT = ("waiting", "open", "blocked")  # R9
+
+
+def ts(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M").timestamp()
+    except Exception:
+        return 0.0
+
+
+def msg_link(u):
+    """Owner 2026-10-22: a card link must open a message (/channels/<guild>/<channel>/<message>), not a bare channel."""
+    return bool(re.match(r"^https://discord\.com/channels/[^/]+/\d+/\d+", str(u or "")))
+
+
+def finance(it):
+    if it.get("until") or str(it.get("id", "")).startswith("gate-"):
+        return True  # time gates clear themselves on their date; never auto-close them
+    # Owner 2026-10-22: "finance" is decided by the card's area only, never by title words.
+    return str(it.get("area", "")).lower() in SKIP_AREAS
+
+
+def report_path(l):
+    m = re.match(r"^/reports/(.+\.md)$", str(l or ""))
+    return os.path.join(WEB, m.group(1)) if m else None
+
+
+def decide(it, ctx):
+    """Other rules first; R7 only when no other rule changes the card's status or note. R9 filters last."""
+    acts = _decide(it, ctx)
+    if not any(x[0] == "set" for x in acts):
+        acts = acts + r7(it)
+    if it.get("queued"):
+        acts = [x for x in acts if not (x[0] == "set" and x[1][1] in QUEUED_KEEP_OUT)]
+    return acts
+
+
+def r7(it):
+    iid, s, note = it.get("id"), it.get("s"), it.get("n", "") or ""
+    if not iid or s == "done":
+        return []
+    # R7 (owner 2026-10-18): a card that needs the owner must link the question (q) or the source (src);
+    # an open card is an unanswered question, so it must link the question (q).
+    # Only a note flag, so it also runs on finance cards; it is removed once a link exists.
+    for flag, needs, ok in ((NOLINK, s in ("waiting", "blocked") or bool(it.get("owner")), bool(it.get("q") or msg_link(it.get("src")))),
+                            (NOQ, s == "open", bool(it.get("q")))):
+        has_flag = flag in note
+        if needs and not ok and not has_flag:
+            if finance(it):
+                return [("log", [iid], f"R7 {'no owner link' if flag == NOLINK else 'open without q'} (finance card: log only, not edited)")]
+            return [("set", [iid, s, f"{note} {flag}".strip()], "R7 no owner link" if flag == NOLINK else "R7 open without q")]
+        if has_flag and (ok or not needs):
+            return [("set", [iid, s, note.replace(flag, "").strip()], "R7 link present")]
+    return []
+
+
+def as_list(v):
+    return v if isinstance(v, list) else ([v] if v else [])
+
+
+def unit_key(name):
+    """'peer:report-sync.service' -> ('peer', 'report-sync'); timers map to their service. Known hosts: HOSTS."""
+    n, host = str(name).strip().lower(), None
+    if ":" in n and n.split(":", 1)[0] in {h.lower() for h in HOSTS}:
+        host, n = n.split(":", 1)
+    return host, re.sub(r"\.(service|timer)$", "", n)
+
+
+def job_state(it, ctx):
+    """Which jobs belong to the card: Herdr panes (tag match or build-running's task-file link) and units.
+    Returns dict(exists, live=[names working now], recent=bool, label=name to put in the job field,
+    units=bool (a tagged unit exists), silent=bool (R12: a working pane, no running unit, and no pane activity
+    and no `fm beat` for SILENT_S))."""
+    tags = as_list(it.get("job"))
+    by = {j["id"]: j for j in ctx["jobs"]}
+    panes = [by[x] for x in ctx["item_jobs"].get(it.get("id"), []) if x in by]
+    for j in ctx["jobs"]:
+        names = {str(x).lower() for x in (j.get("code"), j.get("tabLabel"), j.get("id")) if x}
+        if j not in panes and any(str(t).lower() in names for t in tags):
+            panes.append(j)
+    units = []
+    for t in tags:
+        h, b = unit_key(t)
+        units += [s for s in ctx.get("services", []) if unit_key(s.get("unit", ""))[1] == b and h in (None, s.get("host"))]
+    now = ctx.get("now", time.time())
+    live_p = [j for j in panes if j.get("status") == "working"]
+    live_u = [s["unit"] for s in units if s.get("state") == "running"]
+    live = [j.get("tabLabel") or j["id"] for j in live_p] + live_u
+    def act(j):
+        try:
+            return datetime.fromisoformat(j.get("active")).timestamp()
+        except Exception:
+            return 0.0
+    beat = beat_s(it)
+    recent = any(now - act(j) < RECENT_S for j in panes) or now - beat < RECENT_S
+    # R12: silence is judged only when every working pane reports its activity time (no data = not silent).
+    acts = [act(j) for j in live_p]
+    silent = bool(live_p) and not live_u and all(acts) and now - max(acts + [act(j) for j in panes] + [beat]) > SILENT_S
+    label = (live_p[0].get("code") or live_p[0].get("tabLabel") or live_p[0]["id"]) if live_p else None
+    return {"exists": bool(panes or units), "live": live, "recent": recent, "label": label, "units": bool(units), "silent": silent}
+
+
+def beat_s(it):
+    """R12: last `fm beat` of the card in epoch seconds (0 when none)."""
+    try:
+        return float(it.get("beat") or 0) / 1000
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def receipt_ms(rec):
+    """R11: receipt time in epoch ms (tsMs, else the ISO ts), 0 when unusable."""
+    try:
+        if rec.get("tsMs"):
+            return int(rec["tsMs"])
+        return int(datetime.strptime(str(rec.get("ts")), "%Y-%m-%dT%H:%M:%S%z").timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def receipt_current(it):
+    """R11: the applied receipt is still the newest event (no real change after it), so R3 must not reopen the card."""
+    try:
+        rms = int(it.get("receipt") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(rms) and rms / 1000 >= last_touch(it) - RECEIPT_SLACK_S
+
+
+def r11(it, rec, rms):
+    """R11: apply one new worker-done receipt to the card."""
+    iid, res = it["id"], rec.get("result")
+    summ = re.sub(r"\s+", " ", str(rec.get("summary") or "")).strip().rstrip(". ")
+    ev = "; ".join(str(x) for x in (rec.get("evidence") or []) if x)
+    when = datetime.fromtimestamp(rms / 1000).strftime("%m-%d %H:%M")
+    src = f" ({when}" + (f", pane {rec['pane']}" if rec.get("pane") else "") + ")"
+    tail = f" Evidence: {ev}." if ev else ""
+    mark = ("field", [iid, "receipt", str(rms)], "R11 receipt applied")
+    if res == "done":
+        return [("set", [iid, "done", f"🧾 Receipt done{src}: {summ}.{tail}"[:600]], "R11 receipt done"), mark]
+    jobs = as_list(it.get("job"))
+    jobtxt = f" (job was {', '.join(str(j) for j in jobs)})" if jobs else ""
+    pre, state, flag = [], "partial", ""
+    if res == "failed":
+        flag = " [needs check]"
+    else:
+        # blocked: an owner step only when the worker linked the owner question/message (q/src); a blocker on another
+        # card or on time stays partial with the reason (sweep-task step 5), plus blockedBy when the worker named cards.
+        q, srcl, bb = rec.get("q"), rec.get("src"), [str(x) for x in as_list(rec.get("blockedBy")) if x]
+        if (q or srcl) and not it.get("queued"):
+            state = "blocked"
+            if q:
+                pre.append(("q", [iid, str(q)], "R11 receipt link"))
+            if srcl:
+                pre.append(("field", [iid, "src", str(srcl)], "R11 receipt link"))
+        else:
+            flag = f" [blocked by {', '.join(bb)}]" if bb else " [blocked; not an owner step]"
+        if bb:
+            pre.append(("field", [iid, "blockedBy", ",".join(bb)], "R11 receipt blockedBy"))
+    acts = pre + [("set", [iid, state, f"🧾 Receipt {res}{src}: {summ}.{tail}{jobtxt}"[:560] + flag], f"R11 receipt {res}"), mark]
+    if jobs:
+        acts.append(("field", [iid, "job", "-"], "R11 job ended"))
+    return acts
+
+
+def _decide(it, ctx):
+    """Pure: return a list of (cmd, args, reason). ctx: jobs(list), item_jobs(dict), services(list), jobs_ok,
+    file(path)->(mtime,text)|None, answer(qurl)->(n, option)|None, unit(name)->state str."""
+    iid, s, note = it.get("id"), it.get("s"), it.get("n", "") or ""
+    if not iid or s == "done" or it.get("until") or str(iid).startswith("gate-"):
+        return []  # time gates clear themselves on their date; never touched, not even by a receipt
+    # R11 receipt: a new worker-done receipt closes the card by contract (before every other rule).
+    # Owner 2026-10-22: this also applies to finance cards (tracker only; it never touches orders).
+    rec = ctx.get("receipt", lambda _i: None)(iid)
+    if rec and rec.get("card") == iid and rec.get("result") in RESULTS:
+        rms = receipt_ms(rec)
+        if rms and str(it.get("receipt") or "") != str(rms):
+            # A receipt older than the card's last change (minus slack) is stale: a newer note wins.
+            if int(it.get("cts") or 0) and rms < int(it.get("cts") or 0) - RECEIPT_SLACK_S * 1000:
+                return [("field", [iid, "receipt", str(rms)], "R11 stale receipt skipped (card changed after it)")]
+            return r11(it, rec, rms)
+    if finance(it):
+        return []
+    acts = []
+    # R1
+    rp = report_path(it.get("l"))
+    rep = ctx["file"](rp) if rp and re.search(r"-(status|summary|result)\.md$", rp) else None
+    if rep:
+        mt, text = rep
+        m = DONE_LINE.search(text)
+        if m and mt > ts(it.get("changed", "")) and ctx.get("l_count", {}).get(it["l"], 1) == 1:  # shared reports never close a card
+            return [("set", [iid, "done", f"Report says: {m.group(0).strip()[:160]} ({it['l']})"], "R1 status file")]
+    js = job_state(it, ctx) if ctx["jobs_ok"] else {"exists": True, "live": [], "recent": True, "label": None}
+    jobfield = [("field", [iid, "job", js["label"]], "R3 job link")] if js["live"] and not it.get("job") and js["label"] else []
+    can_run = bool(js["live"]) and bool(it.get("job") or jobfield)
+    # R2
+    if it.get("q"):
+        ans = ctx["answer"](it["q"])
+        if ans:
+            n, opt = ans
+            acts.append(("q", [iid, "-"], f"R2 owner answered {n}"))
+            if s in ("waiting", "open"):
+                if can_run:
+                    return acts + jobfield + [("set", [iid, "running", f"Owner answered {n}: {opt}. working: {js['live'][0]}."[:400]], "R2 answered")]
+                return acts + [("set", [iid, "partial", f"Owner answered {n}: {opt}. Queued."[:400]], "R2 answered")]
+    # R3
+    # waiting = an owner action: a working job does not complete it, so only partial cards are promoted.
+    if s == "partial" and can_run and ctx["jobs_ok"] and not receipt_current(it):
+        base = re.sub(WORKING, "", MARKS.sub("", note).strip())
+        lead = f"working: {js['live'][0]}."
+        return acts + jobfield + [("set", [iid, "running", f"{lead} {base}".strip()[:600]], "R3 job working")]
+    # R4
+    if s == "waiting":
+        lm = REPORT_LINK.search(note)
+        if READY.search(note) and lm:
+            return acts + [("set", [iid, "done", f"Report ready: {lm.group(1)}"], "R4 report ready"), ("field", [iid, "l", lm.group(1)], "R4 link")]
+    tags = as_list(it.get("job"))
+    # R5 job gone / R8 job stopped
+    if ctx["jobs_ok"] and not rep:
+        ended = ENDED in note or ENDED_OLD in note
+        # A card changed after the running.json snapshot (e.g. fm-spawn just set its job) cannot be judged yet.
+        newer = int(it.get("cts") or 0) > int(ctx.get("run_ms") or 0) > 0
+        if tags and not js["exists"] and not newer and s in ("open", "partial", "running") and (not ended or s == "running"):
+            note = (re.sub(WORKING, "", MARKS.sub("", note).strip()) + f" [{ENDED}]").strip()
+            acts.append(("set", [iid, "partial" if s == "running" else s, note], "R5 job gone"))
+        elif s == "running" and js["exists"] and not js["live"] and not js["recent"]:
+            # R8: a unit waiting for its timer is queued; a pane session that stopped without fm receipt needs a check.
+            mk = STOPPED if js.get("units") else STOPPED_NR
+            note = (re.sub(WORKING, "", MARKS.sub("", note).strip()) + f" [{mk}]").strip()
+            acts.append(("set", [iid, "partial", note], "R8 job stopped"))
+        elif s == "running" and js.get("silent") and SILENT not in note:
+            note = (note.strip() + f" [{SILENT}]").strip()
+            acts.append(("set", [iid, "running", note], "R12 job silent"))
+        elif SILENT in note and not (s == "running" and js.get("silent")):
+            note = re.sub(r"\s*\[" + re.escape(SILENT) + r"\]", "", note).strip()
+            acts.append(("set", [iid, s, note], "R12 activity resumed"))
+    s2 = next((a[1][1] for a in acts if a[0] == "set"), s)
+    # R6
+    units = sorted(set(UNIT.findall(it.get("t", "") + " " + re.sub(r"⟨unit [^⟩]*⟩", "", note))))
+    want = [f"⟨unit {u}: failed⟩" for u in units if ctx["unit"](u) == "failed"]
+    have = re.findall(r"⟨unit [^⟩]*⟩", note)
+    if want != have:
+        base = re.sub(r"\s*⟨unit [^⟩]*⟩", "", note).strip()
+        acts = [a for a in acts if a[1][0] != iid or a[0] != "set"]
+        acts.append(("set", [iid, s2, (base + " " + " ".join(want)).strip()], "R6 unit state"))
+    return acts
+
+
+def idle_scan(items, ctx):
+    """R10 (pure): return (idle, skipped) lists for idle.json. Needs ctx['jobs_ok']; see the module doc."""
+    now = ctx.get("now", time.time())
+    state = {i.get("id"): i.get("s") for i in items if i.get("id")}
+    idle, skipped = [], []
+    for it in items:
+        iid = it.get("id")
+        if not iid or it.get("s") != "partial":
+            continue
+        if finance(it):
+            skipped.append({"id": iid, "reason": "finance card: verify only, no automatic sweep"})
+            continue
+        open_bb = [b for b in as_list(it.get("blockedBy")) if state.get(b) not in (None, "done")]
+        if open_bb:
+            skipped.append({"id": iid, "reason": "blocked by " + ", ".join(open_bb)})
+            continue
+        js = job_state(it, ctx)
+        timers = [t for t in as_list(it.get("job")) if any(
+            unit_key(s.get("unit", ""))[1] == unit_key(t)[1] and unit_key(t)[0] in (None, s.get("host"))
+            and s.get("state") in ("running", "waiting") for s in ctx.get("services", []))]
+        if js["live"] or js["recent"] or timers:
+            continue  # a job works on it now, or a timer will run it (blocked on time)
+        last = last_touch(it)
+        if now - last <= IDLE_S:
+            continue
+        idle.append({"id": iid, "t": it.get("t", "")[:120], "mark": "⏳ idle", "idleH": round((now - last) / 3600, 1),
+                     "changed": it.get("changed"), "job": it.get("job"), "queued": bool(it.get("queued"))})
+    return idle, skipped
+
+
+def last_touch(it):
+    """R10: time of the last change NOT made by fm-autoclear (its own note rewrites restamp changed/cts).
+    hist keeps the last 5 writers: newest non-autoclear entry; if all 5 are autoclear, the oldest entry is an upper
+    bound for the last real change; no hist (older cards): `changed`, or cts when a non-autoclear writer made it."""
+    h = [x for x in (it.get("hist") or []) if isinstance(x, dict) and x.get("cts")]
+    real = [x["cts"] for x in h if x.get("by") != "autoclear"]
+    if real:
+        return max(real) / 1000
+    if h:
+        return min(x["cts"] for x in h) / 1000
+    last = ts(it.get("changed", ""))
+    if it.get("cts") and it.get("by") != "autoclear":
+        last = max(last, it["cts"] / 1000)
+    return last
+
+
+def write_idle(items, ctx, dry):
+    if not ctx["jobs_ok"]:
+        print("R10 idle: running.json is stale; idle.json not changed")
+        return
+    idle, skipped = idle_scan(items, ctx)
+    data = {"generated": datetime.now().astimezone().isoformat(timespec="seconds"), "thresholdH": IDLE_S / 3600,
+            "items": idle, "skipped": skipped}
+    try:
+        old = json.load(open(IDLE))
+    except Exception:
+        old = {}
+    if [i["id"] for i in old.get("items", [])] != [i["id"] for i in idle]:
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {'DRY ' if dry else ''}R10 idle list: {', '.join(i['id'] for i in idle) or '(empty)'}"
+        print(line)
+        if not dry:
+            with open(LOG, "a") as f:
+                f.write(line + "\n")
+    if dry:
+        return
+    tmp = IDLE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, IDLE)
+
+
+# ---------- real context ----------
+def real_file(p):
+    try:
+        with open(p) as f:
+            return os.path.getmtime(p), f.read(200_000)
+    except OSError:
+        return None
+
+
+def token():
+    try:
+        env = open(BOT_ENV).read()
+        return re.search(r"DISCORD_BOT_TOKEN=(.+)", env).group(1).strip().strip("\"'")
+    except Exception:
+        return None
+
+
+def make_answer():
+    try:
+        cache = json.load(open(QCACHE))
+    except Exception:
+        cache = {}
+    tok = token()
+
+    def answer(url):
+        if url in cache and cache[url].get("n"):
+            return cache[url]["n"], cache[url]["opt"]
+        if url in cache and time.time() - cache[url].get("at", 0) < 55:
+            return None
+        m = re.search(r"/channels/\d+/(\d+)/(\d+)", url)
+        if not m or not tok:
+            return None
+        try:
+            r = urllib.request.Request(f"https://discord.com/api/v10/channels/{m.group(1)}/messages/{m.group(2)}",
+                                       headers={"Authorization": "Bot " + tok, "User-Agent": "fm-autoclear"})
+            c = json.load(urllib.request.urlopen(r, timeout=10)).get("content", "")
+        except Exception:
+            return None
+        got = parse_answer(c)
+        cache[url] = {"at": time.time(), "n": got[0] if got else None, "opt": got[1] if got else None}
+        os.makedirs(os.path.dirname(QCACHE), exist_ok=True)
+        json.dump(cache, open(QCACHE, "w"))
+        return got
+    return answer
+
+
+def parse_answer(content):
+    m = re.search(r"^✅\s*\*\*(.+?)\*\*", content, re.M)
+    if not m:
+        # Owner 2026-10-22: a typed "Other" answer shows as "✅ ✏️ *text*"; it is an answer too.
+        t = re.search(r"^✅\s*✏️\s*\*(.+?)\*\s*$", content, re.M)
+        return ("Other", t.group(1).strip()[:200]) if t else None
+    n = m.group(1).strip()
+    KEY = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    opt = n
+    if n.isdigit() and 1 <= int(n) <= 10:
+        om = re.search("^" + re.escape(KEY[int(n) - 1]) + r"\s*(.+)$", content, re.M)
+        if om:
+            opt = re.sub(r"\s*\*\*⭐.*$", "", om.group(1)).strip()
+    return n, opt
+
+
+def real_unit(name):
+    try:
+        return subprocess.run(["systemctl", "--user", "is-active", name], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def real_receipt(iid):
+    """R11: read firstmate/receipts/<card>.json (written atomically by `fm receipt`); None when missing/invalid."""
+    if not iid or "/" in iid:
+        return None
+    try:
+        with open(os.path.join(RECEIPTS, iid + ".json")) as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def main(dry):
+    items = json.load(open(ITEMS))["items"]
+    try:
+        run = json.load(open(RUNNING))
+    except Exception:
+        run = {}
+    fresh = time.time() - os.path.getmtime(RUNNING) < 300 if os.path.exists(RUNNING) else False
+    ctx = {"jobs": run.get("jobs") or [], "jobs_ok": bool(run.get("jobsOk")) and fresh,
+           "item_jobs": run.get("itemJobs") or {}, "services": run.get("services") or [], "file": real_file,
+           "l_count": __import__("collections").Counter(i.get("l") for i in items if i.get("l")), "answer": make_answer(), "unit": real_unit,
+           "receipt": real_receipt}
+    try:
+        ctx["run_ms"] = int(datetime.fromisoformat(str(run.get("generated"))).timestamp() * 1000)
+    except Exception:
+        ctx["run_ms"] = 0
+    n = 0
+    for it in items:
+        if not it.get("id") and it.get("s") != "done":
+            print(f"skip: card without id (fm cannot address it): {it.get('t', '')[:60]}")
+        for cmd, args, why in decide(it, ctx):
+            n += 1
+            line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {'DRY ' if dry else ''}{why}: fm {cmd} {' '.join(args)}"
+            print(line)
+            if dry:
+                continue
+            if cmd == "log":
+                try:
+                    seen = any(l.startswith(time.strftime("%Y-%m-%d")) and l.rstrip().endswith(f"fm log {args[0]}") for l in open(LOG))
+                except OSError:
+                    seen = False
+                if seen:
+                    continue  # one log line per card per day
+                with open(LOG, "a") as f:
+                    f.write(line + "\n")
+                continue
+            r = subprocess.run([FM, cmd, *args], env={**os.environ, "FM_AUTO": why}, capture_output=True, text=True)
+            with open(LOG, "a") as f:
+                f.write(line + ("" if r.returncode == 0 else f"  FAILED: {r.stderr.strip()[:200]}") + "\n")
+            if r.returncode != 0 and why.startswith("R11"):
+                break  # the receipt marker is written only after its state change worked, so a failure is retried
+    if not n and dry:
+        print("no changes")
+    # R10: re-read after this run's own changes, then rewrite idle.json
+    write_idle(json.load(open(ITEMS))["items"] if (n and not dry) else items, ctx, dry)
+
+
+# ---------- tests ----------
+def test():
+    global HOSTS, SKIP_AREAS, SKIP_WORDS
+    HOSTS = {"local", "peer"}  # fixed test values, independent of kit.env
+    SKIP_AREAS = {"finance"}
+    SKIP_WORDS = re.compile(r"\b(order|trade|finance)\b", re.I)
+    now = time.time()
+    iso = lambda t: datetime.fromtimestamp(t).astimezone().isoformat()
+    files = {os.path.join(WEB, "x/a-status.md"): (now, "# A\nResult: done and live.\n"),
+             os.path.join(WEB, "x/b-status.md"): (now, "Result: still running\n")}
+    jobs = [{"id": "p1", "code": "W", "tabLabel": "🔧 Work", "status": "working", "active": iso(now)},
+            {"id": "p2", "code": "IDL", "tabLabel": "💤 Idle", "status": "idle", "active": iso(now - 3600)},
+            {"id": "p3", "code": "JUST", "tabLabel": "Just done", "status": "done", "active": iso(now - 60)},
+            {"id": "p4", "code": "SIL", "tabLabel": "🤫 Silent", "status": "working", "active": iso(now - 3600)},
+            {"id": "p5", "code": "NOACT", "tabLabel": "No data", "status": "working", "active": None}]
+    svcs = [{"host": "local", "unit": "nightly-build.service", "state": "running"},
+            {"host": "local", "unit": "kb-daily-retry.service", "state": "waiting"},
+            {"host": "peer", "unit": "report-sync.service", "state": "waiting"}]
+    q = "https://discord.com/channels/1/2/3"
+    ctx = {"jobs": jobs, "jobs_ok": True, "item_jobs": {"w1": ["p1"], "w2": ["p1"]}, "services": svcs, "file": files.get, "now": now,
+           "answer": lambda u: ("2", "Start review") if u == q else None, "unit": lambda u: "failed" if u == "bad.timer" else "active"}
+    ms = lambda t: int(t * 1000)
+    R = lambda card, res, at=now, **k: {"card": card, "result": res, "summary": "built it.", "evidence": ["commit abc"],
+                                        "ts": "x", "tsMs": ms(at), "pane": "wB:p1", **k}
+    recs = {c: R(c, r) for c, r in (("rc1", "done"), ("rc2", "failed"), ("rc3", "blocked"), ("rc3q", "blocked"),
+                                     ("rcT", "done"), ("rcA", "done"), ("rcW", "done"))}
+    recs["rc3l"] = R("rc3l", "blocked", q=q)
+    recs["rc3s"] = R("rc3s", "blocked", src="https://discord.com/channels/1/2/7")
+    recs["rc3b"] = R("rc3b", "blocked", blockedBy=["card-a", "card-b"])
+    recs["rc3ql"] = R("rc3ql", "blocked", q=q)
+    recs["rcX"] = R("other-card", "done")  # a receipt must name its own card
+    recs["rcB"] = R("rcB", "maybe")  # unknown result: ignored
+    recs["rcO"] = R("rcO", "done", at=now - 3 * 3600)  # applied 3 h ago, card restarted since
+    ctx["receipt"] = recs.get
+    base = {"area": "Tools", "changed": "2026-01-01 00:00", "n": ""}
+    D = lambda **k: decide({**base, **k}, ctx)
+    n = 0
+    def ok(cond, msg=""):
+        nonlocal n
+        n += 1
+        assert cond, msg
+    a = D(id="r1", s="partial", l="/reports/x/a-status.md"); ok(a[0][0] == "set" and a[0][1][1] == "done", a)
+    ctx["l_count"] = {"/reports/x/a-status.md": 2}
+    ok(D(id="r1s", s="partial", l="/reports/x/a-status.md") == [], "shared report must not close")
+    ctx["l_count"] = {}
+    ok(D(id="r1b", s="partial", l="/reports/x/b-status.md") == [])
+    ok(D(id="r1c", s="partial", l="/reports/x/a-status.md", changed="2999-01-01 00:00") == [])
+    # R2: answered question never stays waiting/open
+    a = D(id="r2", s="waiting", q=q); ok(("q", ["r2", "-"]) == a[0][:2] and a[1][1][1] == "partial" and "answered 2" in a[1][1][2], a)
+    a = D(id="r2o", s="open", q=q); ok(a[0][0] == "q" and a[1][1][1] == "partial" and "Queued" in a[1][1][2], a)
+    a = D(id="w2", s="open", q=q); ok(a[0][0] == "q" and a[1] == ("field", ["w2", "job", "W"], "R3 job link") and a[2][1][1] == "running", a)
+    a = D(id="r2b", s="planned", q=q); ok(len(a) == 1 and a[0][0] == "q", a)
+    ok(D(id="r2c", s="waiting", q="https://discord.com/channels/1/2/9") == [])
+    ok(D(id="r2d", s="open", q="https://discord.com/channels/1/2/9") == [], "unanswered open question stays open")
+    # R3: live job -> running (job field filled in)
+    a = D(id="w1", s="partial"); ok(a[0] == ("field", ["w1", "job", "W"], "R3 job link") and a[1][1][1] == "running" and "working: 🔧 Work" in a[1][1][2], a)
+    ok(D(id="w1", s="waiting", src="https://discord.com/channels/1/2/3") == [], "a waiting (owner action) card stays waiting while a job works")
+    a = D(id="r8u", s="running", job="kb-daily-retry.timer", n="working: kb-daily-retry.timer. keep this"); ok(a[0][1][2] == f"keep this [{STOPPED}]", a)
+    a = D(id="r3x", s="partial", job="nightly-build.service", n="working: nightly-build.service. keep"); ok(a[0][1][2] == "working: nightly-build.service. keep", a)
+    a = D(id="r3", s="partial", job="W", n="old"); ok(len(a) == 1 and a[0][1][1] == "running" and a[0][1][2] == "working: 🔧 Work. old", a)
+    a = D(id="r3u", s="partial", job="nightly-build.service"); ok(a[0][1][1] == "running" and "nightly-build.service" in a[0][1][2], a)
+    ok(D(id="r3t", s="partial", job="kb-daily-retry.timer") == [], "a waiting timer is queued, not running")
+    ok(D(id="r3h", s="partial", job="local:report-sync.service")[0][1][2].endswith(f"[{ENDED}]"), "host prefix must match")
+    ok(D(id="r3r", s="running", job="W", n="working: 🔧 Work. x") == [], "running card with live job stays")
+    a = D(id="r4", s="waiting", n="Proposal ready: /reports/loan/"); ok(a[0][1][1] == "done" and a[1] == ("field", ["r4", "l", "/reports/loan/"], "R4 link"), a)
+    # R5 job gone
+    a = D(id="r5", s="partial", job="GONE"); ok(ENDED in a[0][1][2] and a[0][1][1] == "partial", a)
+    ctx["run_ms"] = 1000
+    ok(D(id="r5n", s="running", job="GONE", cts=2000) == [], "R5 waits when the card changed after the running.json snapshot")
+    a = D(id="r5o", s="running", job="GONE", cts=500, n="working: X. y"); ok(a and a[0][1][1] == "partial", a)
+    ctx["run_ms"] = 0
+    a = D(id="r5r", s="running", job="GONE", n="working: X. y"); ok(a[0][1][1] == "partial" and a[0][1][2] == f"y [{ENDED}]", a)
+    ok(D(id="r5b", s="partial", job="IDL") == [])
+    ok(D(id="r5c", s="partial", job="GONE", n=f"x [{ENDED}]") == [])
+    ok(D(id="r5d", s="partial", job="peer:report-sync.service") == [])
+    # R8 job stopped
+    a = D(id="r8", s="running", job="IDL", n="working: 💤 Idle. y"); ok(a[0][1][1] == "partial" and a[0][1][2] == f"y [{STOPPED_NR}]", a)
+    ok(D(id="r8b", s="running", job="JUST") == [], "a pane active in the last 10 min still counts")
+    a = D(id="r8t", s="running", job="kb-daily-retry.timer"); ok(a[0][1][1] == "partial" and a[0][1][2] == f"[{STOPPED}]", a)
+    ctx["jobs_ok"] = False
+    ok(D(id="r8x", s="running", job="GONE") == [], "no job decisions when running.json is stale")
+    ctx["jobs_ok"] = True
+    # R6 units
+    a = D(id="r6", s="partial", t="watch bad.timer"); ok(a[0][1][2] == "⟨unit bad.timer: failed⟩", a)
+    ok(D(id="r6b", s="partial", t="watch bad.timer", n="⟨unit bad.timer: failed⟩") == [])
+    a = D(id="r6c", s="partial", t="watch ok.timer", n="x ⟨unit ok.timer: failed⟩"); ok(a[0][1][2] == "x", a)
+    # finance / done untouched
+    ok(D(id="t1", s="waiting", area="Finance", q=q) == [])
+    ok(D(id="t2", s="waiting", area="finance", t="account go-live", q=q) == [])
+    ok(D(id="t3", s="partial", area="Finance", job="GONE", src="https://discord.com/channels/1/2/3") == [])
+    ok(D(id="d1", s="done", q=q) == [])
+    # R7 links
+    a = D(id="n1", s="waiting", area="Finance"); ok(a[0][0] == "log", a)
+    a = D(id="n5", s="waiting", n="keep me"); ok(a[0][1][2] == "keep me " + NOLINK, a)
+    ok(D(id="n6", s="waiting", n="keep me " + NOLINK) == [])
+    ok(D(id="n2", s="waiting", src="https://discord.com/channels/1/2/4") == [])
+    a = D(id="n3", s="blocked", src="https://discord.com/channels/1/2/3", n="y " + NOLINK); ok(a[0][1][2] == "y", a)
+    a = D(id="n4", s="planned", owner=True); ok(NOLINK in a[0][1][2], a)
+    a = D(id="o1", s="open", src="https://discord.com/channels/1/2/3", n="q?"); ok(a[0][1][2] == "q? " + NOQ, a)
+    a = D(id="o2", s="partial", src="https://discord.com/channels/1/2/3", n="q? " + NOQ); ok(a[0][1][2] == "q?", a)
+    ok(D(id="o3", s="open", q="https://discord.com/channels/1/2/9") == [])
+    a = D(id="o4", s="open", area="Finance", src="https://discord.com/channels/1/2/3"); ok(a[0][0] == "log", a)
+    ok(parse_answer("❓ Q\n1️⃣ Keep **⭐ (Recommended)**\n2️⃣ Start review\n\n✅ **2**") == ("2", "Start review"))
+    ok(parse_answer("❓ Q\n1️⃣ Yes\n2️⃣ Later\n\n✅ ✏️ *already answered*") == ("Other", "already answered"), "typed Other answer counts")
+    ok(not msg_link("https://discord.com/channels/1/2") and msg_link("https://discord.com/channels/1/2/3"), "a bare channel URL is not an owner link")
+    ok(parse_answer("❓ Q\n1️⃣ a\n2️⃣ b") is None)
+    ok(unit_key("peer:X.timer") == ("peer", "x") and unit_key("kb-a.service") == (None, "kb-a"))
+    # R9 queued: never back to waiting/open/blocked (stale read before the bot's fm set partial)
+    ok(D(id="q1", s="waiting", queued="1", n="x") == [], "R7 must not re-set a queued card to waiting")
+    ok(D(id="q2", s="open", queued="1", src="https://discord.com/channels/1/2/3") == [], "R7 must not re-set a queued card to open")
+    ok(D(id="q3", s="blocked", queued="1", t="watch bad.timer") == [], "R6 must not re-set a queued card to blocked")
+    a = D(id="q4", s="waiting", queued="1", q=q); ok(a[0][0] == "q" and a[1][1][1] == "partial", a)
+    a = D(id="w1", s="partial", queued="1"); ok(a[1][1][1] == "running", "a live job may still take a queued card")
+    a = D(id="q5", s="partial", queued="1", t="watch bad.timer"); ok(a[0][1][1] == "partial", a)
+    # R10 idle list (pure idle_scan)
+    old, recent = "2026-01-01 00:00", datetime.fromtimestamp(now - 3600).strftime("%Y-%m-%d %H:%M")
+    P = lambda **k: {"area": "Tools", "s": "partial", "changed": old, "n": "", **k}
+    its = [P(id="i1"), P(id="i2a", by="autoclear", cts=now * 1000), P(id="i2m", by="manual", cts=now * 1000),
+           P(id="i3", changed=recent), {"id": "open1", "s": "planned"}, {"id": "done1", "s": "done"},
+           P(id="i4o", blockedBy="open1"), P(id="i4d", blockedBy=["done1"]), P(id="i4u", blockedBy="no-such-card"),
+           P(id="i5t", job="kb-daily-retry.timer"), P(id="i5r", job="nightly-build.service"),
+           P(id="i5i", job="IDL"), P(id="i5g", job="GONE"), P(id="i5j", job="JUST"), P(id="w1"),
+           P(id="i5h", job="local:report-sync.service"), P(id="i5q", job="peer:report-sync.timer"),
+           P(id="i6", area="Finance"), P(id="i6g", area="finance", t="account go-live"), P(id="i7", s="running"), P(id="i8", queued="1")]
+    idl, skp = idle_scan(its, ctx)
+    got, sk = {i["id"] for i in idl}, {s["id"] for s in skp}
+    ok(got == {"i1", "i2a", "i4d", "i4u", "i5i", "i5g", "i5h", "i8"}, sorted(got))
+    ok(sk == {"i4o", "i6", "i6g"}, sorted(sk))
+    ok(all(i["mark"] == "⏳ idle" and i["idleH"] > 2 for i in idl), idl)
+    ms = lambda t: int(t * 1000)
+    its2 = [P(id="h1", changed=recent, hist=[{"by": "pane:x", "cts": ms(now - 3 * 3600)}, {"by": "autoclear", "cts": ms(now - 60)}]),
+            P(id="h2", hist=[{"by": "manual", "cts": ms(now - 3600)}, {"by": "autoclear", "cts": ms(now - 60)}]),
+            P(id="h3", changed=recent, hist=[{"by": "autoclear", "cts": ms(now - 5 * 3600)}, {"by": "autoclear", "cts": ms(now - 60)}])]
+    got2 = {i["id"] for i in idle_scan(its2, ctx)[0]}
+    ok(got2 == {"h1", "h3"}, f"only autoclear wrote recently -> still idle: {sorted(got2)}")
+    # R11 receipts (Orca #3)
+    a = D(id="rc1", s="running", job="W", n="working: 🔧 Work. x")
+    ok(a[0][0] == "set" and a[0][1][1] == "done" and a[0][1][2].startswith("🧾 Receipt done (") and "pane wB:p1): built it. Evidence: commit abc." in a[0][1][2], a)
+    ok(a[1] == ("field", ["rc1", "receipt", str(ms(now))], "R11 receipt applied") and len(a) == 2, a)
+    a = D(id="rc1", s="partial", job="W", receipt=str(ms(now)))
+    ok(a == [], f"an applied receipt is not applied twice, and R3 does not reopen the card: {a}")
+    a = D(id="rc2", s="running", job="W", n="x")
+    ok(a[0][1][1] == "partial" and a[0][1][2].endswith("(job was W) [needs check]") and a[0][2] == "R11 receipt failed", a)
+    ok(a[1][0] == "field" and a[1][1][1] == "receipt" and a[2] == ("field", ["rc2", "job", "-"], "R11 job ended"), a)
+    a = D(id="rc3", s="running", job="W", src="https://discord.com/channels/1/2/3")
+    ok(a[0][1][1] == "partial" and a[0][1][2].endswith("[blocked; not an owner step]") and a[2] == ("field", ["rc3", "job", "-"], "R11 job ended"), f"blocked without a link is not an owner step: {a}")
+    a = D(id="rc3l", s="running", job="W")
+    ok(a[0] == ("q", ["rc3l", q], "R11 receipt link") and a[1][1][1] == "blocked" and "🧾 Receipt blocked" in a[1][1][2], a)
+    a = D(id="rc3s", s="running"); ok(a[0] == ("field", ["rc3s", "src", "https://discord.com/channels/1/2/7"], "R11 receipt link") and a[1][1][1] == "blocked" and len(a) == 3, a)
+    a = D(id="rc3b", s="running")
+    ok(a[0] == ("field", ["rc3b", "blockedBy", "card-a,card-b"], "R11 receipt blockedBy") and a[1][1][1] == "partial" and a[1][1][2].endswith("[blocked by card-a, card-b]"), a)
+    a = D(id="rc3q", s="waiting", queued="1", src="https://discord.com/channels/1/2/3"); ok(a[0][1][1] == "partial" and len(a) == 2, f"R9: queued blocked -> partial {a}")
+    a = D(id="rc3ql", s="waiting", queued="1"); ok(a[0][1][1] == "partial" and len(a) == 2, f"queued + link -> partial, no link copy {a}")
+    a = D(id="rcT", s="running", area="Finance", job="W"); ok(a and a[0][1][1] == "done" and a[0][2] == "R11 receipt done", f"a receipt also closes a finance card (owner 2026-10-22): {a}")
+    ok(not finance({"id": "x", "area": "tools", "t": "finance tables image-only"}), "title words do not make a card a finance card")
+    a = D(id="rcT", s="running", area="Finance", job="W", cts=str(ms(now) + 3_600_000)); ok(a == [("field", ["rcT", "receipt", str(ms(now))], "R11 stale receipt skipped (card changed after it)")], f"stale receipt: {a}")
+    ok(finance({"id": "x", "area": "Finance", "t": "anything"}), "area finance is a finance card")
+    ok(D(id="rcA", s="done") == [], "done cards stay as they are")
+    a = D(id="rcW", s="waiting", src="https://discord.com/channels/1/2/3"); ok(a[0][1][1] == "done", f"a done receipt closes a waiting card too: {a}")
+    a = D(id="rcX", s="partial", job="W"); ok(a[-1][2] == "R3 job working", f"a receipt for another card is ignored: {a}")
+    a = D(id="rcB", s="partial", job="W"); ok(a[-1][2] == "R3 job working", f"unknown result is ignored: {a}")
+    a = D(id="rcO", s="partial", job="W", receipt=str(ms(now - 3 * 3600)), hist=[{"by": "run:x", "cts": ms(now - 600)}])
+    ok(a[-1][2] == "R3 job working", f"a restarted card (real change after the receipt) may run again: {a}")
+    ok(receipt_ms({"ts": "2026-10-19T11:00:00-0400"}) == ms(datetime(2026, 10, 19, 15, 0).replace(tzinfo=__import__("datetime").timezone.utc).timestamp()))
+    ok(receipt_ms({"ts": "garbage"}) == 0)
+    # R12 heartbeat / silence
+    a = D(id="s1", s="running", job="SIL", n="working: 🤫 Silent. z")
+    ok(a == [("set", ["s1", "running", f"working: 🤫 Silent. z [{SILENT}]"], "R12 job silent")], a)
+    ok(D(id="s1", s="running", job="SIL", n=f"z [{SILENT}]") == [], "flag once")
+    ok(D(id="s2", s="running", job="SIL", beat=ms(now - 60)) == [], "a recent fm beat keeps a working pane from being silent")
+    ok(D(id="s3", s="running", job="NOACT") == [], "no activity data -> not silent")
+    ok(D(id="s4", s="running", job=["SIL", "nightly-build.service"]) == [], "a running unit is never silent")
+    a = D(id="s5", s="running", job="W", n=f"working: 🔧 Work. z [{SILENT}]")
+    ok(a == [("set", ["s5", "running", "working: 🔧 Work. z"], "R12 activity resumed")], a)
+    a = D(id="s6", s="partial", job="W", n=f"z [{SILENT}]"); ok(a[-1][1] == ["s6", "running", "working: 🔧 Work. z"], a)
+    ok(D(id="s7", s="running", job="IDL", beat=ms(now - 120)) == [], "R8: a recent beat counts as activity")
+    ok(D(id="r5o", s="partial", job="GONE", n=f"x [{ENDED_OLD}]") == [], "the old ended mark is not rewritten")
+    a = D(id="r5p", s="running", job="GONE", n=f"working: X. y [{SILENT}]"); ok(a[0][1] == ["r5p", "partial", f"y [{ENDED}]"], a)
+    its3 = [P(id="b1", job="IDL", beat=ms(now - 60)), P(id="b2", job="IDL", beat=ms(now - 3 * 3600))]
+    ok({i["id"] for i in idle_scan(its3, ctx)[0]} == {"b2"}, "R10: a recent beat is activity")
+    print(f"all tests passed ({n})")
+
+
+if __name__ == "__main__":
+    if "--test" in sys.argv:
+        test()
+    else:
+        main("--dry-run" in sys.argv)
