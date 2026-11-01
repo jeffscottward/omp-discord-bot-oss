@@ -14,6 +14,12 @@ PROJECT="${OMP_GITLAB_PROJECT:-owner%2Fomp-discord-bot}"
 POLL="${OMP_CI_POLL:-20}"
 SLEEP="${OMP_CI_SLEEP:-sleep}"
 short="${SHA:0:7}"
+# No GitLab configured (no OMP_GITLAB_API and no token file): skip the CI check, so a setup without GitLab can
+# still restart. Set OMP_GITLAB_API or OMP_GITLAB_TOKEN_FILE to require a green pipeline.
+if [ -z "${OMP_GITLAB_API:-}" ] && [ -z "${OMP_GITLAB_TOKEN_FILE:-}" ] && [ ! -e "$TOKFILE" ]; then
+  echo "CI SKIPPED at $short: no GitLab configured"
+  exit 0
+fi
 [ -r "$TOKFILE" ] || { echo "CI UNKNOWN at $short: GitLab token file is not readable"; exit 2; }
 
 # Prints the status of the newest pipeline for SHA ("none" when there is none). Fails when GitLab is not readable.

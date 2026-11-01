@@ -74,7 +74,8 @@ only a time stamp does not repost it within 10 min. Sections, in order:
 - 🤖 **Bots and scheduled jobs**: one count line (running, scheduled, down) and a dashboard link.
 
 ⏸️ **Pause all** / ▶️ **Resume all** (buttons, or `/pause [reason]` and `/resume-work`) stop the queue from
-starting new work; fm-spawn and the sweeps wait too (`src/maintpause.ts`). A **Stopped** reply and the pause notice
+starting new work; fm-spawn and the sweeps wait too (`src/maintpause.ts`; the buttons call an `omp-maintenance`
+command that writes the pause flag, set with `OMP_MAINT_BIN`). A **Stopped** reply and the pause notice
 carry a ▶️ **Resume** button that continues the same session (`src/resumebtn.ts`). Finance cards show their subject,
 or only the card id when the title carries amounts, sizes or account data.
 
@@ -150,7 +151,8 @@ Voice messages in text channels are transcribed the same way. Long transcripts a
 ### 🔄 Restart-when-idle gate
 Restart with `scripts/restart-when-idle.sh` (detached, for example through `systemd-run --user --collect`), never
 from inside a run. It first runs the gate (`bash -n`, typecheck, `bun test`) and refuses on failure. The commit
-must also have a green CI pipeline (`scripts/ci-green.sh`, GitLab; set `OMP_RESTART_CI` to another check), and the
+must also have a green CI pipeline when GitLab is configured (`scripts/ci-green.sh`; without GitLab it is skipped;
+`OMP_RESTART_CI` selects another check), and the
 restart loads only the commit the gate checked: a dirty checkout or a moved HEAD stops it. Then it waits until no
 job runs and the owner is not in a voice call. After 10 min it drains: new jobs stay queued (saved, run after the
 restart) while running jobs finish. After 2 h of a busy bot it gives up and posts one notice.

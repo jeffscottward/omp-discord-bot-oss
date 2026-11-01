@@ -1,5 +1,0 @@
-# M4 (owner 2026-10-30, card infra-bot-consolidation): hourly Discord cleanups, one timer (omp-discord-cleanup.timer).
-# Replaces omp-archive-purge.timer and omp-stopped-cleanup.timer. Format: see self-healing-harness/bin/tick-runner.
-# name          timeout every stage command
-archive-purge   900     0     1     /usr/bin/python3 ~/Github/tools/omp-discord-bot/scripts/purge-archive.py --drop-categories --empty-dupes
-stopped-cleanup 1200    0     1     /usr/bin/python3 ~/Github/tools/omp-discord-bot/scripts/stopped-cleanup.py --min-age-hours 24

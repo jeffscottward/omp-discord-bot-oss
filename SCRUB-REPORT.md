@@ -71,5 +71,8 @@ Rules: the same replacement table as above. Also replaced or removed in the new 
   test alert channel name).
 
 CI: `.github/workflows/ci.yml` runs typecheck, `bun test test/`, `bun test src/` and `lint:mentions`. The
-restart gate (`scripts/ci-green.sh`) reads a GitLab pipeline; set `OMP_RESTART_CI` and `OMP_SAFE_RESTART_CI` to
-another check command when you do not use GitLab.
+restart gate (`scripts/ci-green.sh`) reads a GitLab pipeline when one is configured and skips the check otherwise;
+`OMP_RESTART_CI` and `OMP_SAFE_RESTART_CI` select another check command.
+
+Not copied: the private hourly/daily cleanup units that run through the owner's separate harness (`tick-runner`,
+`unit-audit`). The standalone `omp-archive-purge` and `omp-stopped-cleanup` timers stay.
