@@ -30,7 +30,15 @@ beforeEach(() => {
     // never reach the real bot: no channel waiter unless a test turns it on with fake agents.json + /post
     FM_SPAWN_CHANNEL_WAIT_S: "0", FM_SPAWN_AGENTS: join(dir, "agents.json"), FM_SPAWN_POST_URL: "http://127.0.0.1:9/post",
     FM_SPAWN_ITEMS: join(dir, "items.json"),
+    // the maintenance pause flag (card omp-pause-button): a scratch path, so a real pause never blocks these tests
+    OMP_MAINT_PAUSED: join(dir, "paused.json"),
+    // the stack catalog (owner 2026-10-28): a scratch file, so auto-created stacks never reach the real catalog
+    OMP_BOT_STACKS: join(dir, "stacks.json"),
+    // stack fallback: 3 quick tries, then a fake omp-notify that logs (the default transport fails; ntfy works)
+    FM_SPAWN_FALLBACK_DELAYS: "0,0", FM_SPAWN_NOTIFY: join(dir, "omp-notify"),
     GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+    // no user git config (e.g. remote.origin.followRemoteHEAD) may change what these tests see
+    GIT_CONFIG_GLOBAL: "/dev/null",
   };
   // fake herdr: pane list from panes.json; tab create returns ids; process-info says omp; logs every call
   writeFileSync(join(dir, "herdr"), `#!/bin/bash
@@ -47,6 +55,8 @@ esac
   // fake fm-tabwatch: one finished fm-spawn tab and one that only looks finished
   writeFileSync(join(dir, "fm-tabwatch"), `#!/bin/bash\necho '{"tabs":31,"closable":[{"tab":"wT:t1","label":"🧪 done job","card":"c0","why":"receipt done"}],"look_finished":[{"tab":"wT:t2","label":"old tab","status":"done"}]}'\n`);
   chmodSync(join(dir, "fm-tabwatch"), 0o755);
+  writeFileSync(join(dir, "omp-notify"), `#!/bin/bash\nprintf '%s\\n' "notify[\${OMP_NOTIFY_TRANSPORT:-default}] $*" >> ${dir}/calls.log\n[ "\${OMP_NOTIFY_TRANSPORT:-}" = ntfy ]\n`);
+  chmodSync(join(dir, "omp-notify"), 0o755);
   chmodSync(join(dir, "herdr"), 0o755);
   chmodSync(join(dir, "fm"), 0o755);
   writeFileSync(join(dir, "task.md"), "# task\n");
@@ -59,6 +69,17 @@ esac
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 describe("fm-spawn start", () => {
+  test("maintenance pause: refuses with exit 5 and starts no tab; works again after resume", () => {
+    setPanes(["/elsewhere"]);
+    writeFileSync(join(dir, "paused.json"), JSON.stringify({ since: "2026-10-30T21:00:00-04:00", reason: "kernel update" }));
+    const r = spawn();
+    expect(r.code).toBe(5);
+    expect(r.err).toContain("agent work is paused (kernel update)");
+    expect(calls()).not.toContain("tab create");
+    rmSync(join(dir, "paused.json"));
+    expect(spawn().code).toBe(0);
+  });
+
   test("no other pane in the repo: starts in the repo, no worktree", () => {
     setPanes(["/elsewhere"]);
     const r = spawn("--card", "c1");
@@ -175,7 +196,54 @@ describe("fm-spawn start", () => {
     expect(JSON.parse(spawn().out).stack).toBe("firstmate");
     writeFileSync(join(dir, "cards", "c2.json"), JSON.stringify({ id: "c2", area: "Client Co: postal address" }));
     expect(JSON.parse(spawn("--card", "c2", "--dry-run").out).stack).toBe("realestate");
-    expect(spawn("--stack", "nope").code).not.toBe(0);
+    expect(spawn("--stack", "Not A Name!").code).not.toBe(0);
+  });
+
+  test("catalog (owner 2026-10-28): --stack accepts any name and adds an unknown one; a new area makes a new stack", () => {
+    setPanes(["/elsewhere"]);
+    const catalog = () => (existsSync(join(dir, "stacks.json")) ? (JSON.parse(readFileSync(join(dir, "stacks.json"), "utf8")).stacks as { name: string; areas?: string[]; addedBy?: string }[]) : []);
+    // dry runs never write the catalog
+    expect(JSON.parse(spawn("--stack", "boats", "--dry-run").out).stack).toBe("boats");
+    expect(catalog()).toEqual([]);
+    expect(JSON.parse(spawn("--stack", "boats").out).stack).toBe("boats");
+    expect(catalog().map((s) => [s.name, s.addedBy])).toEqual([["boats", "fm-spawn auto"]]);
+    sh(["mkdir", "-p", join(dir, "cards")]);
+    writeFileSync(join(dir, "cards", "c3.json"), JSON.stringify({ id: "c3", area: "Boat Repair: hull" }));
+    expect(JSON.parse(spawn("--card", "c3").out).stack).toBe("boat-repair");
+    expect(catalog().find((s) => s.name === "boat-repair")!.areas).toEqual(["boat repair"]);
+    // the same area again maps to that stack (no second entry)
+    expect(JSON.parse(spawn("--card", "c3").out).stack).toBe("boat-repair");
+    expect(catalog().filter((s) => s.name === "boat-repair")).toHaveLength(1);
+  });
+
+  test("catalog areas and keywords route cards to catalog stacks", () => {
+    setPanes(["/elsewhere"]);
+    writeFileSync(join(dir, "stacks.json"), JSON.stringify({ version: 1, stacks: [
+      { name: "infra", areas: ["tools", "infra"] },
+      { name: "discord", emoji: "💬", areas: ["discord", "discord bot"], keywords: ["queue message", "discord"] },
+      { name: "home", keywords: ["doorbell"] },
+    ] }));
+    sh(["mkdir", "-p", join(dir, "cards")]);
+    writeFileSync(join(dir, "cards", "c1.json"), JSON.stringify({ id: "c1", area: "Discord" }));
+    writeFileSync(join(dir, "cards", "c4.json"), JSON.stringify({ id: "c4", t: "Charge the Ring doorbell" }));
+    expect(JSON.parse(spawn("--card", "c1").out).stack).toBe("discord");
+    expect(JSON.parse(spawn("--card", "c4").out).stack).toBe("home");
+    expect(JSON.parse(spawn("--label", "fix the queue-message footer").out).stack).toBe("discord");
+  });
+
+  test("STACK_KEYWORDS matches the router's DEFAULT_STACKS keywords", () => {
+    const r = sh(["python3", "-c", `import runpy,json;print(json.dumps(runpy.run_path(${JSON.stringify(SCRIPT)},run_name="x")["STACK_KEYWORDS"]))`]);
+    expect(JSON.parse(r.out)).toEqual(Object.fromEntries(DEFAULT_STACKS.map((s) => [s.name, s.keywords])));
+  });
+
+  test("built-in keywords and the webapp rule beat an unknown area (no needless new stack)", () => {
+    setPanes(["/elsewhere"]);
+    sh(["mkdir", "-p", join(dir, "cards")]);
+    writeFileSync(join(dir, "cards", "c5.json"), JSON.stringify({ id: "c5", area: "Paperwork", t: "pay the tax bill before the deadline" }));
+    writeFileSync(join(dir, "cards", "c6.json"), JSON.stringify({ id: "c6", area: "Web", t: "webapp settings page" }));
+    expect(JSON.parse(spawn("--card", "c5").out).stack).toBe("finance");
+    expect(JSON.parse(spawn("--card", "c6").out).stack).toBe("webapp");
+    expect(existsSync(join(dir, "stacks.json"))).toBe(false);
   });
 
   test("STACK_AREAS matches the router's DEFAULT_STACKS areas", () => {
@@ -203,14 +271,16 @@ describe("fm-spawn start", () => {
 describe("fm-spawn channel post and --adopt (owner 2026-10-24)", () => {
   /** Fake bot /post on a free port; returns the posted bodies. */
   function fakeBot(status = 200) {
-    const posts: { channel: string; text: string }[] = [];
+    const posts: { channel?: string; text: string; stack?: string; pane?: string; alert?: string }[] = [];
+    const paths: string[] = [];
     const srv = Bun.serve({ port: 0, fetch: async (req) => {
-      const b = (await req.json()) as { channel: string; text: string };
+      const b = (await req.json()) as { channel?: string; text: string };
       posts.push(b);
-      return status === 200 && !b.text.includes("REFUSE") ? Response.json({ ok: true, url: `https://discord/x/${b.channel}` }) : Response.json({ error: "no" }, { status: 400 });
+      paths.push(new URL(req.url).pathname);
+      return status === 200 && !b.text.includes("REFUSE") ? Response.json({ ok: true, url: `https://discord/x/${b.channel ?? "thread"}` }) : Response.json({ error: "no" }, { status: status === 200 ? 400 : status });
     } });
     env.FM_SPAWN_POST_URL = `http://127.0.0.1:${srv.port}/post`;
-    return { posts, stop: () => srv.stop(true) };
+    return { posts, paths, stop: () => srv.stop(true) };
   }
   async function run(...args: string[]) {
     const p = Bun.spawn(["python3", SCRIPT, ...args], { env: { ...process.env, ...env }, stdout: "pipe", stderr: "pipe" });
@@ -236,14 +306,54 @@ describe("fm-spawn channel post and --adopt (owner 2026-10-24)", () => {
     expect(bot.posts[0]!.text).not.toContain("```ask");
   });
 
-  test("no channel within the deadline: no post, exit 3; an archived entry does not count", async () => {
+  test("no channel within the deadline: the job goes to its stack thread with Stop + FIRSTMATE alert (owner 2026-10-28)", async () => {
     const bot = fakeBot();
     env.FM_SPAWN_CHANNEL_WAIT_S = "1";
-    agents([{ paneId: "wT:p9", channelId: "OLD", archived: true }]);
-    const r = await run("--await-channel", "wT:p9", "--task", join(dir, "task.md"), "--label", "x", "--stack", "infra");
+    agents([{ paneId: "wT:p9", channelId: "OLD", archived: true }]); // an archived entry does not count
+    const r = await run("--await-channel", "wT:p9", "--task", join(dir, "task.md"), "--label", "x", "--stack", "infra", "--card", "c1");
+    bot.stop();
+    expect(r.code).toBe(0);
+    expect(bot.paths).toEqual(["/stack-job"]);
+    expect(bot.posts[0]).toMatchObject({ stack: "infra", pane: "wT:p9" });
+    expect(bot.posts[0]!.text).toContain("no Discord channel of its own");
+    expect(bot.posts[0]!.alert).toContain("x");
+    expect(readFileSync(join(dir, "state", "fm-spawn.log"), "utf8")).toContain("posted in the infra stack thread with Stop");
+  });
+
+  test("a 4xx refusal is not retried: one post, then omp-notify", async () => {
+    const bot = fakeBot(400);
+    env.FM_SPAWN_CHANNEL_WAIT_S = "1";
+    agents([]);
+    const r = await run("--await-channel", "wT:p5", "--label", "x", "--stack", "kb");
     bot.stop();
     expect(r.code).toBe(3);
-    expect(bot.posts).toHaveLength(0);
+    expect(bot.posts).toHaveLength(1);
+    expect(calls()).toContain("notify[ntfy] --kind error");
+  });
+
+  test("a tab id resolves to its OMP pane for the Stop button", async () => {
+    const bot = fakeBot();
+    env.FM_SPAWN_CHANNEL_WAIT_S = "1";
+    agents([]);
+    writeFileSync(join(dir, "panes.json"), JSON.stringify([{ pane_id: "wT:p8", tab_id: "wT:t9", agent: "shell" }, { pane_id: "wT:p9", tab_id: "wT:t9", agent: "omp" }]));
+    const r = await run("--await-channel", "wT:t9", "--label", "x", "--stack", "kb");
+    bot.stop();
+    expect(r.code).toBe(0);
+    expect(bot.posts[0]!.pane).toBe("wT:p9");
+  });
+
+  test("stack fallback refused on every retry: exit 3 and omp-notify (ntfy when the bot route fails); never silent", async () => {
+    const bot = fakeBot(503);
+    env.FM_SPAWN_CHANNEL_WAIT_S = "1";
+    agents([]);
+    const r = await run("--await-channel", "wT:p5", "--label", "x", "--stack", "kb");
+    bot.stop();
+    expect(r.code).toBe(3);
+    expect(bot.posts).toHaveLength(3); // FM_SPAWN_FALLBACK_DELAYS "0,0": 3 tries
+    expect(bot.posts[0]!.pane).toBe("wT:p5");
+    expect(calls()).toContain("notify[default] --kind error --summary Terminal job x (stack kb, pane wT:p5)");
+    expect(calls()).toContain("notify[ntfy] --kind error");
+    expect(readFileSync(join(dir, "state", "fm-spawn.log"), "utf8")).toContain("stack fallback FAILED");
   });
 
   test("a refused full post falls back to the short form", async () => {
@@ -268,15 +378,15 @@ describe("fm-spawn channel post and --adopt (owner 2026-10-24)", () => {
       { id: "c", s: "running", job: "wT:p7" }, // pane gone
       { id: "d", s: "done", job: "wT:p1" },
       { id: "e", s: "running", job: "kb-daily.timer" },
-      { id: "f", s: "partial", job: ["wT:t1"], area: "Something new" }, // tab id; no domain -> firstmate
-      { id: "g", s: "running", job: "wT:p3", area: "Finance: options", t: "SECRET position title" }, // finance stack ("Finance: …" too): no title in Discord
+      { id: "f", s: "partial", job: ["wT:t1"], area: "Something new" }, // tab id; new area -> new stack (owner 2026-10-28)
+      { id: "g", s: "running", job: "wT:p3", area: "Finance: invoices", t: "Pay 100 usd SECRET" }, // finance stack ("Finance: …" too): no title in Discord
       { id: "h", s: "running", job: "wT:p2", area: "tools" }, // same pane as b: one note per pane
     ]));
     agents([{ paneId: "wT:p1", tabId: "wT:t1", channelId: "C1", archived: false }, { paneId: "wT:p2", tabId: "wT:t2", channelId: "C2", archived: false }, { paneId: "wT:p3", tabId: "wT:t3", channelId: "C3", archived: false }]);
     const dry = await run("--adopt-all", "--dry-run");
     expect(dry.out).toContain("DRY adopt wT:p1 card a stack infra (set) channel C1");
     expect(dry.out).toContain("DRY adopt wT:p2 card b stack kb channel C2");
-    expect(dry.out).toContain("DRY adopt wT:t1 card f stack firstmate (set) channel C1 (already noted)");
+    expect(dry.out).toContain("DRY adopt wT:t1 card f stack something-new (set) channel C1 (already noted)");
     expect(dry.out).not.toContain("card c ");
     expect(dry.out).not.toContain("card d ");
     expect(dry.out).not.toContain("card e ");
@@ -284,10 +394,11 @@ describe("fm-spawn channel post and --adopt (owner 2026-10-24)", () => {
     await run("--adopt-all"); // waits in-process: every note is posted when it returns
 
     expect(calls()).toContain("fm field a stack infra");
-    expect(calls()).toContain("fm field f stack firstmate");
+    expect(calls()).toContain("fm field f stack something-new");
     expect(calls()).toContain("fm field g stack finance");
     expect(bot.posts.some((p) => p.text.includes("SECRET"))).toBe(false);
-    expect(bot.posts.find((p) => p.channel === "C3")!.text).toContain("Finance card g");
+    expect(bot.posts.find((p) => p.channel === "C3")!.text).toContain("g");
+    expect(bot.posts.some((p) => p.text.includes("100 usd"))).toBe(false);
     expect(calls()).not.toContain("fm field b stack");
     expect(bot.posts.map((p) => p.channel).sort()).toEqual(["C1", "C2", "C3"]);
     expect(bot.posts[0]!.text).toContain("📌 **Terminal job** (fm-spawn --adopt)");
@@ -429,5 +540,121 @@ describe("fm-spawn shared dependencies (worktree-share, store-based)", () => {
     const r = sh(["python3", SCRIPT, "--cleanup"]);
     expect(r.out).toContain("not merged");
     expect(sh(["test", "-L", join(o.worktree, "node_modules")]).code).toBe(0);
+  });
+});
+
+describe("fm-spawn --close-finished (card tabclose-safe)", () => {
+  const P = (id: string, tab: string, status = "idle", extra: Record<string, unknown> = {}) =>
+    ({ pane_id: id, tab_id: tab, workspace_id: "wT", agent_status: status, terminal_title: "π > job", ...extra });
+  const setup = (tabs: object[], panes: object[], items: object[], spawned: object[] = []) => {
+    writeFileSync(join(dir, "tabs.json"), JSON.stringify(tabs));
+    writeFileSync(join(dir, "panes.json"), JSON.stringify(panes));
+    writeFileSync(join(dir, "items.json"), JSON.stringify({ items }));
+    sh(["mkdir", "-p", join(dir, "state")]);
+    writeFileSync(join(dir, "state", "spawned.jsonl"), spawned.map((s) => JSON.stringify(s)).join("\n") + "\n");
+  };
+  const run = (...a: string[]) => sh(["python3", SCRIPT, "--close-finished", "--workspace", "wT", ...a]);
+  const line = (out: string, tab: string) => out.split("\n").find((l) => l.includes(`: ${tab} `)) || "";
+
+  test("(a) a busy pane keeps the tab; an idle tab without cards closes", () => {
+    setup([{ tab_id: "wT:t1", label: "a", agent_status: "done" }, { tab_id: "wT:t2", label: "b" }, { tab_id: "wT:t3", label: "c" }],
+      [P("wT:p1", "wT:t1"), P("wT:p2", "wT:t2", "working"), P("wT:p3", "wT:t3", "idle", { terminal_title: "⠋ busy" })], []);
+    const r = run();
+    expect(line(r.out, "wT:t1")).toStartWith("closed");
+    expect(line(r.out, "wT:t2")).toContain("keep");
+    expect(line(r.out, "wT:t3")).toContain("keep");
+    expect(calls()).toContain("tab close wT:t1");
+    expect(calls()).not.toContain("tab close wT:t2");
+    expect(calls()).not.toContain("tab close wT:t3");
+  });
+
+  test("(b) a live card whose job is the pane, tab id or label keeps the tab; done/backlog cards do not", () => {
+    setup([1, 2, 3, 4].map((i) => ({ tab_id: `wT:t${i}`, label: `L${i}`, agent_status: "done" })),
+      [1, 2, 3, 4].map((i) => P(`wT:p${i}`, `wT:t${i}`)),
+      [{ id: "k1", s: "running", job: "wT:p1" }, { id: "k2", s: "partial", job: "wT:t2" },
+       { id: "k3", s: "waiting", job: "L3" }, { id: "d4", s: "done", job: "wT:p4" }, { id: "b4", s: "backlog", job: "wT:p4" }]);
+    const r = run("--dry-run");
+    for (const t of ["wT:t1", "wT:t2", "wT:t3"]) expect(line(r.out, t)).toContain("live card job");
+    expect(line(r.out, "wT:t4")).toStartWith("DRY would close");
+    expect(calls()).not.toContain("tab close");
+  });
+
+  test("(c) own fm-spawn card must be done", () => {
+    setup([{ tab_id: "wT:t1", label: "x" }, { tab_id: "wT:t2", label: "y" }], [P("wT:p1", "wT:t1"), P("wT:p2", "wT:t2")],
+      [{ id: "c1", s: "partial" }, { id: "c2", s: "done" }], [{ tab: "wT:t1", card: "c1" }, { tab: "wT:t2", card: "c2" }]);
+    const r = run("--dry-run");
+    expect(line(r.out, "wT:t1")).toContain("own card c1 is partial");
+    expect(line(r.out, "wT:t2")).toStartWith("DRY would close");
+  });
+
+  test("idle tab with no fm-spawn card and no Herdr done status is kept (DYR incident)", () => {
+    setup([{ tab_id: "wT:t1", label: "DYR narration", agent_status: "idle" }], [P("wT:p1", "wT:t1")], []);
+    const r = run();
+    expect(line(r.out, "wT:t1")).toContain("may be an owner tab");
+    expect(calls()).not.toContain("tab close");
+  });
+
+  test("focused and FIRSTMATE tabs are kept", () => {
+    setup([{ tab_id: "wT:t1", label: "x", focused: true }, { tab_id: "wT:t2", label: "FIRSTMATE" }],
+      [P("wT:p1", "wT:t1"), P("wT:p2", "wT:t2")], []);
+    const r = run();
+    expect(r.out).not.toContain("closed: wT");
+    expect(calls()).not.toContain("tab close");
+  });
+
+  test("restore duplicates: same label, one tab holds the card job -> the other closes, the job tab stays", () => {
+    setup([{ tab_id: "wT:t1", label: "DYR narration" }, { tab_id: "wT:t2", label: "DYR narration" }],
+      [P("wT:p1", "wT:t1"), P("wT:p2", "wT:t2")], [{ id: "dyr", s: "running", job: "wT:p2" }]);
+    const r = run();
+    expect(line(r.out, "wT:t1")).toContain("restore duplicate");
+    expect(line(r.out, "wT:t2")).toContain("live card job: dyr");
+    expect(calls()).toContain("tab close wT:t1");
+    expect(calls()).not.toContain("tab close wT:t2");
+  });
+
+  test("duplicates where the card names only the label: both kept (cannot tell which is live)", () => {
+    setup([{ tab_id: "wT:t1", label: "dup" }, { tab_id: "wT:t2", label: "dup" }],
+      [P("wT:p1", "wT:t1"), P("wT:p2", "wT:t2")], [{ id: "c", s: "running", job: "dup" }]);
+    const r = run("--dry-run");
+    expect(r.out).not.toContain("DRY would close");
+  });
+
+  test("refusal message suggests --close-finished", () => {
+    setPanes([repo]);
+    writeFileSync(join(dir, "tabs.json"), JSON.stringify(Array.from({ length: 31 }, (_, i) => ({ tab_id: `wT:t${i}` }))));
+    expect(spawn().err).toContain("fm-spawn --close-finished --dry-run");
+  });
+});
+
+describe("fm-spawn default base (card webapp-ws-branches-unrelated-history)", () => {
+  const defaultBase = (clone: string) =>
+    sh(["python3", "-c", `import runpy,sys;print(runpy.run_path(${JSON.stringify(SCRIPT)},run_name="x")["default_base"](sys.argv[1]))`, clone]);
+
+  test("refreshes a stale cached origin/HEAD from the remote default branch", () => {
+    // remote: default branch `live`; a stale `main` with unrelated history also exists
+    const remote = join(dir, "remote.git");
+    git("branch", "-m", "live");
+    git("checkout", "-q", "--orphan", "main");
+    git("commit", "-qm", "stale root");
+    sh(["git", "clone", "-q", "--bare", repo, remote]);
+    sh(["git", "-C", remote, "symbolic-ref", "HEAD", "refs/heads/live"]);
+    const clone = join(dir, "clone");
+    sh(["git", "clone", "-q", remote, clone]);
+    // the clone cached `main` as origin/HEAD (default branch changed after the clone)
+    sh(["git", "-C", clone, "remote", "set-head", "origin", "main"]);
+    const r = defaultBase(clone);
+    expect(r.err).toBe("");
+    expect(r.out.trim()).toBe("origin/live");
+  });
+
+  test("keeps the cached origin/HEAD when the remote is unreachable", () => {
+    // default branch `live`, so the main/master fallback cannot give the same answer
+    const remote = join(dir, "remote.git");
+    git("branch", "-m", "live");
+    sh(["git", "clone", "-q", "--bare", repo, remote]);
+    const clone = join(dir, "clone");
+    sh(["git", "clone", "-q", remote, clone]);
+    rmSync(remote, { recursive: true, force: true });
+    expect(defaultBase(clone).out.trim()).toBe("origin/live");
   });
 });

@@ -34,7 +34,7 @@ describe("card sweep: dashboard cards", () => {
   const chan = (id: string) => (id === "9" ? "archived" : id === "8" ? "gone" : "live") as "live" | "archived" | "gone";
   const url = (c: string, m?: string) => `https://discord.com/channels/1/${c}${m ? `/${m}` : ""}`;
   test("links", () => expect(discordLink(url("5", "6"))).toEqual({ channel: "5", message: "6" }));
-  test("flags cards on archived/gone channels or closed menus; skips finance, done, parked, already flagged", () => {
+  test("flags cards on archived/gone channels or closed menus (finance too); skips time gates, done, parked, already flagged", () => {
     const cards = [
       { id: "a", s: "waiting", src: url("9") },
       { id: "b", s: "partial", q: url("8", "1") },
@@ -45,7 +45,10 @@ describe("card sweep: dashboard cards", () => {
       { id: "g", s: "waiting", t: "account auth", src: url("9") },
       { id: "h", s: "waiting", n: "🧹 Card sweep: x", src: url("9") },
       { id: "i", s: "waiting", src: url("5") },
+      { id: "j", s: "waiting", until: "2099-01-01T00:00:00Z", src: url("9") },
+      { id: "gate-k", s: "waiting", src: url("9") },
     ];
-    expect(staleCards(cards, chan, new Set(["77"])).map((x) => x.id)).toEqual(["a", "b", "c"]);
+    expect(staleCards(cards, chan, new Set(["77"])).map((x) => x.id)).toEqual(["a", "b", "c", "f", "g"]);
+    expect(staleCards(cards, chan, new Set(["77"]), new Set(["f"])).map((x) => x.id)).toEqual(["a", "b", "c", "g"]); // owner hold
   });
 });

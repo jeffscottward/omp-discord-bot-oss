@@ -51,6 +51,8 @@
     "archives": [],
     "//overflow": "More category ids for this machine's live pane channels, used in order when the local category holds 50 channels.",
     "overflow": [],
+    "//stackCategories": "Owner 2026-10-30: present = main pane channels go to one category per stack (stack name -> [category id, overflow ids...]); the bot creates and saves missing ones. Remove the key to turn the split off.",
+    "stackCategories": {},
     "peers": []
   },
   "//dashboardUrl": "FIRSTMATE dashboard base URL that your phone can open, e.g. https://<host>.<tailnet>.ts.net/reports/firstmate/ . Empty: replies carry no dashboard link.",
@@ -81,7 +83,7 @@
       {
         "name": "finance",
         "channelIds": [
-          "<TRADING_CHANNEL_ID>"
+          "<FINANCE_CHANNEL_ID>"
         ]
       },
       {

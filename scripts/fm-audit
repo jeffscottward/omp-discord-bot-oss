@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""fm-audit: every-minute FIRSTMATE dashboard auditor (owner 2026-10-31, card dashboard-autoflow).
+
+Runs as a step of fm-tick.timer (after fm-autoclear). Finds cards in a bad state and fixes them, so the owner does
+not have to watch the dashboard. Usage: fm-audit [--dry-run] [--report] [--test]
+
+All cards flow the same way, finance cards included (owner 2026-10-31). Never touched: time gates
+(`until`), cards without id, and cards on the owner hold list (firstmate/hold.json: cards the owner reviews himself).
+Hard limit for everything this starts: automatic flow never changes finance code, payments, gates or
+live configs (sweep-task.md). Backlog cards may stay idle.
+Findings:
+ F1 unblocked     partial/planned card with blockedBy links that are all done, and no job -> flow (sweep starts it).
+ F2 no-job        running card with no job at all (no job field, no Herdr pane, no unit) for 15 min
+                  -> partial "[running with no job; needs check]" + flow.
+ F3 daemon-job    running card whose only job is an always-on service (no timer, not one-shot), no pane, no beat and no
+                  real change for 6 h -> job removed (fm-autoclear R3 would raise it again), partial
+                  "[job was the always-on <unit>; needs check]" + flow.
+ F4 needs-check   partial card flagged "needs check" (job ended/stopped/silent without a receipt) and no job -> flow
+                  at once (fm-autoclear R10 would wait 2 h).
+ F5 unclear       partial/blocked card whose blocker chain ends at a parked (planned/backlog) card, a missing card
+                  or a loop (a held card counts as the owner's step) -> ✍️ Needs you: ONE ask menu in FIRSTMATE for all new ones (max 5),
+                  card q = its menu, state waiting with an action. fm-needs-ntfy sends the ntfy push.
+ F6 answered      partial card the owner answered (📨 queued) more than 30 min ago and still no job -> flow.
+
+Flow: audit.json `flow` lists the cards; firstmate-sweep reads them next to idle.json. When a flow or idle card was not
+in a sweep in the last 6 h, fm-audit starts firstmate-sweep.service (at most every 20 min; one sweep at a time).
+Alerts: one omp-notify message per run that has new incidents (once per incident). The first run only seeds.
+Files: firstmate/audit.json (dashboard + sweep), firstmate/audit.log, ~/.local/state/fm-audit/state.json.
+"""
+import json, os, re, subprocess, sys, time, urllib.error, urllib.request
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+HERE = os.environ.get("FM_AUDIT_DIR") or os.environ.get("FM_DIR") or os.path.join(HOME, "Documents/reports/web/firstmate")
+ITEMS = os.path.join(HERE, "items.json")
+RUNNING = os.path.join(HERE, "running.json")
+IDLE = os.path.join(HERE, "idle.json")
+OUT = os.path.join(HERE, "audit.json")
+LOG = os.path.join(HERE, "audit.log")
+STATE = os.environ.get("FM_AUDIT_STATE") or os.path.join(HOME, ".local/state/fm-audit/state.json")
+FM = os.path.join(HOME, ".local/bin/fm")
+NOTIFY = os.environ.get("OMP_NOTIFY") or os.path.join(HOME, ".local/bin/omp-notify")
+POST_URL = os.environ.get("FM_AUDIT_POST_URL") or f"http://127.0.0.1:{os.environ.get('OMP_BOT_HTTP_PORT') or 47821}/post"
+SWEEP_UNIT = "firstmate-sweep.service"
+OTHER = "✏️ Other (type or dictate a reply)"
+
+GRACE_S = 10 * 60          # a card changed this recently is left alone (someone works on it)
+NOJOB_S = 15 * 60          # F2
+DAEMON_S = 6 * 3600        # F3
+ANSWER_S = 30 * 60         # F6
+RECENT_S = 10 * 60         # pane activity / beat this recent = a job works on it
+SWEEP_GAP_S = 20 * 60      # minimum time between two sweeps started by fm-audit
+RESWEEP_S = 6 * 3600       # a card is sent to a sweep again only after this
+ASK_GAP_S = 10 * 60        # minimum time between two ask menus
+ASK_KEEP_S = 3 * 86400     # an asked incident is not asked again for this long
+ALERT_S = 24 * 3600        # one alert per card per day at most
+MAX_ASK = 5
+STALE_RUN_S = 300
+NEEDS_CHECK = re.compile(r"needs check", re.I)
+SKIP_AREAS = {x.strip().lower() for x in (os.environ.get("FM_SKIP_AREAS") or "").split(",") if x.strip()}  # opt-in; default none
+HOLD = os.path.join(HERE, "hold.json")
+
+
+# ---------- pure helpers ----------
+def as_list(v):
+    return [str(x) for x in (v if isinstance(v, list) else [v] if v else []) if str(x).strip()]
+
+
+def ts(s):
+    try:
+        return datetime.strptime(str(s), "%Y-%m-%d %H:%M").timestamp()
+    except Exception:
+        return 0.0
+
+
+def iso_ts(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def holds():
+    """Owner hold list (hold.json {"cards": {id: reason}}): cards the owner reviews himself; never swept or changed."""
+    try:
+        return dict(json.load(open(HOLD)).get("cards") or {})
+    except Exception:
+        return {}
+
+
+def protected(it, held=()):
+    """Never changed by the auditor: time gates, cards without id, FM_SKIP_AREAS (default none), held cards."""
+    if it.get("id") in held:
+        return True
+    if not it.get("id") or it.get("until") or str(it.get("id", "")).startswith("gate-"):
+        return True
+    return str(it.get("area", "")).lower() in SKIP_AREAS
+
+
+def last_touch(it):
+    """Last change NOT made by fm-autoclear/fm-audit (same rule as fm-autoclear R10)."""
+    h = [x for x in (it.get("hist") or []) if isinstance(x, dict) and x.get("cts")]
+    real = [x["cts"] for x in h if x.get("by") != "autoclear"]
+    if real:
+        return max(real) / 1000
+    if h:
+        return min(x["cts"] for x in h) / 1000
+    last = ts(it.get("changed", ""))
+    if it.get("cts") and it.get("by") != "autoclear":
+        last = max(last, float(it["cts"]) / 1000)
+    return last
+
+
+def unit_key(name):
+    n, host = str(name).strip().lower(), None
+    if ":" in n and n.split(":", 1)[0] in ("main", "remote"):
+        host, n = n.split(":", 1)
+    return host, re.sub(r"\.(service|timer)$", "", n)
+
+
+def jobs_of(it, ctx):
+    """Herdr panes and units of a card: running.json itemJobs/itemUnits plus `job` tags (tab label, code, pane id, unit)."""
+    iid, tags = it.get("id"), as_list(it.get("job"))
+    by = {j.get("id"): j for j in ctx["jobs"]}
+    panes = [by[x] for x in ctx["item_jobs"].get(iid, []) if x in by]
+    for j in ctx["jobs"]:
+        names = {str(x).lower() for x in (j.get("code"), j.get("tabLabel"), j.get("id"), j.get("tab")) if x}
+        if j not in panes and any(t.lower() in names for t in tags):
+            panes.append(j)
+    units, keys = [], set(ctx["item_units"].get(iid, []))
+    for s in ctx["services"]:
+        k = f"{s.get('host')}:{s.get('unit')}"
+        hit = k in keys or any(unit_key(s.get("unit", ""))[1] == unit_key(t)[1] and unit_key(t)[0] in (None, s.get("host"))
+                               for t in tags if re.search(r"\.(service|timer)\b", t))
+        if hit and s not in units:
+            units.append(s)
+    now = ctx["now"]
+    beat = float(it.get("beat") or 0) / 1000
+    return {
+        "panes": panes, "units": units, "tags": tags,
+        "live": any(j.get("status") == "working" for j in panes) or any(u.get("state") == "running" for u in units),
+        "recent": any(now - iso_ts(j.get("active")) < RECENT_S for j in panes) or now - beat < RECENT_S,
+        "timer": any(u.get("state") == "waiting" for u in units),
+        "daemon_only": bool(units) and not panes and all(not u.get("oneShot") and not u.get("timer") for u in units)
+                       and all(re.search(r"\.(service|timer)\b", t) for t in tags),
+        "beat": beat,
+    }
+
+
+def graph(items):
+    """Blocker edges like `fm why` and the dashboard: blockedBy by id or title, plus reverse `blocks`."""
+    by = {i.get("id"): i for i in items if i.get("id")}
+    title = {str(i.get("t", "")).lower(): i.get("id") for i in items if i.get("t") and i.get("id")}
+    res = lambda r: r if r in by else title.get(r.lower(), r)
+    edges = {iid: [x for x in (res(r) for r in as_list(i.get("blockedBy"))) if x != iid] for iid, i in by.items()}
+    for iid, i in by.items():
+        for d in map(res, as_list(i.get("blocks"))):
+            if d in edges and d != iid and iid not in edges[d]:
+                edges[d].append(iid)
+    return by, edges
+
+
+def cleared(it, now):
+    g = iso_ts(it.get("until")) if it.get("until") else None
+    return it.get("s") == "done" or (g is not None and 0 < g <= now)
+
+
+def roots(iid, by, edges, cls, now):
+    """Root leaves of a card's open blocker chain: [(class, leaf id, chain)]. Stops at owner/external leaves."""
+    out, seen = [], set()
+
+    def open_refs(x):
+        return [r for r in edges.get(x, []) if r not in by or not cleared(by[r], now)]
+
+    def walk(cur, chain, path):
+        for r in open_refs(cur):
+            if r in path:
+                if r not in seen:
+                    seen.add(r)
+                    out.append(("loop", r, chain + [r]))
+                continue
+            if r not in by:
+                if r not in seen:
+                    seen.add(r)
+                    ref = "external" if re.match(r"(?i)(ext|time):", r) else "bot" if (
+                        re.match(r"(?i)(ci|job|unit|agent|pane):", r) or re.search(r"\.(timer|service)$", r)) else "missing"
+                    out.append((ref, r, chain + [r]))
+                continue
+            own = cls(by[r])
+            if open_refs(r) and own not in ("owner", "external"):
+                walk(r, chain + [r], path | {r})
+            elif r not in seen:
+                seen.add(r)
+                out.append((own, r, chain + [r]))
+
+    walk(iid, [iid], {iid})
+    return out
+
+
+def audit(items, ctx):
+    """Pure: return a list of findings {id, kind, why, fix, ...}. ctx: now, jobs, item_jobs, item_units, services."""
+    now = ctx["now"]
+    held = ctx.get("holds") or {}
+    by, edges = graph(items)
+    J = {iid: jobs_of(it, ctx) for iid, it in by.items() if it.get("s") != "done"}
+    working = lambda iid: J[iid]["live"] or J[iid]["recent"] or J[iid]["timer"]
+    found, flow = [], set()
+
+    def add(it, kind, why, fix, **kw):
+        found.append({"id": it["id"], "t": str(it.get("t", ""))[:120], "s": it.get("s"), "kind": kind, "why": why, "fix": fix, **kw})
+        if fix in ("flow", "partial+flow", "unjob+flow"):
+            flow.add(it["id"])
+
+    for iid, it in by.items():
+        s = it.get("s")
+        if s == "done" or protected(it, held):
+            continue
+        j, refs = J[iid], edges.get(iid, [])
+        open_bb = [r for r in refs if r not in by or not cleared(by[r], now)]
+        quiet = now - last_touch(it) > GRACE_S  # fm-autoclear/fm-audit writes do not count
+        if s == "running":
+            if not j["panes"] and not j["units"] and not j["tags"] and now - max(last_touch(it), j["beat"]) > NOJOB_S:
+                add(it, "no-job", "running, but no job, pane or unit works on it", "partial+flow")
+            elif j["daemon_only"] and now - max(last_touch(it), j["beat"]) > DAEMON_S:
+                u = j["units"][0].get("unit")
+                add(it, "daemon-job", f"running only because its job is the always-on {u}; no beat or real change for 6 h", "unjob+flow", unit=u)
+            continue
+        if s in ("partial", "planned") and refs and not open_bb and not working(iid) and quiet:
+            add(it, "unblocked", "all blockers are done (" + ", ".join(refs[:4]) + "); nothing works on it", "flow")
+            continue
+        if s == "partial" and not open_bb and not working(iid):
+            if NEEDS_CHECK.search(str(it.get("n") or "")) and quiet:
+                add(it, "needs-check", "flagged needs check (job ended or stopped without a receipt); nothing works on it", "flow")
+            elif it.get("queued") and now - float(it.get("queued") or 0) / 1000 > ANSWER_S and quiet:
+                add(it, "answered", "the owner answered; no job took the answer for 30 min", "flow")
+
+    def cls(x):
+        """Leaf class: owner | bot | external | parked | unknown. Flow cards and plain partial cards are bot; held cards are owner."""
+        if x.get("id") in held and x.get("s") != "done":
+            return "owner"  # the owner reviews it himself
+        act = str(x.get("action") or "").strip() and not x.get("queued")
+        if (act and x.get("s") in ("waiting", "open")) or (x.get("s") == "blocked" and (x.get("q") or x.get("src"))):
+            return "owner"
+        if x.get("queued") and x.get("s") != "done":
+            return "bot"
+        g = iso_ts(x.get("until")) if x.get("until") else 0
+        if x.get("ext") or g > now:
+            return "external"
+        if x.get("s") == "running" or x.get("id") in flow or (x.get("id") in J and working(x["id"])):
+            return "bot"
+        if x.get("s") in ("planned", "backlog"):
+            return "parked"
+        if x.get("s") == "partial":
+            return "bot"  # fm-autoclear R10 + the sweep move idle partial cards
+        return "unknown"
+
+    BAD = ("parked", "unknown", "missing", "loop")
+    for iid, it in by.items():
+        if it.get("s") not in ("partial", "blocked") or protected(it, held) or iid in flow or it.get("queued"):
+            continue
+        if it.get("s") == "blocked" and (it.get("q") or it.get("src")):
+            continue  # an owner step with a question/message link (fm-autoclear R11 sets no action): already asked
+        if working(iid):
+            continue
+        rs = roots(iid, by, edges, cls, now)
+        bad = [r for r in rs if r[0] in BAD]
+        if not bad and not (it.get("s") == "blocked" and not rs):
+            continue
+        if bad:
+            c, leaf, chain = bad[0]
+            lt = by.get(leaf, {})
+            what = {"parked": f"{lt.get('s')} card", "missing": "not a card",
+                    "loop": "a blocker loop", "unknown": f"{lt.get('s')} card with no job or owner step"}[c]
+            add(it, "unclear", f"waits on {leaf} ({what}); nothing moves it", "ask", root=leaf, rootClass=c,
+                rootTitle=str(lt.get("t") or leaf)[:100], chain=chain)
+        else:
+            add(it, "unclear", "blocked, but names no blocker and no owner question", "ask", root="", rootClass="none", rootTitle="", chain=[iid])
+    return found
+
+
+def question(f):
+    """One ask-menu question for an F5 finding (card id in brackets so FIRSTMATE can apply the answer)."""
+    iid, root, rt = f["id"], f.get("root"), f.get("rootTitle")
+    if f.get("rootClass") == "none":
+        q = f"[{iid}] “{f['t'][:90]}” is blocked, but no blocker or question is recorded. What should happen?"
+        opts = [f"▶️ Start {iid} now", f"🗃️ Park {iid} in backlog"]
+    elif f.get("rootClass") in ("missing", "loop"):
+        q = f"[{iid}] “{f['t'][:90]}” waits on {root}, which is {'not a card' if f['rootClass'] == 'missing' else 'a blocker loop'}. What should happen?"
+        opts = [f"✂️ Drop the link; start {iid} now", f"🗃️ Park {iid} in backlog"]
+    else:
+        state = "parked; nothing works on it"
+        q = f"[{iid}] “{f['t'][:90]}” waits on [{root}] “{(rt or root)[:80]}” ({state}). What should happen?"
+        opts = [f"▶️ Start {root} now", f"✂️ Drop the link; start {iid} now", f"🗃️ Park {iid} in backlog"]
+    return {"id": "", "question": q[:1200], "options": opts + [OTHER]}
+
+
+def ask_text(fs):
+    qs = [question(f) for f in fs]
+    for n, q in enumerate(qs):
+        q["id"] = f"b{n + 1}"
+    head = ("❔ Dashboard auditor: these cards wait on a blocker that nothing moves. "
+            "Pick what happens; I apply your answer.")
+    return head + "\n```ask\n" + json.dumps({"questions": qs}, ensure_ascii=False) + "\n```"
+
+
+# ---------- effects ----------
+def log(line, dry):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {'DRY ' if dry else ''}{line}"
+    print(line)
+    if not dry:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+
+
+def fm(argv, why):
+    r = subprocess.run([FM, *argv], env={**os.environ, "FM_AUTO": f"fm-audit {why}"}, capture_output=True, text=True, timeout=60)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()[:200]
+
+
+def note_with(it, mark):
+    n = str(it.get("n") or "")
+    return (n if mark in n else (n + " " + mark).strip())[-560:]
+
+
+def firstmate_channel():
+    try:
+        return str(json.load(open(os.path.join(HOME, ".config/omp-discord/config.json"))).get("firstmateChannelId") or "")
+    except Exception:
+        return ""
+
+
+def post(text):
+    ch = firstmate_channel()
+    if not ch:
+        raise RuntimeError("no firstmateChannelId in ~/.config/omp-discord/config.json")
+    req = urllib.request.Request(POST_URL, data=json.dumps({"channel": ch, "text": text}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=30))
+
+
+def notify(summary, action, dry):
+    if dry:
+        print(f"DRY alert: {summary} | {action}")
+        return
+    try:
+        subprocess.run([NOTIFY, "--kind", "progress", "--summary", summary[:240], "--action", action[:240]],
+                       capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        print(f"omp-notify failed: {e}")
+
+
+def sweep_active():
+    r = subprocess.run(["systemctl", "--user", "is-active", SWEEP_UNIT], capture_output=True, text=True, timeout=20)
+    return r.stdout.strip() in ("active", "activating", "reloading")
+
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return None
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, STATE)
+
+
+def write_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def report(found, items):
+    by_kind = {}
+    for f in found:
+        by_kind.setdefault(f["kind"], []).append(f)
+    act = [i for i in items if i.get("s") != "done"]
+    print(f"Cards not done: {len(act)} (" + ", ".join(f"{k} {sum(1 for i in act if i.get('s') == k)}" for k in
+          ("running", "partial", "planned", "backlog", "blocked", "waiting", "open")) + ")")
+    print(f"Not touched (time gate, owner hold): {sum(1 for i in act if protected(i, holds()))}")
+    for k, fs in by_kind.items():
+        print(f"\n{k} ({len(fs)}):")
+        for f in fs:
+            print(f"  {f['id']} [{f['s']}] {f['why']} -> {f['fix']}")
+    if not found:
+        print("No bad states found.")
+
+
+def post_asks(todo, st, asked, by, now, dry, post_fn=None, fm_fn=None):
+    """F5: post ONE ask menu for `todo`; link each card to ITS question (matched by question id); card -> waiting.
+    Returns the ids that got a menu. The incidents count as asked as soon as the post may have reached Discord."""
+    post_fn, fm_fn = post_fn or post, fm_fn or fm
+    text = ask_text(todo)
+    if dry:
+        log(f"F5 would ask about {', '.join(f['id'] for f in todo)}", dry)
+        print(text)
+        return []
+    st["lastAsk"] = now
+    try:
+        res = post_fn(text)
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), ConnectionRefusedError):
+            log(f"F5 ask not posted (bot not listening); retry in {ASK_GAP_S // 60} min", dry)
+            return []
+        res, err = None, e
+    except Exception as e:
+        res, err = None, e
+    if res is None:  # the post may have reached Discord: never post the same menu again for these incidents
+        for f in todo:
+            asked[f"{f['id']}:{f.get('root')}"] = {"at": now, "url": ""}
+        log(f"F5 ask post FAILED ({err}); not asked again for {ASK_KEEP_S // 86400} d: {', '.join(f['id'] for f in todo)}", dry)
+        return []
+    urls = {q.get("id"): q.get("url") for a in (res.get("asks") or []) for q in (a.get("questions") or []) if q.get("url")}
+    done_ans = res.get("alreadyAnswered") or []
+    got = []
+    for n, f in enumerate(todo):
+        url = urls.get(f"b{n + 1}") or ""
+        asked[f"{f['id']}:{f.get('root')}"] = {"at": now, "url": url}
+        if not url:
+            log(f"F5 {f['id']}: no menu for its question (already answered or not posted): {json.dumps(done_ans, ensure_ascii=False)[:200]}", dry)
+            continue
+        it = by[f["id"]]
+        note = f"❔ Blocker unclear: {f['why']}. Question in FIRSTMATE. " + str(it.get("n") or "")
+        try:
+            ok, err = fm_fn(["q", f["id"], url], "F5 unclear")
+            if ok:
+                ok, err = fm_fn(["set", f["id"], "waiting", note[:560], "--action",
+                                 f"Pick what happens with blocker {f.get('root') or '(none recorded)'} in the FIRSTMATE menu"], "F5 unclear")
+        except Exception as e:
+            ok, err = False, str(e)
+        if ok:
+            got.append(f["id"])
+        log(f"F5 {f['id']}: waiting, q {url}" + ("" if ok else f" FAILED: {err}"), dry)
+    return got
+
+
+def main(dry, rep):
+    now = time.time()
+    try:
+        items = json.load(open(ITEMS))["items"]
+    except Exception as e:
+        print(f"fm-audit: cannot read {ITEMS} ({e}); nothing checked")
+        return 0
+    try:
+        run = json.load(open(RUNNING))
+        fresh = now - os.path.getmtime(RUNNING) < STALE_RUN_S and bool(run.get("jobsOk"))
+    except Exception:
+        run, fresh = {}, False
+    if not fresh:
+        print("fm-audit: running.json is stale or has no job list; nothing checked")
+        return 0
+    ctx = {"now": now, "jobs": run.get("jobs") or [], "item_jobs": run.get("itemJobs") or {},
+           "item_units": run.get("itemUnits") or {}, "services": run.get("services") or [], "holds": holds()}
+    found = audit(items, ctx)
+    if rep:
+        report(found, items)
+        return 0
+    st = load_state()
+    first = st is None
+    st = st or {}
+    for k, v in (("incidents", {}), ("asked", {}), ("swept", {}), ("alerted", {}), ("lastSweep", 0), ("lastAsk", 0)):
+        st.setdefault(k, v)
+    by = {i.get("id"): i for i in items if i.get("id")}
+    new, keys = [], set()
+    for f in found:
+        k = f"{f['kind']}:{f['id']}" + (f":{f.get('root')}" if f["kind"] == "unclear" else "")
+        keys.add(k)
+        if k not in st["incidents"]:
+            st["incidents"][k] = {"first": now, "why": f["why"]}
+            new.append(f)
+            log(f"NEW {k}: {f['why']} -> {f['fix']}", dry)
+    for k in [k for k in st["incidents"] if k not in keys]:
+        log(f"resolved {k}", dry)
+        del st["incidents"][k]
+
+    # F2/F3 state fixes; a failed fix is not sent to the sweep (the card would still say running)
+    failed = set()
+    for f in found:
+        it = by[f["id"]]
+        if f["fix"] == "partial+flow":
+            ok, err = (True, "") if dry else fm(["set", f["id"], "partial", note_with(it, "[running with no job; needs check]")], "F2 no-job")
+            log(f"F2 {f['id']}: running -> partial (no job)" + ("" if ok else f" FAILED: {err}"), dry)
+        elif f["fix"] == "unjob+flow":
+            ok, err = True, ""
+            if not dry:
+                ok, err = fm(["field", f["id"], "job", "-"], "F3 daemon-job")
+                if ok:
+                    ok, err = fm(["set", f["id"], "partial", note_with(it, f"[job was the always-on {f['unit']}; needs check]")], "F3 daemon-job")
+            log(f"F3 {f['id']}: job {f['unit']} removed; running -> partial" + ("" if ok else f" FAILED: {err}"), dry)
+        else:
+            continue
+        if not ok:
+            failed.add(f["id"])
+
+    # F5: one ask menu for new unclear cards
+    asked = {k: v for k, v in st["asked"].items() if now - v.get("at", 0) < ASK_KEEP_S}
+    todo = [f for f in found if f["fix"] == "ask" and f"{f['id']}:{f.get('root')}" not in asked][:MAX_ASK]
+    got = []
+    if todo and now - st["lastAsk"] > ASK_GAP_S:
+        got = post_asks(todo, st, asked, by, now, dry)
+    st["asked"] = asked
+
+    # Flow list + sweep trigger
+    flow = [{"id": f["id"], "t": f["t"], "kind": f["kind"], "why": f["why"]} for f in found if "flow" in f["fix"] and f["id"] not in failed]
+    try:
+        idle_ids = [i["id"] for i in json.load(open(IDLE)).get("items") or []]
+    except Exception:
+        idle_ids = []
+    cand = [x["id"] for x in flow] + [i for i in idle_ids if i not in {x["id"] for x in flow} and i not in ctx["holds"]]
+    due = [i for i in cand if now - st["swept"].get(i, 0) > RESWEEP_S]
+    st["swept"] = {k: v for k, v in st["swept"].items() if now - v < 2 * RESWEEP_S}
+    out = {"generated": datetime.now().astimezone().isoformat(timespec="seconds"), "flow": flow,
+           "owner": [{"id": f["id"], "why": f["why"], "root": f.get("root")} for f in found if f["fix"] == "ask"],
+           "findings": [{k: f[k] for k in ("id", "kind", "why", "fix")} for f in found],
+           "lastSweep": st.get("lastSweep") or None, "sweepStarted": None}
+    if not dry:
+        write_json(OUT, out)  # before the sweep starts: firstmate-sweep reads the flow list at once
+    sweep = None
+    if due and now - st["lastSweep"] > SWEEP_GAP_S and not os.path.exists(
+            os.path.join(HOME, ".local/state/omp-maintenance/paused.json")):
+        if dry:
+            log(f"would start {SWEEP_UNIT} for {', '.join(due)}", dry)
+        elif sweep_active():
+            print("sweep already running; flow cards wait for the next one")
+        else:
+            r = subprocess.run(["systemctl", "--user", "start", "--no-block", SWEEP_UNIT], capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                sweep = due
+                st["lastSweep"] = now
+                for i in cand:
+                    st["swept"][i] = now
+                log(f"started {SWEEP_UNIT} for {', '.join(due)}", dry)
+            else:
+                log(f"start {SWEEP_UNIT} FAILED: {r.stderr.strip()[:200]}", dry)
+    out.update(lastSweep=st.get("lastSweep") or None, sweepStarted=sweep)
+
+    # Alerts: once per card per ALERT_S (a card that drops out of a finding for a while and comes back, or that moves
+    # from no-job/daemon-job to needs-check, does not alert again).
+    st["alerted"] = {k: v for k, v in st["alerted"].items() if now - v < ALERT_S}
+    fresh_new = [f for f in new if f["id"] not in st["alerted"]]
+    if not dry:
+        if sweep:
+            write_json(OUT, out)
+        if fresh_new and not first:
+            fixes = {"flow": "sent to sweep", "partial+flow": "back to In progress + sweep", "unjob+flow": "job unlinked + sweep"}
+            txt = lambda f: fixes.get(f["fix"]) or ("asked you in FIRSTMATE" if f["id"] in got else "question queued")
+            summ = "Dashboard auditor: " + "; ".join(f"{f['id']} {f['kind']} -> {txt(f)}" for f in fresh_new[:6])
+            notify(summ, "Nothing to do unless a question is in FIRSTMATE; details: firstmate/audit.log on main-host", dry)
+        for f in new:
+            st["alerted"][f["id"]] = now
+        save_state(st)
+    else:
+        print(json.dumps(out, ensure_ascii=False, indent=1)[:4000])
+    return 0
+
+
+# ---------- self-test ----------
+def test():
+    global LOG
+    import tempfile
+    LOG = os.path.join(tempfile.mkdtemp(prefix="fm-audit-test-"), "audit.log")  # never the real log
+    n = [0]
+
+    def ok(cond, msg=""):
+        n[0] += 1
+        if not cond:
+            sys.exit(f"FAIL {n[0]}: {msg}")
+
+    now = 1_800_000_000.0
+    old = int((now - 3 * 86400) * 1000)
+    mk = lambda iid, s, **kw: {"id": iid, "t": iid.upper(), "s": s, "area": kw.pop("area", "ops"), "cts": kw.pop("cts", old), "hist": [{"by": "pane:x", "cts": kw.pop("h", old)}], **kw}
+    items = [
+        mk("a-done", "done"),
+        mk("unb", "partial", blockedBy=["a-done"]),                         # F1
+        mk("unb-planned", "planned", blockedBy="a-done"),                   # F1 (planned)
+        mk("unb-fresh", "partial", blockedBy=["a-done"], cts=int(now * 1000), h=int(now * 1000)),  # grace: changed just now
+        mk("unb-job", "partial", blockedBy=["a-done"], job="wB:p1"),        # working pane
+        mk("nojob", "running"),                                             # F2
+        mk("daemon", "running", job="omp-discord-bot.service"),             # F3
+        mk("timerjob", "running", job="x-check.timer"),                     # timer: fine
+        mk("chk", "partial", n="foo [job ended; no receipt; needs check]"),  # F4
+        mk("ans", "partial", queued=int((now - 3600) * 1000)),             # F6
+        mk("parked", "planned"),
+        mk("waits-parked", "partial", blockedBy="parked"),                  # F5 parked
+        mk("waits-missing", "partial", blockedBy="ghost-card"),             # F5 missing
+        mk("waits-bot", "partial", blockedBy="nojob"),                      # nojob is in flow -> bot
+        mk("waits-unb", "partial", blockedBy="unb"),                        # unb in flow -> bot
+        mk("loop1", "partial", blockedBy="loop2"), mk("loop2", "partial", blockedBy="loop1"),
+        mk("trade", "partial", area="finance", blockedBy="a-done"),        # owner 2026-10-31: finance flows too
+        mk("held", "partial", area="finance", blockedBy="a-done"),         # on the owner hold list: never touched
+        mk("waits-held", "partial", blockedBy="held"),                      # waits on the owner's review: not unclear
+        mk("bl", "blocked"),                                                 # F5 no blocker
+        mk("bl-owner", "blocked", q="https://discord.com/channels/1/2/3", action="do it"),
+        mk("bl-r11", "blocked", src="https://discord.com/channels/1/2/9"),  # R11 blocked receipt: link, no action
+        mk("waits-r11", "partial", blockedBy="bl-r11"),
+        mk("back", "backlog", blockedBy="parked"),                          # backlog may stay idle
+        mk("own", "waiting", q="https://discord.com/channels/1/2/4", action="answer"),
+        mk("waits-own", "partial", blockedBy="own"),                        # owner leaf: fine
+        mk("idle", "partial"),                                               # plain idle: R10's job, not ours
+        mk("unb-auto", "partial", blockedBy=["a-done"], cts=int(now * 1000)),  # only fm-autoclear wrote it just now
+    ]
+    ctx = {"now": now, "holds": {"held": "owner review"}, "jobs": [{"id": "wB:p1", "status": "working", "active": datetime.fromtimestamp(now - 60).isoformat()}],
+           "item_jobs": {}, "item_units": {"daemon": ["main:omp-discord-bot.service"]},
+           "services": [{"host": "main", "unit": "omp-discord-bot.service", "state": "running", "oneShot": False, "timer": None},
+                        {"host": "main", "unit": "x-check.service", "state": "waiting", "oneShot": True, "timer": "x-check.timer"}]}
+    found = audit(items, ctx)
+    k = {f["id"]: f for f in found}
+    ok(k.get("unb", {}).get("kind") == "unblocked", k.get("unb"))
+    ok(k.get("unb-planned", {}).get("kind") == "unblocked", "planned card with done blockers flows")
+    ok("unb-fresh" not in k, "grace period")
+    ok(k.get("unb-auto", {}).get("kind") == "unblocked", "autoclear writes do not restart the grace period")
+    ok("unb-job" not in k, "a working pane means it moves")
+    ok(k.get("nojob", {}).get("fix") == "partial+flow", k.get("nojob"))
+    ok(k.get("daemon", {}).get("fix") == "unjob+flow", k.get("daemon"))
+    ok("timerjob" not in k, "a waiting timer is a job")
+    ok(k.get("chk", {}).get("kind") == "needs-check", k.get("chk"))
+    ok(k.get("ans", {}).get("kind") == "answered", k.get("ans"))
+    ok(k.get("waits-parked", {}).get("rootClass") == "parked" and k["waits-parked"]["root"] == "parked", k.get("waits-parked"))
+    ok(k.get("waits-missing", {}).get("rootClass") == "missing", k.get("waits-missing"))
+    ok("waits-bot" not in k and "waits-unb" not in k, "a flow card is bot work, not unclear")
+    ok(k.get("loop1", {}).get("rootClass") == "loop" and k.get("loop2", {}).get("rootClass") == "loop", "loop")
+    ok(k.get("trade", {}).get("kind") == "unblocked", "a finance card flows like any card")
+    ok("held" not in k and "waits-held" not in k, "held cards are never changed; a card behind one waits on the owner")
+    ok(k.get("bl", {}).get("rootClass") == "none", k.get("bl"))
+    ok("bl-r11" not in k and "waits-r11" not in k, "a blocked card with a q/src link is an owner step, not unclear")
+    ok("bl-owner" not in k and "back" not in k and "own" not in k and "waits-own" not in k and "idle" not in k, sorted(k))
+    txt = ask_text([k["waits-parked"], k["waits-missing"], k["bl"]])
+    blk = json.loads(txt.split("```ask\n", 1)[1].rsplit("\n```", 1)[0])
+    ok(len(blk["questions"]) == 3 and all(q["options"][-1] == OTHER for q in blk["questions"]), blk)
+    ok("[waits-parked]" in blk["questions"][0]["question"] and "▶️ Start parked now" in blk["questions"][0]["options"], blk["questions"][0])
+    ok(len({q["id"] for q in blk["questions"]}) == 3, "unique question ids")
+    # post_asks: links matched by question id (the bot drops answered questions), card -> waiting, failures
+    todo = [k["waits-parked"], k["waits-missing"], k["bl"]]
+    by = {i["id"]: i for i in items}
+    calls, st, asked = [], {}, {}
+    fake = lambda text: {"asks": [{"questions": [{"id": "b1", "url": "U1"}, {"id": "b3", "url": "U3"}]}], "alreadyAnswered": [{"url": "A2"}]}
+    got = post_asks(todo, st, asked, by, now, False, fake, lambda argv, why: (calls.append(argv), (True, ""))[1])
+    ok(got == ["waits-parked", "bl"], got)
+    ok(["q", "bl", "U3"] in calls and ["q", "waits-parked", "U1"] in calls and not any(c[1] == "waits-missing" for c in calls), calls)
+    ok(len(asked) == 3 and asked["waits-missing:ghost-card"]["url"] == "", asked)
+    ok(any(c[:3] == ["set", "bl", "waiting"] and "--action" in c for c in calls), calls)
+    def boom(text):
+        raise TimeoutError("read timed out")
+    asked2 = {}
+    ok(post_asks(todo, {}, asked2, by, now, False, boom, lambda a, w: (True, "")) == [] and len(asked2) == 3, "a post that may have reached Discord is not repeated")
+    def refused(text):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+    asked3 = {}
+    ok(post_asks(todo, {}, asked3, by, now, False, refused, lambda a, w: (True, "")) == [] and not asked3, "bot down: retry later")
+    # no area is protected by default; time gates and held cards are
+    ok(not protected({"id": "x", "area": "Finance"}) and protected({"id": "x", "until": "2030-01-01"}) and protected({"id": "h"}, {"h": "r"}))
+    print(f"fm-audit self-test: {n[0]} checks passed")
+
+
+if __name__ == "__main__":
+    if "--test" in sys.argv:
+        test()
+    else:
+        sys.exit(main("--dry-run" in sys.argv, "--report" in sys.argv))

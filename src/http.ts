@@ -12,6 +12,8 @@ export interface PostResult {
   attachments: { name: string; url: string }[];
   /** Menu messages of an ask block, one per question. */
   asks?: { setId: string; questions: { id: string; question: string; url: string }[] }[];
+  /** Owner 2026-10-31 (card no-reask-answered): questions not posted because the owner already answered them. */
+  alreadyAnswered?: { question: string; answer: string[]; url: string }[];
 }
 
 /** One message for GET /messages (text redacted; no embeds, no attachment URLs with tokens beyond Discord's own). */
@@ -61,6 +63,11 @@ export interface HttpDeps {
   holdAlert?: (channelId: string, text: string) => { until: number } | null;
   /** GET /secret-drop/<id>: state only (never the value). */
   secretDropStatus?: (id: string) => unknown | null;
+  /**
+   * POST /stack-job (owner 2026-10-28, fm-spawn): a terminal job that got no mirrored channel is posted into its
+   * stack thread with a ❌ Stop button for its pane, and FIRSTMATE gets an alert with the same button.
+   */
+  stackJob?: (o: StackJobPost) => Promise<{ url: string; thread: string; alert?: string } | { error: string }>;
 }
 
 export const MAX_MESSAGES = 50;
@@ -177,6 +184,18 @@ export function startHttp(deps: HttpDeps, port = HTTP_PORT) {
         const res = await deps.secretDrop({ name: b.name, dest: b.dest, overwrite: b.overwrite === true, ttlMs: typeof b.ttlMin === "number" ? b.ttlMin * 60_000 : undefined, ...(ch ? { channelId: ch.id } : {}) }).catch((e: Error) => ({ error: `post failed: ${e.message}` }));
         return "error" in res ? Response.json(res, { status: 400 }) : Response.json({ ok: true, ...res });
       }
+      if (req.method === "POST" && url.pathname === "/stack-job" && deps.stackJob) {
+        const r = await readJson(req);
+        if (r instanceof Response) return r;
+        const p = parseStackJob(r.body);
+        if ("error" in p) return Response.json({ error: p.error }, { status: 400 });
+        try {
+          const res = await deps.stackJob(p);
+          return "error" in res ? Response.json(res, { status: 400 }) : Response.json({ ok: true, ...res });
+        } catch (e) {
+          return Response.json({ error: `post failed: ${(e as Error).message}` }, { status: 502 });
+        }
+      }
       const sd = url.pathname.match(/^\/secret-drop\/([\w-]{20,64})$/);
       if (req.method === "GET" && sd && deps.secretDropStatus) {
         const st = deps.secretDropStatus(sd[1]!);
@@ -222,6 +241,21 @@ export function startHttp(deps: HttpDeps, port = HTTP_PORT) {
       return Response.json({ ok: true, channel: chName, ...(res ?? {}) });
     },
   });
+}
+
+export type StackJobPost = { stack: string; text: string; pane?: string; machine: "main" | "second"; alert: string };
+
+/** Validate a /stack-job body (pure): {stack, text, pane?, machine?, alert?}. */
+export function parseStackJob(b: unknown): StackJobPost | { error: string } {
+  if (!b || typeof b !== "object") return { error: "expected {stack, text, pane?, machine?, alert?}" };
+  const o = b as Record<string, unknown>; // parsed JSON; each field is checked below
+  const { stack, text, pane, machine, alert } = o;
+  if (typeof stack !== "string" || !/^[a-z0-9][a-z0-9-]{1,29}$/.test(stack)) return { error: "stack must be a stack name" };
+  if (typeof text !== "string" || !text.trim()) return { error: "text must be a non-empty string" };
+  if (pane !== undefined && (typeof pane !== "string" || !/^w[A-Za-z0-9]+:p[A-Za-z0-9]+$/.test(pane))) return { error: "pane must be a Herdr pane id (wX:pY)" };
+  if (machine !== undefined && machine !== "main" && machine !== "second") return { error: "machine must be main or second" };
+  if (alert !== undefined && typeof alert !== "string") return { error: "alert must be a string" };
+  return { stack, text: text.slice(0, 1900), ...(pane ? { pane } : {}), machine: machine ?? "main", alert: (alert ?? "").slice(0, 600) };
 }
 
 /**

@@ -1,3 +1,4 @@
+import { safeSubject } from "./router.ts";
 import { WORKING_EMOJI } from "./config.ts";
 /**
  * 📋 Master queue (owner 2026-10-23, "where is my master queue report"): one live board in the FIRSTMATE
@@ -8,7 +9,7 @@ import { WORKING_EMOJI } from "./config.ts";
  * (⏳ queued / ⚙️ running / ✅ finished / ❌ failed / 🛑 stopped) and the finish time. Finished jobs stay
  * visible for 12 h (bot jobs are saved in a small state file, so a restart keeps them).
  *
- * The board is edited in place and kept at the bottom of the channel; only the bridge's own ⏳ Queue box
+ * The board is never edited: each change is a new silent post (old one deleted), kept at the bottom of the channel; only the bridge's own ⏳ Queue box
  * may sit below it (both boards are "last" boxes; this one never reprints for the Queue box).
  */
 import { channelMention, safeTitle } from "./mention.ts";
@@ -151,9 +152,9 @@ export function needsRows(cards: FmCard[], now: number, dash: string, menus: Men
     if (e.kind === "menu") return { key: `menu:${e.menu.key}`, title: e.menu.label, link: e.menu.link, where: "your pick in a question menu", steps: [], state: "needs", at: e.menu.createdAt };
     const c = e.item;
     const finance = isFinanceCard(c);
-    const title = finance ? `Finance card ${c.id}` : (c.t ?? c.id);
+    const title = finance ? safeSubject(c.t, c.id) : (c.t ?? c.id);
     const where = e.unblocks ? `${NEEDS_WHERE[e.group]} (unblocks ${e.unblocks} card${e.unblocks === 1 ? "" : "s"})` : NEEDS_WHERE[e.group];
-    const steps = finance ? ["Open the finance card and do the step it names."] : actionSteps(c.action ?? "");
+    const steps = finance ? ["Open the card and do the step it names."] : actionSteps(c.action ?? "");
     return { key: `need:${c.id}`, title, link: itemLink(c, dash) || undefined, where, steps, ...(e.unblocks ? { unblocks: e.unblocks } : {}), state: "needs", at: c.cts || now };
   });
 }
@@ -166,8 +167,8 @@ export function cardRows(cards: FmCard[], receipts: Map<string, Receipt>, now: n
   for (const c of cards) {
     if (!c.job || !c.id) continue;
     const finance = isFinanceCard(c);
-    // Finance cards: no title on the board (it can carry positions or account data).
-    const title = finance ? `Finance card ${c.id}` : (c.t ?? c.id);
+    // Finance cards: subject, or the id when the title carries money, sizes or account data (owner 2026-10-30).
+    const title = finance ? safeSubject(c.t, c.id) : (c.t ?? c.id);
     const first0 = String(Array.isArray(c.job) ? (c.job[0] ?? "") : c.job).trim();
     const place = res?.job?.(first0);
     const session = place?.session; // only live Herdr sessions are grouped
@@ -349,6 +350,8 @@ export type MasterOpts = {
   /** Board notice line below the head ("" = none); owner alert pause. */
   notice?: () => string;
   botId: () => string | undefined;
+  /** Button rows on the last page (⏸️ Pause / ▶️ Resume, card omp-pause-button); other pages get none. */
+  components?: () => unknown[];
   /** Live bot jobs (running + queued), every channel. */
   jobs: () => LiveJob[];
   /** Messages that may sit below this board without a reprint (the ⏳ Queue box). */
@@ -366,6 +369,9 @@ export type MasterOpts = {
 
 /** SuppressEmbeds (4) | SuppressNotifications (4096). */
 const FLAGS = 4 | 4096;
+/** Board rows without the head lines and without " · 6m"-style elapsed times. */
+const ageless = (t: string): string => t.split("\n").slice(2).join("\n").replace(/ · \d+[smhd]( \d+[smhd])?\b/g, " · ~");
+export const AGE_REPOST_MS = 10 * 60_000;
 
 export class MasterQueueBoard {
   private boards: BoardMsg[] = [];
@@ -373,6 +379,7 @@ export class MasterQueueBoard {
   private timer: NodeJS.Timeout | null = null;
   private poll: NodeJS.Timeout | null = null;
   private lastText = "";
+  private lastComps = "null";
   private lastEdit = 0;
   private force = false;
   private done: DoneJob[] = [];
@@ -389,6 +396,11 @@ export class MasterQueueBoard {
 
   private now(): number {
     return (this.o.now ?? Date.now)();
+  }
+  /** Components for page i of n: the rows on the last page, [] on the others (nothing without the option). */
+  private comps(i: number, n: number): { components?: unknown[] } {
+    if (!this.o.components) return {};
+    return { components: i === n - 1 ? this.o.components() : [] };
   }
 
   start(): void {
@@ -465,7 +477,11 @@ export class MasterQueueBoard {
     const pages = renderMasterPages(this.rows(await this.openMenus()), now, this.o.dash, 1900, WORKING_EMOJI, this.o.notice?.() ?? "");
     const text = pages.join("\n");
     // Lines 0-1 are the ━ rule and the head with the changing `updated <t:…:R>` stamp: compare the rows below them.
-    const sameRows = text.split("\n").slice(2).join("\n") === this.lastText.split("\n").slice(2).join("\n");
+    const comps = JSON.stringify(this.o.components?.() ?? null);
+    const sameRows = text.split("\n").slice(2).join("\n") === this.lastText.split("\n").slice(2).join("\n") && comps === this.lastComps;
+    // Only elapsed times changed ("1m" -> "6m"): no repost before AGE_REPOST_MS, so running jobs do not churn the channel.
+    const ageOnly = !sameRows && comps === this.lastComps && ageless(text) === ageless(this.lastText) && now - this.lastEdit < AGE_REPOST_MS;
+    this.lastComps = comps;
     const fetched = await ch.messages.fetch({ limit: 40 }).catch(() => null);
     const recent = fetched ? [...fetched.values()] : []; // newest first
     const me = this.o.botId();
@@ -475,15 +491,14 @@ export class MasterQueueBoard {
     const firstAt = this.boards.length ? recent.findIndex((m) => m.id === this.boards[0]!.id) : -1;
     // "Last": below the first page only its own pages and the ⏳ Queue box.
     const isLast = firstAt >= 0 && recent.slice(0, firstAt).every((m) => m.author.id === me && (ids.has(m.id) || this.o.mayBeBelow(m)));
-    if (isLast && this.boards.length === pages.length) {
-      if (!sameRows || force || now - this.lastEdit > 300_000) {
-        for (let i = 0; i < pages.length; i++) await this.boards[i]!.edit({ content: pages[i]! }).catch((e) => this.o.log(`master queue edit: ${(e as Error).message}`));
-        this.lastEdit = now;
-      }
+    // Owner 2026-10-30 (card discord-queue-own-message): never edit a message to carry the queue. A change is a
+    // fresh silent post (SuppressNotifications) at the bottom; the previous board is deleted afterwards.
+    if (isLast && this.boards.length === pages.length && (sameRows || ageOnly) && !force) {
+      // unchanged and still at the bottom: nothing to do
     } else {
       const fresh: BoardMsg[] = [];
       for (const pg of pages) {
-        const m = await ch.send({ content: pg, flags: FLAGS, allowedMentions: { parse: [] } }).catch((e) => (this.o.log(`master queue post: ${(e as Error).message}`), null));
+        const m = await ch.send({ content: pg, flags: FLAGS, allowedMentions: { parse: [] }, ...this.comps(fresh.length, pages.length) }).catch((e) => (this.o.log(`master queue post: ${(e as Error).message}`), null));
         if (!m) break;
         fresh.push(m);
       }

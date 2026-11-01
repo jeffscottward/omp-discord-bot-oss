@@ -11,12 +11,17 @@ Start a side session:
     2. Creates a Herdr tab (--no-focus), checks that OMP started in it, and prompts OMP with the task file.
        With a worktree, the prompt also states the merge-back steps.
     3. With --card: `fm field <card> job <pane id>`, `fm field <card> stack <stack>` and `fm set <card> running`.
-       Stack (owner 2026-10-24): --stack NAME (finance, webapp, realestate, infra, kb, personal, firstmate); without it,
-       the card's `area` mapped like the bot's router (src/router.ts DEFAULT_STACKS), else firstmate.
+       Stack (owner 2026-10-28: every job goes to a stack): --stack NAME, any stack in the catalog
+       (~/.config/omp-discord/stacks.json, src/stackcatalog.ts); an unknown NAME is added to the catalog. Without it:
+       the card's `area`, else catalog keywords in the card title/--label, else a NEW stack named after the area
+       (scripts/stack-add.ts --only-if-missing). firstmate only when there is no card area and no keyword match.
     4. Starts a detached waiter (owner 2026-10-24): it waits up to 2 min until the bot's mirror lists the new pane
        with a Discord channel in agents.json, then posts the task text there through the bot's loopback /post
        (AGENTS.md "Start side sessions from their Discord channel"). Log: ~/.local/state/fm-spawn/fm-spawn.log.
+       No channel in time (category full, rate limit; owner 2026-10-28): it posts the job in its stack thread with a
+       ❌ Stop button for the pane and alerts FIRSTMATE (bot /stack-job). Never silent.
     Prints one JSON line: {label, tab, pane, cwd, worktree, branch, base, reason, stack}.
+    Refuses (exit 5, nothing created) while agent work is paused (omp-maintenance pause; card omp-pause-button).
     Refuses (exit 4, nothing created) when the workspace already has more than 30 tabs (auth-loop-guard,
     owner 2026-10-19), and prints the tabs that fm-tabwatch closes automatically or that look finished.
     Every spawned tab is recorded in ~/.local/state/fm-spawn/spawned.jsonl; fm-tabwatch closes it after
@@ -24,12 +29,19 @@ Start a side session:
 
 Adopt live terminal jobs (owner 2026-10-24 addendum: terminal jobs that so far had no channel):
   fm-spawn --adopt PANE [--card ID] [--stack NAME] [--label TEXT] [--dry-run]
-    Sets the card's job + stack (area, else firstmate) and posts one note in the pane's mirrored channel once the
+    Sets the card's job + stack (as above) and posts one note in the pane's mirrored channel once the
     bot's mirror has made it (the mirror makes a channel for every live OMP pane by itself).
   fm-spawn --adopt-all [--dry-run]
     The same for every open card whose `job` is a live Herdr pane/tab. Repeatable: missing stacks are set, and
     panes already noted (~/.local/state/fm-spawn/adopted.json) get no second post. Waits (up to 2 min) in-process,
     so it also works from a systemd one-shot unit.
+
+Close finished tabs safely (card tabclose-safe, owner 2026-10-31):
+  fm-spawn --close-finished [--dry-run] [--workspace WS]
+    Closes a tab only when ALL are true: every pane is idle/done (no spinner); no card outside done/backlog has
+    job = one of its panes, the tab id or its label; its own fm-spawn card (spawned.jsonl), if any, is done.
+    Focused and FIRSTMATE tabs are kept. Restore leftovers: several tabs with one label where only one tab's pane
+    is a live card job -> the others close (same idle rule). Prints every tab with close/keep and the reason.
 
 Clean up:
   fm-spawn --cleanup [--dry-run]
@@ -50,9 +62,11 @@ checkout's writable folders. npm (package-lock) uses its cache only.
 
 Env (tests): FM_SPAWN_HERDR, FM_SPAWN_FM, FM_SPAWN_TABWATCH (binaries), FM_SPAWN_STATE (state dir), FM_SPAWN_OMP_WAIT_S,
 FM_SPAWN_FAST, FM_SPAWN_MAX_TABS, FM_SPAWN_AGENTS (bot agents.json), FM_SPAWN_POST_URL (bot /post),
-FM_SPAWN_CHANNEL_WAIT_S (channel wait; 0 = no waiter).
+FM_SPAWN_CHANNEL_WAIT_S (channel wait; 0 = no waiter), FM_SPAWN_STACKJOB_URL (bot /stack-job),
+FM_SPAWN_FALLBACK_DELAYS (retry delays, s), FM_SPAWN_NOTIFY (omp-notify), OMP_BOT_STACKS (stack catalog).
 """
 import argparse, fcntl, json, os, re, subprocess, sys, time
+FIN_RE = re.compile(r"[$€£]\s?\d|\b\d{1,3}(?:,\d{3})+|\b\d+(?:\.\d+)?\s?[kmb]\b|\b\d[\d,.]*\s?(?:shares?|contracts?|usd|dollars?)\b|\b(?:sell|buy|short|cover)\s+\d|\b[Uu]\d{6,}\b|\bacct\b|\baccount\b", re.I)
 
 HOME = os.path.expanduser("~")
 HERDR = os.environ.get("FM_SPAWN_HERDR") or os.path.join(HOME, ".local/bin/herdr")
@@ -68,6 +82,12 @@ PAUSE = 0.05 if os.environ.get("FM_SPAWN_FAST") else 1.0  # tests: short sleeps
 AGENTS = os.environ.get("FM_SPAWN_AGENTS") or os.path.join(HOME, ".local/share/omp-discord-bot/agents.json")
 POST_URL = os.environ.get("FM_SPAWN_POST_URL") or f"http://127.0.0.1:{os.environ.get('OMP_BOT_HTTP_PORT') or 47821}/post"
 CHANNEL_WAIT_S = int(os.environ.get("FM_SPAWN_CHANNEL_WAIT_S") or 120)
+# Owner 2026-10-28: no channel in time -> the job goes to its stack thread with a Stop button (bot /stack-job).
+STACK_JOB_URL = os.environ.get("FM_SPAWN_STACKJOB_URL") or POST_URL.rsplit("/post", 1)[0] + "/stack-job"
+PANE_ID = re.compile(r"^w[A-Za-z0-9]+:p[A-Za-z0-9]+$")
+# Seconds between /stack-job retries (~15 min in total: a bot restart can take that long).
+FALLBACK_DELAYS = [float(x) for x in (os.environ.get("FM_SPAWN_FALLBACK_DELAYS") or "30,60,120,240,450").split(",") if x.strip()]
+NOTIFY = os.environ.get("FM_SPAWN_NOTIFY") or os.path.join(HOME, ".local/bin/omp-notify")
 
 # Card area -> stack. Same as DEFAULT_STACKS[].areas in src/router.ts (test/fm-spawn.test.ts checks they match).
 STACK_AREAS = {
@@ -80,25 +100,120 @@ STACK_AREAS = {
     "personal": ["personal", "home", "reminders", "taxes"],
     "firstmate": ["questions"],
 }
-# Stacks added with scripts/stack-add.ts live in the bot config (router.stacks); merge their areas (owner 2026-10-24).
-try:
-    import json as _json, os as _os
-    _cfg = _json.load(open(_os.environ.get("OMP_BOT_CONFIG", _os.path.expanduser("~/.config/omp-discord/config.json"))))
-    # null/odd values (e.g. "router": null, "areas": null) must not break every fm-spawn command at import
-    for _s in ((_cfg.get("router") or {}).get("stacks") or []) if isinstance(_cfg, dict) else []:
-        if isinstance(_s, dict) and _s.get("name"):
-            STACK_AREAS[_s["name"]] = sorted(set(STACK_AREAS.get(_s["name"], [])) | {str(x).lower() for x in (_s.get("areas") or [])})
-except (OSError, ValueError, AttributeError, TypeError):
-    pass
+# Stack -> keywords. Same as DEFAULT_STACKS[].keywords in src/router.ts (test/fm-spawn.test.ts checks they match);
+# the catalog replaces a stack's list when it has one, like mergeStacks.
+STACK_KEYWORDS = {
+    "finance": ["finance", "budget", "budgets", "invoice", "invoices", "tax", "taxes", "bill", "bills", "expense", "expenses", "payment", "account", "example-watch", "finance alert", "finance alerts"],
+    "webapp": ["webapp", "web app", "research app", "charts page", "chart", "charts", "candles", "backtest", "backtests", "screener", "quantlab", "strategy dsl", "lenses"],
+    "realestate": ["client co", "clientco", "realestate", "exampleclient", "exampleclient", "planetscale"],
+    "infra": ["discord bot", "the bot", "omp", "herdr", "heeler", "pane", "panes", "main", "omarchy", "hyprland", "systemd", "service", "services", "tailscale", "streamsrv", "stream-client", "gitlab", "pipeline", "btrfs", "disk", "dashboard", "fm-autoclear", "fm-spawn", "worktree", "restart", "channel", "channels", "thread", "threads", "ssh", "gpu", "discord", "activity", "discord activity", "example-activity", "framevid", "fx-video", "video player", "player", "bots"],
+    "kb": ["kb", "knowledge base", "knowledge bases", "transcribe", "transcription", "transcripts", "transcript", "youtube", "tiktok", "instagram", "podcast", "paper", "papers", "research", "summarize", "summary of", "scrape", "scraping", "x post", "tweet", "tweets"],
+    "fun": ["demoapp", "apps", "apps", "plugin", "plugins", "ports", "tool", "retro", "demo", "demoapp", "rocket belt", "example-activity"],
+    "personal": ["remind", "reminder", "reminders", "home", "nest", "blinds", "thermostat", "tv", "shopping", "buy", "order", "appointment", "doctor", "dentist", "trip", "travel", "flight", "taxes", "tax", "family", "birthday", "gift"],
+    "firstmate": [],
+}
+# The stack catalog (owner 2026-10-28, card stack-catalog): ONE file read by the bot's router and by fm-spawn
+# (src/stackcatalog.ts). Legacy config.json router.stacks is merged first; the catalog wins.
+STACKS_FILE = os.environ.get("OMP_BOT_STACKS") or os.path.join(HOME, ".config/omp-discord/stacks.json")
+STACK_ADD = os.path.join(os.path.dirname(os.path.realpath(__file__)), "stack-add.ts")
+STACK_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{1,29}$")
 
 
-def stack_of_area(area):
-    """Stack for a card area (case-insensitive; 'Client Co: ...' counts as 'client co'); firstmate when unknown."""
+def load_stacks():
+    """Merge legacy config router.stacks, then the catalog, into STACK_AREAS / STACK_KEYWORDS (bad files are skipped)."""
+    entries = []
+    try:
+        cfg = json.load(open(os.environ.get("OMP_BOT_CONFIG", os.path.join(HOME, ".config/omp-discord/config.json"))))
+        entries += ((cfg.get("router") or {}).get("stacks") or []) if isinstance(cfg, dict) else []
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    try:
+        cat = json.load(open(STACKS_FILE))
+        entries += (cat.get("stacks") if isinstance(cat, dict) else cat) or []
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    for s in entries:
+        name = s.get("name") if isinstance(s, dict) else None
+        if not (isinstance(name, str) and STACK_NAME.match(name)):
+            continue
+        # an entry with areas replaces the list (the catalog may move an area to a new stack)
+        if isinstance(s.get("areas"), list):
+            STACK_AREAS[name] = sorted({str(x).lower() for x in s["areas"] if isinstance(x, str)})
+        else:
+            STACK_AREAS.setdefault(name, [])
+        if isinstance(s.get("keywords"), list):
+            STACK_KEYWORDS[name] = [str(x).lower() for x in s["keywords"] if isinstance(x, str)]
+
+
+load_stacks()
+
+
+def stack_of_area(area, default="firstmate"):
+    """Stack for a card area (case-insensitive; 'Client Co: ...' counts as 'client co'); `default` when unknown."""
     a = (area or "").strip().lower()
     for cand in (a, a.split(":", 1)[0].strip()):
         for stack, areas in STACK_AREAS.items():
             if cand and (cand == stack or cand in areas):
                 return stack
+    return default
+
+
+def stack_of_text(text):
+    """Stack whose keywords match the text best (whole words/phrases, like src/router.ts keywordScores); None on a tie."""
+    t = (text or "").lower().replace("’", "'")
+    if re.search(r"(^|[^a-z0-9])webapp([^a-z0-9]|$)", t) and "webapp" in STACK_AREAS:
+        return "webapp"  # owner rule, as in src/router.ts ruleRoute
+    scores = []
+    for stack, kws in STACK_KEYWORDS.items():
+        hits = {k for k in kws if k.strip() and re.search(
+            r"(^|[^a-z0-9])" + r"[\s-]+".join(map(re.escape, re.split(r"[\s-]+", k.strip()))) + r"([^a-z0-9]|$)", t)}
+        if hits:
+            scores.append((len(hits), stack))
+    scores.sort(reverse=True)
+    if scores and (len(scores) == 1 or scores[0][0] > scores[1][0]):
+        return scores[0][1]
+    return None
+
+
+def slugify_stack(text):
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:30].rstrip("-")
+    return s if STACK_NAME.match(s) else None
+
+
+def ensure_stack(name, area=None):
+    """Owner 2026-10-28: a topic with no stack gets a new one. Add `name` to the catalog (scripts/stack-add.ts,
+    never overwriting an existing entry) when it is unknown. Returns the stack name; firstmate if the add fails."""
+    if name in STACK_AREAS:
+        return name
+    a = (area or "").split(":", 1)[0].strip().lower()
+    cmd = ["bun", STACK_ADD, "--name", name, "--title", name.replace("-", " ").title(),
+           "--description", f"{a or name} (auto-created by fm-spawn)", "--by", "fm-spawn auto", "--only-if-missing"]
+    if a:
+        cmd += ["--areas", a]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        err = r.stderr.strip()[:200] if r.returncode else None
+    except (OSError, subprocess.SubprocessError) as e:
+        err = str(e)[:200]
+    if err is not None:
+        log(f"stack: auto-create {name} failed ({err}); using firstmate")
+        return "firstmate"
+    STACK_AREAS[name] = [a] if a else []
+    log(f"stack: auto-created {name} in {STACKS_FILE}" + (f" (area {a})" if a else ""))
+    return name
+
+
+def resolve_stack(stack=None, area=None, text=None, create=True):
+    """--stack (any catalog name; an unknown valid name is created), else the card area, else keywords in the
+    card title/label, else a new stack named after the area. firstmate only when there is no topic at all."""
+    if stack:
+        return ensure_stack(stack) if create else stack
+    hit = stack_of_area(area, None) or stack_of_text(text)
+    if hit:
+        return hit
+    name = slugify_stack((area or "").split(":", 1)[0])
+    if name:
+        return ensure_stack(name, area) if create else name
     return "firstmate"
 
 
@@ -249,13 +364,17 @@ def merge_steps(repo, wt, branch, base):
             f"5) leave the worktree in place: `fm-spawn --cleanup` removes it after it is merged, clean and idle.")
 
 def default_base(repo):
-    """origin/<default branch> after a fetch; never the main checkout's current HEAD (bug 2026-10-19)."""
+    """origin/<default branch> after a fetch; never the main checkout's current HEAD (bug 2026-10-19).
+
+    The cached refs/remotes/origin/HEAD is refreshed from the remote first: a clone keeps the default
+    branch it saw at clone time, and a stale origin/main put 5 webapp-research worktrees on unrelated
+    history (card webapp-ws-branches-unrelated-history, 2026-10-31). Offline, the cached ref is used.
+    A hand-set origin/HEAD is overwritten; pass --base <ref> to choose another base."""
     if git(repo, "remote", "get-url", "origin", check=False).returncode == 0:
-        git(repo, "fetch", "--quiet", "origin", check=False)
-        r = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
-        if r.returncode != 0:
+        # Only after a good fetch: offline, one slow failure is enough (review 2026-10-31).
+        if git(repo, "fetch", "--quiet", "origin", check=False).returncode == 0:
             git(repo, "remote", "set-head", "origin", "--auto", check=False)
-            r = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+        r = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
         for b in ("main", "master"):
@@ -298,7 +417,8 @@ def tab_cap(ws):
     if len(tabs) <= MAX_TABS:
         return None
     lines = [f"fm-spawn: refused: Herdr workspace {ws} already has {len(tabs)} tabs (max {MAX_TABS}). "
-             f"Nothing was created. Close finished tabs first, then start the job again."]
+             f"Nothing was created. Close finished tabs first (`fm-spawn --close-finished --dry-run` lists the safe ones, "
+             f"`fm-spawn --close-finished` closes them), then start the job again."]
     try:
         r = subprocess.run([TABWATCH, "--list-closable", "--json"], capture_output=True, text=True, timeout=60)
         c = json.loads(r.stdout)
@@ -347,7 +467,7 @@ def spawn(args):
         print(refusal, file=sys.stderr)
         return 4
     p = plan(args, all_panes)
-    stack = pick_stack(args)
+    stack = pick_stack(args, create=not args.dry_run)
     out = {"label": args.label, "workspace": ws, **{k: p.get(k) for k in ("cwd", "worktree", "branch", "base", "reason")},
            "stack": stack}
     if args.dry_run:
@@ -421,17 +541,17 @@ def spawn(args):
 
 # ---------- stack and Discord channel (owner 2026-10-24) ----------
 
-def pick_stack(args):
-    """--stack, else the card's area mapped to a stack, else firstmate."""
-    if args.stack:
-        return args.stack
-    if not args.card:
-        return "firstmate"
-    r = run([FM, "get", args.card], check=False)
-    try:
-        return stack_of_area(json.loads(r.stdout).get("area"))
-    except Exception:
-        return "firstmate"
+def pick_stack(args, create=True):
+    """resolve_stack over --stack, the card's area and title, and --label (owner 2026-10-28: never no stack)."""
+    card = {}
+    if args.card:
+        r = run([FM, "get", args.card], check=False)
+        try:
+            card = json.loads(r.stdout) or {}
+        except Exception:
+            card = {}
+    text = " ".join(x for x in (card.get("t"), getattr(args, "label", None)) if isinstance(x, str))
+    return resolve_stack(args.stack, card.get("area"), text, create=create)
 
 
 def pane_channel(pane):
@@ -445,10 +565,10 @@ def pane_channel(pane):
                  and e.get("machine", "main") == "main"), None)  # Herdr ids are per host; fm-spawn runs on the main host
 
 
-def post(channel, text):
-    """Bot loopback /post. Returns (ok, detail)."""
+def post(channel, text, url=None, body=None):
+    """Bot loopback /post (or another loopback endpoint with its own body). Returns (ok, detail)."""
     import urllib.error, urllib.request
-    req = urllib.request.Request(POST_URL, data=json.dumps({"channel": channel, "text": text}).encode(),
+    req = urllib.request.Request(url or POST_URL, data=json.dumps(body or {"channel": channel, "text": text}).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -457,6 +577,62 @@ def post(channel, text):
         return False, f"{e.code} {e.read().decode(errors='replace')[:200]}"
     except Exception as e:
         return False, str(e)[:200]
+
+
+def omp_pane_of(ref):
+    """A Herdr pane id for a pane or tab id: the tab's OMP pane (Stop needs a pane id). None when not found."""
+    if PANE_ID.match(ref):
+        return ref
+    panes_ = (herdr("pane", "list", check=False).get("result") or {}).get("panes") or []
+    in_tab = [p for p in panes_ if p.get("tab_id") == ref and PANE_ID.match(p.get("pane_id") or "")]
+    omp = [p for p in in_tab if p.get("agent") == "omp"] or in_tab
+    return omp[0]["pane_id"] if omp else None
+
+
+def notify_owner(summary, action):
+    """Last resort when the bot cannot post: omp-notify (Discord via the bot first, then ntfy, which does not need the
+    bot). Returns True when one transport accepted it."""
+    for extra in ({}, {"OMP_NOTIFY_TRANSPORT": "ntfy"}):
+        try:
+            r = subprocess.run([NOTIFY, "--kind", "error", "--summary", summary[:240], "--action", action[:240]],
+                               capture_output=True, text=True, timeout=60, env={**os.environ, **extra})
+            if r.returncode == 0:
+                log(f"channel: owner notified via {extra.get('OMP_NOTIFY_TRANSPORT', 'default')} transport")
+                return True
+            log(f"channel: omp-notify ({extra or 'default'}) failed: {(r.stderr or r.stdout).strip()[:200]}")
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"channel: omp-notify failed: {e}")
+    return False
+
+
+def stack_fallback(args, pane):
+    """Owner 2026-10-28 (card stack-catalog): no mirrored channel in time (category full, rate limit). Post the job
+    in its stack thread with a ❌ Stop button for its OMP pane and alert FIRSTMATE (bot /stack-job). Retries with
+    backoff over ~15 min (a bot restart); if the bot never takes it, the owner gets omp-notify. Never silent."""
+    stop_pane = omp_pane_of(pane)
+    text = (f"📝 **Terminal job** (fm-spawn): {args.label}\nCard: `{args.card or '-'}` · stack: {args.stack} · pane `{stop_pane or pane}`\n"
+            "It has no Discord channel of its own (pane categories full or a Discord rate limit)."
+            + (" ❌ Stop sends Esc to its OMP turn." if stop_pane else "")
+            + (f"\nTask file: `{args.task}`" if args.task else ""))
+    body = {"stack": args.stack, "text": text,
+            "alert": f"Terminal job **{args.label}** got no Discord channel within {CHANNEL_WAIT_S} s"
+                     f" (card `{args.card or '-'}`, pane `{stop_pane or pane}`)."}
+    if stop_pane:
+        body["pane"] = stop_pane
+    detail = ""
+    for attempt, delay in enumerate([*FALLBACK_DELAYS, None], 1):
+        ok, detail = post(None, None, url=STACK_JOB_URL, body=body)
+        if ok:
+            return True, detail
+        log(f"channel: stack-job post for {pane} failed (attempt {attempt}): {detail}")
+        if re.match(r"4\d\d ", detail):
+            break  # the bot refused the body (e.g. unknown stack): a retry cannot succeed
+        if delay is not None:
+            time.sleep(delay)
+    notify_owner(f"Terminal job {args.label} (stack {args.stack}, pane {stop_pane or pane}) has no Discord channel"
+                 f" and the bot did not take the stack post: {detail}",
+                 f"Stop it in Herdr if needed: herdr agent send-keys {stop_pane or pane} esc")
+    return False, detail
 
 
 def channel_text(label, card, stack, task, full=True, pane=None):
@@ -484,8 +660,13 @@ def await_channel(args):
         time.sleep(5 * PAUSE)
         ch = pane_channel(pane)
     if not ch:
-        log(f"channel: no mirrored channel for {pane} ({args.label}) within {CHANNEL_WAIT_S} s; task not posted")
-        return 3
+        ok, detail = stack_fallback(args, pane)
+        log(f"channel: no mirrored channel for {pane} ({args.label}) within {CHANNEL_WAIT_S} s; "
+            + (f"posted in the {args.stack} stack thread with Stop: {detail}" if ok else f"stack fallback FAILED: {detail}"))
+        if ok and not args.task:
+            adopted_update(lambda d: d.__setitem__(pane, {"card": args.card, "stack": args.stack, "fallback": detail,
+                                                          "tsMs": int(time.time() * 1000)}))
+        return 0 if ok else 3
     ok, detail = post(ch, channel_text(args.label, args.card, args.stack, args.task, pane=pane))
     if not ok and args.task:  # e.g. the bot refused the text: post the short form
         log(f"channel: full task post to {ch} failed ({detail}); posting the short form")
@@ -531,8 +712,8 @@ def start_waiter(pane, label, stack, card=None, task=None):
 def adopt(pane, card, stack, label, dry_run=False):
     """Give a live terminal job its stack (on the card) and post a note in its mirrored channel once it has one.
     The bot's mirror makes the channel for every live OMP pane by itself; this links card, stack and channel."""
-    if not stack:
-        stack = pick_stack(argparse.Namespace(stack=None, card=card))
+    stack = (ensure_stack(stack) if stack and not dry_run else stack) or \
+        pick_stack(argparse.Namespace(stack=None, card=card, label=label), create=not dry_run)
     label = label or card or pane
     out = {"pane": pane, "card": card, "stack": stack, "channel": pane_channel(pane)}
     if dry_run:
@@ -569,7 +750,7 @@ def adopt_all(dry_run=False):
         job = str((job[0] if job else "") if isinstance(job, list) else (job or "")).strip()
         if c.get("s") == "done" or not HERDR_ID.match(job) or job not in live:
             continue
-        stack = c.get("stack") or stack_of_area(c.get("area"))
+        stack = resolve_stack(c.get("stack"), c.get("area"), c.get("t"), create=not dry_run)
         ch = pane_channel(job)
         # one note per pane/channel, even when several cards link it (or one links the pane, another its tab)
         posted = job in done or job in started or (ch and (ch in started or ch in noted_channels))
@@ -586,7 +767,8 @@ def adopt_all(dry_run=False):
         if not posted:
             # Finance cards: no title in Discord (it can carry positions or account data), as on the master queue.
             # Any card on the finance stack counts ("Finance: ..." areas map there too), not only area == "finance".
-            label = f"Finance card {c['id']}" if stack == "finance" else (c.get("t") or c["id"])
+            finance = stack == "finance" or str(c.get("area") or "").strip().lower().startswith("finance")
+            label = c["id"] if finance and FIN_RE.search(c.get("t") or "") else (c.get("t") or c["id"])  # owner 2026-10-30: subject, no "Finance card" prefix
             waits.append(argparse.Namespace(await_channel=job, label=label, stack=stack, card=c["id"], task=None))
     log(f"adopt-all: {n} live terminal job(s){' (dry run)' if dry_run else ''}")
     # In-process waits, joined: a detached child would die with a systemd one-shot unit's cgroup.
@@ -746,6 +928,130 @@ def share_existing(args):
     return 0
 
 
+# ---------- safe tab close (card tabclose-safe, owner 2026-10-31) ----------
+
+SPINNER = re.compile("[\u2801-\u28ff]")  # OMP's braille spinner in the terminal title while it works
+OPEN_OK = {"done", "backlog"}  # card states that do not hold a tab
+KEEP_LABELS = {"firstmate"}
+
+
+def _norm(s):
+    return (s or "").strip().lower()
+
+
+def _job_refs(it):
+    j = it.get("job")
+    return {_norm(x) for x in (j if isinstance(j, list) else str(j or "").split(",")) if _norm(x)}
+
+
+def _spawn_cards():
+    """tab id -> card from spawned.jsonl (the card fm-spawn started in that tab)."""
+    out = {}
+    try:
+        for line in open(SPAWNED):
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("tab") and r.get("card"):
+                out[r["tab"]] = r["card"]
+    except OSError:
+        pass
+    return out
+
+
+def pane_idle(p):
+    return p.get("agent_status") in ("idle", "done") and not SPINNER.search(p.get("terminal_title") or "")
+
+
+def plan_close(tabs, all_panes, items, spawn_cards):
+    """Return [(tab, close: bool, why)]. Rules: (a) every pane idle/done; (b) no card outside done/backlog
+    has job = a pane of the tab, the tab id or its label; (c) the tab's own fm-spawn card, if any, is done.
+    Dedupe: same label in several tabs where only one tab holds a live card job -> the others may close."""
+    by_id = {i.get("id"): i for i in items}
+    live = [i for i in items if _norm(i.get("s")) not in OPEN_OK]
+    tp = {}
+    for p in all_panes:
+        tp.setdefault(p.get("tab_id"), []).append(p)
+
+    def holders(t):
+        refs = {_norm(t["tab_id"]), _norm(t.get("label"))} | {_norm(p.get("pane_id")) for p in tp.get(t["tab_id"], [])}
+        refs.discard("")
+        return [i["id"] for i in live if _job_refs(i) & refs]
+
+    def pane_holders(t):  # label match excluded: used to find which duplicate really holds the job
+        refs = {_norm(t["tab_id"])} | {_norm(p.get("pane_id")) for p in tp.get(t["tab_id"], [])}
+        return [i["id"] for i in live if _job_refs(i) & refs]
+
+    groups = {}
+    for t in tabs:
+        if _norm(t.get("label")):
+            groups.setdefault(_norm(t.get("label")), []).append(t)
+    dup_keeper = {}
+    for lab, ts in groups.items():
+        if len(ts) > 1:
+            owners = [t["tab_id"] for t in ts if pane_holders(t)]
+            if len(owners) == 1:
+                dup_keeper[lab] = owners[0]
+
+    out = []
+    for t in tabs:
+        tid, lab = t["tab_id"], _norm(t.get("label"))
+        ps = tp.get(tid, [])
+        if t.get("focused"):
+            out.append((t, False, "focused tab"))
+            continue
+        if lab in KEEP_LABELS:
+            out.append((t, False, "FIRSTMATE tab"))
+            continue
+        busy = [p.get("pane_id") for p in ps if not pane_idle(p)]
+        if busy or not ps:
+            out.append((t, False, f"pane(s) not idle/done: {', '.join(busy) or 'no pane info'}"))
+            continue
+        h = pane_holders(t) if lab in dup_keeper else holders(t)
+        if h:
+            out.append((t, False, f"live card job: {', '.join(h)}"))
+            continue
+        own = spawn_cards.get(tid)
+        if own:
+            st = _norm((by_id.get(own) or {}).get("s"))
+            if st != "done":
+                out.append((t, False, f"own card {own} is {st or 'missing'}"))
+                continue
+        if not own and lab not in dup_keeper and t.get("agent_status") != "done":
+            out.append((t, False, "no fm-spawn card and Herdr does not mark the tab done (may be an owner tab)"))
+            continue
+        if lab in dup_keeper:
+            out.append((t, True, f"restore duplicate of '{t.get('label')}'; job lives in {dup_keeper[lab]}"))
+        else:
+            out.append((t, True, "all panes idle, no live card job" + (f", own card {own} done" if own else "")))
+    return out
+
+
+def close_finished(args):
+    all_panes = panes()
+    ws = pick_workspace(all_panes, args.workspace)
+    tabs = herdr("tab", "list", "--workspace", ws, check=False).get("result", {}).get("tabs") or []
+    try:
+        items = json.load(open(ITEMS)).get("items") or []
+    except Exception as e:
+        print(f"fm-spawn --close-finished: cannot read cards ({e}); nothing closed", file=sys.stderr)
+        return 2
+    closed = 0
+    for t, ok, why in plan_close(tabs, all_panes, items, _spawn_cards()):
+        if ok and not args.dry_run:
+            r = herdr("tab", "close", t["tab_id"], check=False)
+            if "error" in r:
+                ok, why = False, f"herdr tab close failed: {json.dumps(r)[:150]}"
+            else:
+                closed += 1
+                log(f"close-finished closed {t['tab_id']} ({t.get('label')}): {why}")
+        tag = ("DRY would close" if args.dry_run else "closed") if ok else "keep"
+        print(f"{tag}: {t['tab_id']} {t.get('label') or ''} — {why}")
+    print(f"tabs: {len(tabs)}; closed: {closed}{' (dry run)' if args.dry_run else ''}")
+    return 0
+
+
 # ---------- cleanup ----------
 
 def check_tree(w, all_panes):
@@ -818,7 +1124,8 @@ def main():
     ap.add_argument("--base")
     ap.add_argument("--workspace")
     ap.add_argument("--no-worktree", action="store_true")
-    ap.add_argument("--stack", choices=sorted(STACK_AREAS))
+    ap.add_argument("--stack", type=lambda s: s if STACK_NAME.match(s) else ap.error(f"--stack {s!r}: 2-30 chars a-z 0-9 -"),
+                    help="any catalog stack; an unknown name is added to the catalog")
     ap.add_argument("--adopt", metavar="PANE", help="give a live terminal job (Herdr pane/tab id) its stack + channel post")
     ap.add_argument("--adopt-all", action="store_true", help="adopt every live terminal job linked from an open card")
     ap.add_argument("--await-channel", metavar="PANE", help=argparse.SUPPRESS)
@@ -828,6 +1135,7 @@ def main():
     ap.add_argument("--share-existing", action="store_true")
     ap.add_argument("--root", default=os.path.join(HOME, "Github"))
     ap.add_argument("--no-install", action="store_true")
+    ap.add_argument("--close-finished", action="store_true", help="close tabs that are idle and hold no live card job")
     a = ap.parse_args()
     if a.await_channel:
         return await_channel(a)
@@ -845,9 +1153,29 @@ def main():
         return share_existing(a)
     if a.cleanup:
         return cleanup(a)
+    if a.close_finished:
+        return close_finished(a)
     if not (a.label and a.cwd and a.task):
         ap.error("--label, --cwd and --task are required (or use --cleanup)")
+    pause = maint_pause()
+    if pause is not None and not a.dry_run:
+        print(f"fm-spawn: agent work is paused ({pause}); no job started. "
+              "Resume with `omp-maintenance resume` or the ▶️ Resume button on the 📋 Master queue, then run fm-spawn again.",
+              file=sys.stderr)
+        return 5
     return spawn(a)
+
+
+def maint_pause():
+    """Card omp-pause-button: the omp-maintenance pause reason while paused.json exists, else None."""
+    f = os.environ.get("OMP_MAINT_PAUSED") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "omp-maintenance", "paused.json")
+    if not os.path.exists(f):
+        return None
+    try:
+        return str(json.load(open(f)).get("reason") or "maintenance")
+    except Exception:
+        return "maintenance"
 
 
 if __name__ == "__main__":

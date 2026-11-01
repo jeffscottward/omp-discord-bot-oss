@@ -59,6 +59,14 @@ export type BotConfig = {
     /** Optional (proposed 2026-10-24; the owner has not chosen it yet): more categories for this machine's live pane
      * channels, used in order when the local category holds 50 channels. Empty: a full category gets no new channel. */
     overflow: string[];
+    /** Overflow categories for the second machine's pane channels (owner 2026-10-30). */
+    overflowSecond: string[];
+    /** Owner 2026-10-30 (card bot-upgrades-1030): main pane channels go to one category per stack. Stack name ->
+     * [category id, overflow ids...]. Absent: no split (main panes use categories.local + overflow). The mirror
+     * adds ids when it creates a stack category. */
+    stackCategories?: Record<string, string[]>;
+    /** Owner 2026-10-30: text channel that holds one thread per pane while channel creates are blocked. */
+    threadHome?: string;
     /** Extra machines whose Herdr panes are mirrored (over ssh). Empty: only this machine. */
     peers: { machine: string; ssh: string; herdr: string }[];
   };
@@ -104,7 +112,7 @@ export const DEFAULT_CONFIG: BotConfig = {
   unrestrictedChannelIds: [],
   timeLimitContinueChannelIds: [],
   unrestrictedTools: "",
-  mirror: { categories: { local: "", peer: "", archive: "" }, archives: [], overflow: [], peers: [] },
+  mirror: { categories: { local: "", peer: "", archive: "" }, archives: [], overflow: [], overflowSecond: [], peers: [] },
   dashboardUrl: "",
   hostLabel: "this machine",
   workingEmoji: "⚙️",
@@ -148,6 +156,9 @@ export function loadConfig(file = CONFIG_FILE): BotConfig {
       peers: raw.mirror?.peers ?? [],
       archives: raw.mirror?.archives ?? [],
       overflow: raw.mirror?.overflow ?? [],
+      overflowSecond: raw.mirror?.overflowSecond ?? [],
+      threadHome: raw.mirror?.threadHome ?? "",
+      ...(raw.mirror?.stackCategories && typeof raw.mirror.stackCategories === "object" ? { stackCategories: raw.mirror.stackCategories } : {}),
     },
     features: { ...DEFAULT_CONFIG.features, ...raw.features },
     heeler: { ...DEFAULT_CONFIG.heeler, ...raw.heeler },

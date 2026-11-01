@@ -211,6 +211,10 @@ routed message, topic channel, card area, keywords), then the JEV judge for uncl
 note under the message shows the stack and its state. Replies and menu answers to FIRSTMATE, Undo and handoffs stay
 with FIRSTMATE. Messages with amounts, account ids or finance words never go to the judge. `!stacks` shows counts.
 Status file: `<state>/router/stacks.json`; `/health` field `stacks`. Off: `"router": {"enabled": false}`.
+Stack list (owner 2026-10-28): the catalog `~/.config/omp-discord/stacks.json` (`OMP_BOT_STACKS`, `src/stackcatalog.ts`)
+overrides or adds to the code defaults; `scripts/stack-add.ts` and fm-spawn write it, the bot re-reads it within 10 s.
+POST `/stack-job` {stack, text, pane?, machine?, alert?} posts a terminal job into its stack thread with a ❌ Stop
+button (`ps:<machine>:<pane>`, Esc into that OMP pane) and alerts FIRSTMATE; fm-spawn uses it when a pane gets no channel.
 
 **Needs.** Herdr; `config.json` `firstmateChannelId`, `dashboardUrl`; `kit.env` `FM_DIR`, `FM_DASHBOARD_URL`,
 `FM_CHANNEL`, `FM_ALERTS_CHANNEL`; the kit timers; a web server for the dashboard (§13).

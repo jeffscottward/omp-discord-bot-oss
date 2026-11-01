@@ -11,11 +11,8 @@ import { CONFIG } from "./config.ts";
 /** Hosts never reachable from a Discord run (case-insensitive suffix match). */
 export const DENY_HOST_SUFFIXES = [
   "status.example.com",
-  "interactivebrokers.com",
-  "interactivebrokers.net",
-  "interactivebrokers.co.uk",
-  "interactivebrokers.ie",
-  "interactivebrokers.eu",
+  "broker.example.com",
+  "broker.example.net",
   "status.example.com",
   "remote.example.com",
   "ts.net", // tailnet MagicDNS

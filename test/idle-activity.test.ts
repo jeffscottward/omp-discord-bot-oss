@@ -15,7 +15,9 @@ test("activity() follows new log entries and subagent logs", () => {
   const dir = mkdtempSync(join(tmpdir(), "idle-"));
   const f = join(dir, "s.jsonl");
   writeFileSync(f, L({ type: "session" }));
-  const t0 = Date.now();
+  // The run starts 1 s in the past: file mtimes come from the coarse kernel clock and can read a few ms earlier than
+  // Date.now(), so a subagent log written right after the start looked like an earlier run's log (gate flake 10-31).
+  const t0 = Date.now() - 1_000;
   const hb = new RunHeartbeat(t0, dir);
   expect(hb.activity(t0)).toBeGreaterThanOrEqual(t0); // nothing yet: the run start
   const ts = new Date(t0 + 5_000).toISOString();

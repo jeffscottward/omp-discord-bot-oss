@@ -5,8 +5,8 @@
 // Owner 2026-10-15: the bot stays in the channel all the time; music plays while someone is listening
 // and stops 5 minutes after the last person leaves.
 import { createAudioPlayer, createAudioResource, entersState, joinVoiceChannel, AudioPlayerStatus, StreamType, VoiceConnectionStatus, type VoiceConnection } from "@discordjs/voice";
-import { Client, Events, GatewayIntentBits, type VoiceBasedChannel } from "discord.js";
-import { createReadStream, existsSync, readdirSync, readFileSync } from "node:fs";
+import { ActionRowBuilder, Client, Events, GatewayIntentBits, MessageFlags, StringSelectMenuBuilder, type VoiceBasedChannel } from "discord.js";
+import { createReadStream, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Transform } from "node:stream";
 import { join } from "node:path";
@@ -40,7 +40,16 @@ function humans(ch: VoiceBasedChannel): number {
   return ch.members.filter((m) => !m.user.bot).size;
 }
 
-const LIVE = process.env.RADIO_STREAM_URL ?? "https://www.youtube.com/channel/UCsIg9WMfxjZZvwROleiVsQg/live" /* STEEZYASFUCK channel live: follows stream ID changes */;
+/** Owner 2026-10-31: stations to swap between with /station (a dropdown). The pick is kept across restarts. */
+const STATIONS = [
+  { id: "steezy", name: "🎧 STEEZYASFUCK lofi", url: process.env.RADIO_STREAM_URL ?? "https://www.youtube.com/channel/UCsIg9WMfxjZZvwROleiVsQg/live" /* follows stream ID changes */ },
+  { id: "lego-island", name: "🧱 LEGO Island Radio", url: "https://www.youtube.com/live/Poaxx9sMxjw" },
+];
+const STATION_FILE = join(HOME, ".config/omp-discord/radio-station");
+let station = (() => {
+  const saved = existsSync(STATION_FILE) ? readFileSync(STATION_FILE, "utf8").trim() : "";
+  return STATIONS.find((s) => s.id === saved) ?? STATIONS[0]!;
+})();
 /** After the live stream fails (e.g. YouTube bot check), play local clips for a while instead of retrying. */
 let liveBackoffUntil = 0;
 /** When YouTube blocks the host's own IP, the radio can retry the live stream through a SOCKS5 proxy. */
@@ -92,18 +101,19 @@ async function next(): Promise<void> {
     if (!file) return void (playing = false);
   }
   const launchedAt = performance.now();
-  const src = live ? spawn("yt-dlp", ["--no-warnings", "-q", ...(useProxy ? ["--proxy", PROXY] : []), "-f", "bestaudio", "--hls-use-mpegts", "-o", "-", LIVE], { stdio: ["ignore", "pipe", "pipe"] }) : null;
+  const launchStation = station.id; // a /station switch closes the old stream on purpose: not a failure
+  const src = live ? spawn("yt-dlp", ["--no-warnings", "-q", ...(useProxy ? ["--proxy", PROXY] : []), "-f", "bestaudio", "--hls-use-mpegts", "-o", "-", station.url], { stdio: ["ignore", "pipe", "pipe"] }) : null;
   // Live: yt-dlp follows the HLS playlist itself (ffmpeg on a -g URL stopped every ~7 s -> cut-outs).
   // -4 dB approximates the old loudnorm -18 LUFS target for a YouTube master (~-14 LUFS; estimate).
   const filter = live ? "volume=-4dB" : "loudnorm=I=-18";
   const ff = spawn("ffmpeg", ["-loglevel", "error", "-i", live ? "pipe:0" : file!, "-vn", "-af", filter, "-c:a", "libopus", "-ar", "48000", "-ac", "2", "-b:a", "96k", "-f", "ogg", "pipe:1"], { stdio: [live ? "pipe" : "ignore", "pipe", "pipe"] });
   ff.stderr?.on("data", (d) => log(`ffmpeg: ${String(d).trim().slice(0, 200)}`));
-  const label = live ? "live stream" : file!;
+  const label = live ? `live stream ${station.id}` : file!;
   const probe = bufferProbe(label, launchedAt);
   ff.on("close", (c) => {
     log(`ffmpeg exited ${c}`);
     // A live stream that ends within a minute failed; use local clips for 10 minutes (no rapid retries).
-    if (live && active && performance.now() - launchedAt < 60_000) {
+    if (live && active && launchStation === station.id && performance.now() - launchedAt < 60_000) {
       if (!useProxy && PROXY) {
         // Blocked on the main host's own exit: try the proxy city right away (no extra request on the blocked address).
         useProxy = true;
@@ -149,7 +159,13 @@ async function ensureConnected(): Promise<VoiceBasedChannel | null> {
   }
   if (conn || joining) return ch;
   joining = true;
-  const c = joinVoiceChannel({ channelId: ch.id, guildId: GUILD, adapterCreator: ch.guild.voiceAdapterCreator, selfDeaf: true });
+  const c = joinVoiceChannel({ channelId: ch.id, guildId: GUILD, adapterCreator: ch.guild.voiceAdapterCreator, selfDeaf: true, debug: true });
+  // Debug 2026-10-30 (owner: "clicking and bubble sounds"): the main host side tested clean (source, transcode,
+  // 20 ms send timing). Log DAVE end-to-end-encryption events (session init, transitions, MLS errors), so the
+  // next report can be matched to a key change. Other debug lines (every WS message) are dropped.
+  c.on("debug", (m) => {
+    if (m.includes("[DAVE]")) log(`voice: ${m.replace(/\s+/g, " ").slice(0, 200)}`);
+  });
   try {
     await entersState(c, VoiceConnectionStatus.Ready, 20_000);
   } catch {
@@ -253,9 +269,32 @@ async function sync(): Promise<void> {
 }
 
 client.once(Events.ClientReady, () => {
-  log(`ready; ${tracks().length} tracks`);
+  log(`ready; ${tracks().length} tracks; station ${station.id}`);
+  void client.guilds.cache.get(GUILD)?.commands.create({ name: "station", description: "📻 Pick the Lofi Radio station" }).catch((e) => log(`slash: ${(e as Error).message}`));
   void sync();
   setInterval(() => void sync(), 60_000); // reconnect after drops; re-check listeners
+});
+client.on(Events.InteractionCreate, async (i) => {
+  try {
+    if (i.isChatInputCommand() && i.commandName === "station") {
+      const menu = new StringSelectMenuBuilder().setCustomId("radio-station").setPlaceholder(`Now: ${station.name}`)
+        .addOptions(STATIONS.map((s) => ({ label: s.name, value: s.id, default: s.id === station.id })));
+      await i.reply({ content: "📻 Pick a station:", components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)], flags: MessageFlags.Ephemeral });
+    } else if (i.isStringSelectMenu() && i.customId === "radio-station") {
+      const pick = STATIONS.find((s) => s.id === i.values[0]);
+      if (!pick) return;
+      station = pick;
+      writeFileSync(STATION_FILE, pick.id);
+      liveBackoffUntil = 0;
+      useProxy = false;
+      log(`station -> ${pick.id} by ${i.user.id}`);
+      if (playing) player.stop(true); // Idle handler starts the new station
+      await i.deferUpdate();
+      await i.deleteReply(); // close the menu after the pick (owner 2026-10-31)
+    }
+  } catch (e) {
+    log(`station: ${(e as Error).message}`);
+  }
 });
 client.on(Events.VoiceStateUpdate, (o, n) => {
   if (o.channelId === CHANNEL || n.channelId === CHANNEL) void sync();

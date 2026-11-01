@@ -4,6 +4,8 @@ import { mkdtempSync } from "node:fs";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { STATE_DIR } from "./config.ts";
+import { readVoice } from "./voicepick.ts";
 
 const SOCK = join(process.env.XDG_RUNTIME_DIR ?? "/tmp", "omp-tts.sock");
 
@@ -73,16 +75,17 @@ export function speakable(md: string): string {
 }
 
 /** Synthesize to an .ogg file; null when the server is down or the text is empty. */
-export function synthesize(text: string): Promise<string | null> {
-  const say = speakable(text);
+export function synthesize(text: string, opts: { voice?: string; out?: string; raw?: boolean } = {}): Promise<string | null> {
+  const say = opts.raw ? text.trim() : speakable(text);
   if (!say) return Promise.resolve(null);
-  const out = join(mkdtempSync(join(tmpdir(), "tts-")), "reply.ogg");
+  const out = opts.out ?? join(mkdtempSync(join(tmpdir(), "tts-")), "reply.ogg");
+  const voice = opts.voice ?? readVoice(STATE_DIR);
   const { promise, resolve } = Promise.withResolvers<string | null>();
   {
     const sock = connect(SOCK);
     let buf = "";
     sock.setTimeout(90_000, () => sock.destroy());
-    sock.on("connect", () => sock.write(`${JSON.stringify({ text: say, out })}\n`));
+    sock.on("connect", () => sock.write(`${JSON.stringify({ text: say, out, voice })}\n`));
     sock.on("data", (d) => (buf += d));
     sock.on("error", () => resolve(null));
     sock.on("close", () => {

@@ -43,7 +43,7 @@ describe("renderNeedsYou", () => {
     expect(text).not.toContain("📨");
   });
   test("finance cards show only a link, no title or account data", () => {
-    expect(text).toContain(`💹 Finance card: tr · 0m\n👉 1. Open the finance card and do the step it names.\n🔗 [Open](<${DASH}?item=tr>)`);
+    expect(text).toContain(`💹 tr · 0m\n👉 1. Open the card and do the step it names.\n🔗 [Open](<${DASH}?item=tr>)`);
     expect(text).not.toContain("XYZ");
     expect(text).not.toContain("1234");
   });
@@ -169,11 +169,12 @@ describe("open menus (owner 2026-10-22)", () => {
     expect(rows[1].link).toBe("https://discord.com/channels/9/1/11");
     const text = render([], 10_000, "", 1900, rows);
     expect(text).toContain("❓ **Open menus** (2)");
-    expect(text).not.toContain("AAPL");
+    expect(text).not.toContain("ACME");
   });
   test("finance card rows carry the id", () => {
-    const text = render([{ id: "mwb-push-redeploy", s: "waiting", action: "Do the step", area: "finance", t: "secret" }], 10_000, "");
-    expect(text).toContain("💹 Finance card: mwb-push-redeploy");
+    const text = render([{ id: "mwb-push-redeploy", s: "waiting", action: "Do the step", area: "finance", t: "Pay 5 usd to ACME" }], 10_000, "");
+    expect(text).toContain("💹 mwb-push-redeploy");
+    expect(text).not.toContain("ACME");
   });
 });
 
@@ -194,8 +195,8 @@ test("dismissed menus stay off the board (owner 2026-10-22)", () => {
 
 test("link labels are plain text: no emoji or middle dot inside [..] (owner 2026-10-23)", () => {
   expect(linkLabel("🐘 Client Co · PlanetScale ✅")).toBe("Client Co - PlanetScale");
-  const row = needsYouRow({ id: "mwb-push-redeploy", s: "blocked", action: "Do the step", area: "Finance", t: "x" } as FmItem, "⛔", 0, "https://d/");
-  expect(row).toContain("🏃 💹 Finance card: mwb-push-redeploy");
+  const row = needsYouRow({ id: "mwb-push-redeploy", s: "blocked", action: "Do the step", area: "Finance", t: "buy 10 x" } as FmItem, "⛔", 0, "https://d/");
+  expect(row).toContain("🏃 💹 mwb-push-redeploy");
   expect(/\[[^\]]*\p{Extended_Pictographic}[^\]]*\]\(/u.test(row)).toBe(false);
 });
 
@@ -252,10 +253,11 @@ test("finance cards: area finance, 'Finance: …' or stack finance hide the titl
   expect(isFinanceCard({ area: "finance" })).toBe(true);
   expect(isFinanceCard({ area: "Finance: options" })).toBe(true);
   expect(isFinanceCard({ area: "tools", stack: "finance" })).toBe(true);
-  expect(isFinanceCard({ area: "finance-cards apps" })).toBe(false);
+  expect(isFinanceCard({ area: "finance-cards game" })).toBe(false);
   expect(isFinanceCard({})).toBe(false);
   const rows = cardRowsT([{ id: "x", t: "SECRET 100 shares", area: "Finance: options", s: "running", job: "wB:p1" }], new Map(), 1_800_000_000_000, "https://d/");
-  expect(rows[0]!.title).toBe("Finance card x");
+  expect(rows[0]!.title).toBe("x");
+  expect(cardRowsT([{ id: "y", t: "Quarterly budget review plan", area: "finance", s: "running", job: "wB:p1" }], new Map(), 1_800_000_000_000, "https://d/")[0]!.title).toBe("Quarterly budget review plan");
 });
 
 describe("needs-you action gate (owner 2026-10-25, card needs-you-action-gate)", () => {

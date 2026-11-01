@@ -53,3 +53,23 @@ mirror channel names and emoji sort (`src/mirror.ts`); voice, reminders and the 
 
 Removed or corrected: the owner channel table; the "30-minute expiry" for approvals; stale code comments in
 `src/models.ts`, `src/approvals.ts` and `src/masterqueue.ts`. Detailed internals moved to `docs/REFERENCE.md`.
+
+## Sync 2026-10-31 (UX update)
+Source: the private repository's changes from 2026-10-26 to 2026-10-31, copied into this scrubbed tree with a
+three-way merge (base = the private commit of the first export, sides = this tree and the private main branch).
+No private history or commits were pushed. This repository gets one new commit.
+
+Rules: the same replacement table as above. Also replaced or removed in the new code and tests:
+- Real Discord message and channel IDs in comments and test fixtures: synthetic IDs `1000000000000002NN`, or removed.
+- Ticker, position and trading-engine examples in tests: neutral finance examples (invoices, bills, budgets).
+- Live-trading hard-limit text in the sweep and task templates: a generic finance hard limit.
+- The fm-spawn stack keyword table: copied from `DEFAULT_STACKS` in `src/router.ts` (a test checks they match).
+- Missed by the first scrub and fixed now: broker domain names in `src/egress.ts` and in two tests are now
+  `broker.example.com` / `broker.example.net`; the blocking behavior is unchanged.
+- `OMP_TRADING_CHANNEL_IDS` is now `OMP_FINANCE_CHANNEL_IDS`.
+- Test fixes for scrub renames that the first export left failing (channel emoji titles, overflow names, the
+  test alert channel name).
+
+CI: `.github/workflows/ci.yml` runs typecheck, `bun test test/`, `bun test src/` and `lint:mentions`. The
+restart gate (`scripts/ci-green.sh`) reads a GitLab pipeline; set `OMP_RESTART_CI` and `OMP_SAFE_RESTART_CI` to
+another check command when you do not use GitLab.

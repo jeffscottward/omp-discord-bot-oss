@@ -1,0 +1,4 @@
+# M4 (owner 2026-10-30, card infra-bot-consolidation): extra steps of the daily channel-cleanup.service (ExecStopPost).
+# Replaces omp-audio-prune.timer. Format: see self-healing-harness/bin/tick-runner.
+# name       timeout every stage command
+audio-prune  60      0     1     nice -n 10 ~/.local/bin/omp-audio-prune --days 7

@@ -378,7 +378,7 @@ describe("egress filter", () => {
     for (const ip of ["93.184.215.14", "2606:4700::6810:84e5"]) expect(isBlockedAddress(ip)).toBe(false);
   });
   test("account, remote host, tailnet and single-label hosts are blocked", () => {
-    for (const h of ["api.status.example.com", "ndcdyn.interactivebrokers.com", "remote", "ib-gateway", "remote.tail1234.ts.net", "localhost"]) {
+    for (const h of ["api.status.example.com", "api.broker.example.com", "remote", "broker-gateway", "remote.tail1234.ts.net", "localhost"]) {
       expect([h, isBlockedHost(h)]).toEqual([h, true]);
     }
     expect(isBlockedHost("api.anthropic.com")).toBe(false);

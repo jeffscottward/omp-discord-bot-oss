@@ -2,7 +2,7 @@
  * Plan P1: the job queue survives a bot restart. Each waiting job is saved as the Discord message that
  * asked for it (channel id + message id) plus the text to run. At start the bridge fetches each message
  * again and queues it in the same order. File: <state dir>/queue.json, mode 0600, atomic write (tmp + rename).
- * Running jobs are not saved: a restart waits until no job runs.
+ * Running jobs are not saved, except a running voice-call turn (card voicecall-drop): it runs again after a restart.
  */
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -20,6 +20,21 @@ export interface SavedJob {
   /** The "⏳ Queued." note with the old Cancel button; deleted after the restart. */
   noteId?: string;
   enqueuedAt: number;
+  /** Card voicecall-drop: the voice turn was RUNNING (not waiting) when the state was saved. */
+  running?: boolean;
+  /** How many restarts this running voice turn has already been run again after. */
+  restarts?: number;
+}
+
+/**
+ * Card voicecall-drop: a running voice turn is run again after ONE restart. If it was already re-run once
+ * (the turn itself may restart the bot), it is dropped with a text note, so a restart loop cannot happen.
+ * Returns the restart count for the new run, or "drop".
+ */
+export function voiceRestoreDecision(j: Pick<SavedJob, "running" | "restarts">): number | "drop" {
+  if (!j.running) return j.restarts ?? 0;
+  const n = (j.restarts ?? 0) + 1;
+  return n > 1 ? "drop" : n;
 }
 
 export interface QueueState {

@@ -51,7 +51,7 @@ describe("judge fallback", () => {
   });
   test("rule match never calls the judge", async () => {
     const j = judgeSays("kb", 1);
-    expect((await routeMessage("tax invoices", {}, cfg, j)).stack).toBe("finance");
+    expect((await routeMessage("budget invoices", {}, cfg, j)).stack).toBe("finance");
     expect(j.calls.length).toBe(0);
   });
   test("low confidence, unknown stack, error, timeout and no judge all fall back to FIRSTMATE", async () => {
@@ -69,8 +69,18 @@ describe("judge fallback", () => {
   });
   test("financial details never reach the judge", async () => {
     const j = judgeSays("personal", 1);
-    for (const t of ["move $5,000 to the other account", "sell 100 XYZ tomorrow", "account #123456 balance", "what's my 1Password password", "my checking balance is 52,300 after the wire", "net worth hit 1.2M", "Amex 4,812.33 due", "check the bot dashboard and my account account U1234567", "check the bot dashboard, and how are my puts on nvda doing"])
+    for (const t of ["move $5,000 to the other account", "sell 100 XYZ tomorrow", "account #123456 balance", "what's my 1Password password", "my checking balance is 52,300 after the wire", "net worth hit 1.2M", "Amex 4,812.33 due", "check the bot dashboard and my account account U1234567", "check the bot dashboard, and how is my 401k doing"])
       await routeMessage(t, {}, cfg, j);
+    expect(j.calls).toEqual([]);
+  });
+  test("keyword tie with financial or finance words: no first-keyword win, fallback stays local (router-keyword-tie)", async () => {
+    const j = judgeSays("finance", 1);
+    // infra (dashboard) vs finance (bills) tie: neither tied stack wins.
+    expect(await routeMessage("check the dashboard, how are my bills doing", {}, cfg, j)).toMatchObject({ stack: GENERAL, by: "fallback" });
+    // financial text with a two-stack tie and no finance word: fallback, not the first candidate.
+    expect(await routeMessage("youtube dashboard costs $40", {}, cfg, j)).toMatchObject({ stack: GENERAL, by: "fallback" });
+    // a clear finance rule match still stays in finance.
+    expect((await routeMessage("budget review of invoices, pay 10 bills", {}, cfg, j)).stack).toBe("finance");
     expect(j.calls).toEqual([]);
   });
   test("jevJudge: decisions API request (redacted text, stack criteria), parses choice and confidence, drops the key on 401", async () => {

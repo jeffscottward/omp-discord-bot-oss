@@ -88,8 +88,8 @@ TABS_ALERT, TABS_REARM = 25, 22
 SIGNIN_ALERT, SIGNIN_WINDOW_S = 3, 15 * 60
 LIVE = {"running", "waiting", "open", "blocked"}
 # Same rule as fm-autoclear: cards in these areas / with these title words, and time gates, are never touched.
-SKIP_AREAS = {x.strip().lower() for x in (os.environ.get("FM_SKIP_AREAS") or "finance").split(",") if x.strip()}
-SKIP_WORDS = re.compile(r"\b(" + (os.environ.get("FM_SKIP_WORDS") or "order|trade|finance") + r")\b", re.I)
+SKIP_AREAS = {x.strip().lower() for x in (os.environ.get("FM_SKIP_AREAS") or "").split(",") if x.strip()}  # owner 2026-10-31: no area is exempt by default
+SKIP_WORDS = re.compile(r"\b(" + os.environ["FM_SKIP_WORDS"] + r")\b", re.I) if os.environ.get("FM_SKIP_WORDS") else re.compile(r"(?!x)x")  # opt-in; default matches nothing
 SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
 SPINNER = re.compile("[\u2801-\u28ff]")  # OMP's braille spinner in the terminal title while it works
 SIGNIN_LABEL = re.compile(r"🔐|sign[- ]?in|\blog ?in\b", re.I)
@@ -540,9 +540,13 @@ def selftest():
         write_sess(final + json.dumps({"type": "custom"}) + "\n")
         check("T1 non-message entries after the final reply are skipped", ct()[0])
         check("T1 no card keeps", not ct(sp={**sp, "card": None})[0])
-        check("T1 finance card keeps (area finance)", not ct(items=[{"id": "c1", "s": "done", "area": "finance"}])[0])
-        check("T1 finance card keeps (title words)", not ct(items=[{"id": "c1", "s": "done", "t": "Video reel to trade decision"}])[0])
-        check("T1 a done finance card naming the tab keeps", not ct(items=items + [{"id": "c2", "s": "done", "area": "finance", "job": "wT:t1"}])[0])
+        check("T1 a done finance card closes like any card (owner 2026-10-31)", ct(items=[{"id": "c1", "s": "done", "area": "finance"}])[0])
+        check("T1 title words never keep a tab by default", ct(items=[{"id": "c1", "s": "done", "t": "Video reel to trade decision"}])[0])
+        check("T1 a time gate keeps", not ct(items=[{"id": "c1", "s": "done", "until": "2099-01-01T00:00:00Z"}])[0])
+        global SKIP_AREAS
+        SKIP_AREAS = {"finance"}
+        check("T1 an opt-in FM_SKIP_AREAS card keeps", not ct(items=[{"id": "c1", "s": "done", "area": "finance"}])[0])
+        SKIP_AREAS = set()
         # registry: legacy log + jsonl
         global SPAWN_STATE
         SPAWN_STATE = os.path.join(d, "spawn")

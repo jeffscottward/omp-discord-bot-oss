@@ -1,3 +1,4 @@
+import { safeSubject } from "./router.ts";
 /**
  * 🔔-needs-you (owner 2026-10-22, card needs-you-channel): one live "✍️ Needs you" board that stays the
  * LAST message of a post-only channel and lists every FIRSTMATE card that waits on the owner.
@@ -124,8 +125,8 @@ export const isFinanceCard = (it: { area?: string; stack?: string }): boolean =>
 const isFinance = (it: FmItem) => isFinanceCard(it);
 
 function shortTitle(it: FmItem): string {
-  // Finance cards: link only, never the title (it can carry positions or account data).
-  if (isFinance(it)) return `Finance card: ${linkLabel(it.id)}`; // 💹 goes outside the link (owner 2026-10-23)
+  // Finance cards: subject, or the id when the title carries money, sizes or account data (owner 2026-10-30).
+  if (isFinance(it)) return linkLabel(safeSubject(it.t, it.id)); // 💹 goes outside the link (owner 2026-10-23)
   return linkLabel(it.t ?? it.id);
 }
 
@@ -242,7 +243,7 @@ export function needsYouRow(it: FmItem, emoji: string, now: number, dash: string
   const link = itemLink(it, dash);
   const when = it.cts ? ` · ${age(now - it.cts)}` : "";
   const title = `${isFinance(it) ? "💹 " : ""}${shortTitle(it)}${when}`;
-  const steps = isFinance(it) ? ["Open the finance card and do the step it names."] : actionSteps(it.action ?? "");
+  const steps = isFinance(it) ? ["Open the card and do the step it names."] : actionSteps(it.action ?? "");
   void emoji;
   return actionBlock(title, steps, link);
 }
@@ -327,9 +328,9 @@ export function readItems(file: string): FmItem[] | null {
 }
 
 /** Minimal Discord surface (discord.js Message/TextChannel), so tests can use fakes. */
-export type BoardMsg = { id: string; content: string; author: { id: string }; edit(o: { content: string }): Promise<unknown>; delete(): Promise<unknown> };
+export type BoardMsg = { id: string; content: string; author: { id: string }; edit(o: { content: string; components?: unknown[] }): Promise<unknown>; delete(): Promise<unknown> };
 export type BoardChannel = {
-  send(o: { content: string; flags?: number; allowedMentions?: { parse: [] } }): Promise<BoardMsg>;
+  send(o: { content: string; flags?: number; allowedMentions?: { parse: [] }; components?: unknown[] }): Promise<BoardMsg>;
   messages: { fetch(o: { limit: number }): Promise<Map<string, BoardMsg> | { values(): IterableIterator<BoardMsg> }> };
 };
 
@@ -355,6 +356,8 @@ export type NeedsYouOpts = {
   notice?: () => string;
   /** True while owner alerts are paused: the 🔔 alert lines are not sent (the board still lists the cards). */
   paused?: () => boolean;
+  /** Owner 2026-10-27: no board, only the 🔔 ping lines (they post in FIRSTMATE; #needs-you was removed). */
+  alertsOnly?: boolean;
 };
 
 /**
@@ -464,6 +467,16 @@ export class NeedsYouBoard {
       if (JSON.stringify(prev) !== JSON.stringify(snap)) writeFileSync(this.o.stateFile, JSON.stringify(snap));
       // Record new alerts at once, so a failed board post below cannot leave them untracked (then deleted).
       if (newAlerts.length) writeFileSync(this.alertsFile, JSON.stringify([...this.loadAlerts(), ...newAlerts]));
+    }
+    if (this.o.alertsOnly) {
+      // Seen alerts go; nothing else is posted or deleted (FIRSTMATE holds other messages).
+      const alerts = this.loadAlerts();
+      const gone = new Set(seenAlerts(alerts, items, now, this.ownerSeenAt).map((x) => x.id));
+      const got = await ch.messages.fetch({ limit: 50 }).catch(() => null);
+      for (const m of got ? [...got.values()] : []) if (gone.has(m.id)) await m.delete().catch(() => {});
+      const keep = alerts.filter((x) => !gone.has(x.id) && now - x.at < 2 * ALERT_TTL_MS);
+      if (keep.length || existsSync(this.alertsFile)) writeFileSync(this.alertsFile, JSON.stringify(keep));
+      return;
     }
     const menus = this.o.asksFile && this.o.chanInfo ? await loadOpenMenus({ asksFile: this.o.asksFile, chanInfo: this.o.chanInfo, guildId: this.o.guildId ?? "" }, items) : [];
     const text = renderNeedsYou(items, now, this.o.dash, 1900, menus, this.o.notice?.() ?? "");

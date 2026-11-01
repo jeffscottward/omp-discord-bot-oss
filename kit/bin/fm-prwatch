@@ -41,7 +41,7 @@ FM_DIR = os.environ.get("FM_DIR") or os.path.join(WEB, "firstmate")
 ITEMS = os.path.join(FM_DIR, "items.json")
 LOG = os.path.join(FM_DIR, "prwatch.log")
 FM_BIN = os.environ.get("FM_BIN") or "fm"
-SKIP_AREAS = {a.strip().lower() for a in os.environ.get("FM_SKIP_AREAS", "finance").split(",") if a.strip()}
+SKIP_AREAS = {a.strip().lower() for a in (os.environ.get("FM_SKIP_AREAS") or "").split(",") if a.strip()}
 PR = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
 DRY = "--dry-run" in sys.argv
 

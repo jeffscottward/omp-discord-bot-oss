@@ -43,14 +43,17 @@ export class JobQueue<R> {
   private readonly now: () => number;
   /** Max running jobs per group (jobs without a group, or with an unlisted group, only count against `max`). */
   groupLimits: Record<string, number>;
+  /** Maintenance pause (src/maintpause.ts): while true no job starts; kick() starts them after the pause ends. */
+  private readonly paused: () => boolean;
 
   constructor(
     private readonly max: number,
-    opts: { startId?: number; now?: () => number; groupLimits?: Record<string, number> } = {},
+    opts: { startId?: number; now?: () => number; groupLimits?: Record<string, number>; paused?: () => boolean } = {},
   ) {
     this.nextId = Math.max(1, Math.floor(opts.startId ?? 1));
     this.now = opts.now ?? Date.now;
     this.groupLimits = opts.groupLimits ?? {};
+    this.paused = opts.paused ?? (() => false);
   }
 
   /** The id the next job gets (persisted so ids are not used again after a restart). */
@@ -114,7 +117,7 @@ export class JobQueue<R> {
   }
 
   private pump(): void {
-    if (this.draining()) return;
+    if (this.draining() || this.paused()) return;
     let started = false;
     while (this.running.size < this.max) {
       const busy = new Set([...this.running.values()].map((j) => j.key));

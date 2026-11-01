@@ -14,7 +14,14 @@
 # Usage: scripts/restart-when-idle.sh [rev] [timeout]   (run detached, e.g. via systemd-run --user --collect, so a refused run leaves no failed unit)
 # Test hooks: OMP_RESTART_SLEEP (sleep command), OMP_RESTART_SAFE (restart command),
 # OMP_RESTART_GATE (gate command), OMP_RESTART_NOTIFY (notice command), OMP_RESTART_LOCK (lock file),
-# OMP_RESTART_ALERT (#omp-alerts notice command), OMP_RESTART_GIVE_UP_AFTER (seconds).
+# OMP_RESTART_ALERT (#omp-alerts notice command), OMP_RESTART_GIVE_UP_AFTER (seconds),
+# OMP_RESTART_HEAD (command that prints the checkout's HEAD sha), OMP_RESTART_CI (CI check: <sha> <wait-s>),
+# OMP_RESTART_CI_WAIT (seconds to wait for a pending pipeline, default 1800).
+# CI rule (2026-10-31): the gated SHA must also have a green GitLab pipeline (scripts/ci-green.sh); a pending
+# pipeline is awaited; failed/missing = no restart (exit 6, one notice). safe-restart.sh checks it again.
+# Gated-commit rule (2026-10-31): the restart loads only the commit the gate checked. If HEAD moves while the
+# waiter runs (another session fast-forwards the shared checkout), the restart is abandoned with ONE
+# #omp-alerts notice naming both commits (exit 5). Queue a new restart for the new commit.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 # Single flight: a newer waiter replaces nothing; extra waiters exit at once.
@@ -27,6 +34,9 @@ SLEEP="${OMP_RESTART_SLEEP:-sleep}"
 SAFE="${OMP_RESTART_SAFE:-scripts/safe-restart.sh}"
 GATE="${OMP_RESTART_GATE:-scripts/restart-gate.sh}"
 NOTIFY="${OMP_RESTART_NOTIFY:-bun scripts/notify-owner.ts}"
+HEADCMD="${OMP_RESTART_HEAD:-git rev-parse HEAD}"
+CI="${OMP_RESTART_CI:-scripts/ci-green.sh}"
+CI_WAIT="${OMP_RESTART_CI_WAIT:-1800}"
 DRAIN_AFTER="${OMP_RESTART_DRAIN_AFTER:-600}"
 GIVE_UP_AFTER_DEFAULT=7200  # 2 h of a busy bot, then the pending restart is abandoned
 GIVE_UP_AFTER="${OMP_RESTART_GIVE_UP_AFTER:-$GIVE_UP_AFTER_DEFAULT}"
@@ -72,6 +82,7 @@ busy_summary() {
 trap undrain EXIT
 
 # Check the new code first: never drain or wait for code that would not load.
+GATED="$($HEADCMD)"
 gate="$($GATE 2>&1)"
 if [ $? -ne 0 ]; then
   echo "$gate"
@@ -79,6 +90,14 @@ if [ $? -ne 0 ]; then
   exit 3
 fi
 echo "$(tail -n 1 <<<"$gate")"
+# Deploy only on green CI for this exact commit (a later commit with no pipeline must not ride along).
+ci="$($CI "$GATED" "$CI_WAIT" 2>&1)"
+if [ $? -ne 0 ]; then
+  echo "$ci"
+  notify "⚠️ **Restart skipped:** no green GitLab pipeline for \`${GATED:0:7}\`, so the bot keeps its current code. $(tail -n 1 <<<"$ci"). Push it, let CI pass, and queue the restart again."
+  exit 6
+fi
+echo "$(tail -n 1 <<<"$ci")"
 $SLEEP 20
 # Owner 2026-10-14: never restart during a voice call, however long that takes
 # (the old 2 h give-up restarted mid-call). One Discord notice if the wait passes DRAIN_AFTER.
@@ -133,6 +152,17 @@ while :; do
 done
 # Hold the drain through the restart checks (the bot stops, so the drain ends with it).
 [ "$draining" = 1 ] && drain on 1800
+# Gated-commit rule: never restart at a commit the gate did not check.
+NOW="$($HEADCMD)"
+if [ "$NOW" != "$GATED" ]; then
+  undrain
+  onmain=""
+  git merge-base --is-ancestor "$NOW" origin/main 2>/dev/null || onmain=" \`${NOW:0:7}\` is not on origin/main (unpushed, no CI)."
+  alert "$(printf "%s\n🤖 **Bot restart abandoned**\n———————————\nThe checks passed at \`%s\`, but the checkout moved to \`%s\` during the wait. The bot keeps its current code; it never loads an unchecked commit.%s Queue the restart again (\`/restart\`).\n%s" \
+    "$RULE" "${GATED:0:7}" "${NOW:0:7}" "$onmain" "$RULE")"
+  echo "HEAD moved from ${GATED:0:7} to ${NOW:0:7} after the gate; restart abandoned"
+  exit 5
+fi
 OLD="$(git rev-parse --short HEAD)"
 # UX item 6 (owner pick 2026-10-23): restart notices go only to the channels where a job waits for the restart
 # (queued in the last /health snapshot). A quiet restart posts nothing: the queue boards already show

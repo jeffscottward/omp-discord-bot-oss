@@ -11,6 +11,7 @@
 
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { isOpenAnswer, leavesOpen, REASK_WINDOW_MS, type AnsweredQuestion } from "./reask.ts";
 
 export interface AskQuestion {
   id: string;
@@ -42,6 +43,10 @@ export interface AskSet {
   responded?: Record<string, { at: number; via: AnswerVia }>;
   /** Every message the menus use, including the leading parts of a split question (🗑️ Delete removes them all). */
   partIds?: string[];
+  /** The bot answer message(s) the menus belong to (cards often link those as `q`). */
+  answerIds?: string[];
+  /** Card noreask-clarify: by question id, the owner's reply that asked back or put the question off (no answer). */
+  clarify?: Record<string, string>;
 }
 
 const BLOCK = /^ {0,3}```ask[ \t]*\n([\s\S]*?)\n {0,3}```[ \t]*$/m;
@@ -252,6 +257,8 @@ export interface ClosedSet {
   reason: "expired" | "closed" | "asked-again" | "cancelled";
   sourceId?: string;
   partIds?: string[];
+  /** The bot answer message(s) the menus belong to (cards often link those as `q`). */
+  answerIds?: string[];
   /** Owner 2026-10-25 (card ask-cancel-button): 🚫 Cancel. Not an answer. */
   cancelled?: boolean;
   cancelledAt?: number;
@@ -262,6 +269,10 @@ export interface ClosedSet {
   answerVia?: AnswerVia;
   /** Expired menus: true once the bot edited them to "⌛ Expired · 🔁 Ask again". */
   edited?: boolean;
+  /** Owner 2026-10-31 (card no-reask-answered): the picks of a set answered with the menu, by question id. */
+  answers?: Record<string, string[]>;
+  /** Card noreask-clarify: by question id, the owner's reply that asked back or put the question off (no answer). */
+  clarify?: Record<string, string>;
 }
 
 export class AskStore {
@@ -320,6 +331,14 @@ export class AskStore {
     const s = this.sets.get(setId);
     if (!s) return;
     (s.messageIds ??= {})[String(qi)] = messageId;
+    this.save();
+  }
+
+  /** Remember the bot answer messages this set's menus follow (see answerIdsFor). */
+  recordAnswers(setId: string, messageIds: string[]): void {
+    const s = this.sets.get(setId);
+    if (!s || !messageIds.length) return;
+    s.answerIds = [...new Set([...(s.answerIds ?? []), ...messageIds])];
     this.save();
   }
 
@@ -400,6 +419,8 @@ export class AskStore {
     if (set.pending) delete set.pending[String(Number(m![2]))];
     if (set.questions.every((x) => set.answers[x.id]?.length)) {
       this.sets.delete(set.setId);
+      // Owner 2026-10-31 (card no-reask-answered): keep the answered set, so a later menu that asks the same is stopped.
+      this.closed.set(set.setId, { ...closedFields(set), answered: true, answeredAt: now, answerVia: freeText?.trim() ? "other" : "pick", answers: structuredClone(set.answers), closedAt: now, reason: "closed", edited: true });
       this.save();
       return set;
     }
@@ -414,6 +435,29 @@ export class AskStore {
     return (m && this.sets.get(m[1]!)?.questions[Number(m[2])]) || null;
   }
 
+  /**
+   * Owner 2026-10-31 (card reply-answers-menu): a Discord reply to a menu message (or to any part of a long question)
+   * answers that question like "✏️ Other". Returns its customId ("ask:<set>:<qi>") when the set is open and that
+   * question has no answer yet; else null (the reply is then a normal message).
+   */
+  questionForReply(messageId: string, now = Date.now()): string | null {
+    this.prune(now);
+    for (const s of this.sets.values()) {
+      const byQ = Object.entries(s.messageIds ?? {}).map(([k, v]) => [Number(k), v] as const).sort((a, b) => a[0] - b[0]);
+      let qi = byQ.find(([, v]) => v === messageId)?.[0];
+      if (qi === undefined && s.partIds?.includes(messageId)) {
+        // Parts are recorded in order; the question's own id is its last part.
+        const pi = s.partIds.indexOf(messageId);
+        qi = byQ.find(([, v]) => s.partIds!.indexOf(v) >= pi)?.[0];
+      }
+      if (qi === undefined) continue;
+      const q = s.questions[qi];
+      if (!q || s.answers[q.id]?.length) return null;
+      return AskStore.customId(s.setId, qi);
+    }
+    return null;
+  }
+
   /** Open sets (newest first), optionally for one channel. Read-only copies. */
   openSets(channelId?: string, now = Date.now()): AskSet[] {
     this.prune(now);
@@ -425,9 +469,49 @@ export class AskStore {
     return [...this.closed.values()].filter((c) => c.channelId === channelId && c.answered && now - (c.answeredAt ?? c.closedAt) < withinMs);
   }
 
+  /**
+   * Owner 2026-10-31 (card no-reask-answered): every question the owner answered in the last `withinMs`, in any
+   * channel: answered closed sets, and answered questions of sets that are still open.
+   */
+  answeredQuestions(withinMs = REASK_WINDOW_MS, now = Date.now()): AnsweredQuestion[] {
+    this.prune(now);
+    const out: AnsweredQuestion[] = [];
+    const add = (s: AskSet | ClosedSet, q: AskQuestion, qi: number, answer: string[], at: number) => {
+      if (now - at > withinMs) return;
+      const messageId = s.messageIds?.[String(qi)] ?? Object.values(s.messageIds ?? {})[0];
+      out.push({ question: q.question, options: q.options, ...(q.descriptions ? { descriptions: q.descriptions } : {}), answer, channelId: s.channelId, ...(messageId ? { messageId } : {}), answeredAt: at });
+    };
+    for (const c of this.closed.values()) {
+      if (!c.answered || c.cancelled) continue;
+      c.questions.forEach((q, qi) => add(c, q, qi, c.answers?.[q.id] ?? [], c.answeredAt ?? c.closedAt));
+    }
+    for (const s of this.sets.values())
+      s.questions.forEach((q, qi) => {
+        const r = s.responded?.[String(qi)];
+        const picked = s.answers[q.id] ?? [];
+        if (picked.length || r) add(s, q, qi, picked, r?.at ?? s.answeredAt ?? s.createdAt);
+      });
+    return out;
+  }
+
   /** A closed/expired set, or null. */
   closedSet(setId: string): ClosedSet | null {
     return this.closed.get(setId) ?? null;
+  }
+
+  /**
+   * Owner 2026-10-31 (card needs-you-route-answered): ids of the bot answer messages that belong to the sets owning
+   * these menu message ids. A card whose `q` links the answer text (not the menu itself) is then queued too.
+   */
+  answerIdsFor(menuIds: (string | null | undefined)[]): string[] {
+    const ids = new Set(menuIds.filter((x): x is string => Boolean(x)));
+    if (!ids.size) return [];
+    const out = new Set<string>();
+    for (const s of [...this.sets.values(), ...this.closed.values()]) {
+      const mine = [...Object.values(s.messageIds ?? {}), ...(s.partIds ?? [])];
+      if (mine.some((m) => ids.has(m))) for (const a of s.answerIds ?? []) out.add(a);
+    }
+    return [...out];
   }
 
   /** Why a set id is unknown, and how old it is (for the late-tap label). Null when the set is still open. */
@@ -462,7 +546,10 @@ export class AskStore {
    * a late tap. Closed/expired sets count too (late answers). Only messages that point at the menu count; unrelated
    * text in the same channel does not (one channel holds menus of many topics). Returns the set ids marked.
    */
-  markAnswered(messageIds: (string | null | undefined)[], via: AnswerVia, now = Date.now()): string[] {
+  markAnswered(messageIds: (string | null | undefined)[], via: AnswerVia, now = Date.now(), text?: string): string[] {
+    // Card noreask-clarify: a reply that asks back or defers still clears the boards (FIRSTMATE owes the next step), but its
+    // questions are not "answered" for the no-re-ask filters: the follow-up menu that asks them again must post.
+    const asksBack = text !== undefined && leavesOpen(text);
     this.prune(now);
     const mids = new Set(messageIds.filter((x): x is string => Boolean(x)));
     const marked: string[] = [];
@@ -471,6 +558,20 @@ export class AskStore {
       const all = s.sourceId !== undefined && mids.has(s.sourceId);
       const hit = all ? qmids.map(([k]) => k) : qmids.filter(([, v]) => mids.has(v)).map(([k]) => k);
       if (!hit.length && !all) return;
+      // Card voice-answer-closes-menu (owner 2026-10-31): one answer per set. A set already closed as answered is not
+      // answered again by a later free-text comment or a later late tap; only the bot's own turn for that same answer
+      // (via "late", within ANSWER_ECHO_MS) still counts, so its cards are queued once. A set closed only by asking back
+      // (card noreask-clarify) still takes the real answer.
+      if (!open && s.answered && !Object.keys(s.clarify ?? {}).length && !((via === "late" || via === "voice" || via === "text") && now - (s.answeredAt ?? 0) <= ANSWER_ECHO_MS)) return;
+      // Asked back: flag the questions without a stored answer. Any later response that does not ask back clears it.
+      for (const k of hit) {
+        const q = s.questions[Number(k)];
+        if (!q) continue;
+        const stored = open ? (s as AskSet).answers[q.id] : (s as ClosedSet).answers?.[q.id];
+        if (asksBack && !stored?.length) (s.clarify ??= {})[q.id] = text!.trim().slice(0, 500);
+        // A late batch carries no text (its ✏️ text was checked in useLostTap); it does not clear the flag.
+        else if (!asksBack && !(via === "late" && text === undefined) && s.clarify?.[q.id]) delete s.clarify[q.id];
+      }
       if (open) {
         const o = s as AskSet;
         for (const k of hit) (o.responded ??= {})[k] ??= { at: now, via };
@@ -483,6 +584,28 @@ export class AskStore {
     for (const c of this.closed.values()) visit(c, false);
     if (marked.length) this.save();
     return marked;
+  }
+
+  /**
+   * Card voice-answer-closes-menu (owner 2026-10-31): one ask posted as copies in several channels (same questions and
+   * options, created within COPY_WINDOW_MS) closes together. When set `setId` is answered, every open copy is closed as
+   * answered with the same answers. Returns the copies closed (their menus need the edit).
+   */
+  closeCopies(setId: string, now = Date.now()): ClosedSet[] {
+    const src = this.sets.get(setId) ?? this.closed.get(setId);
+    if (!src) return [];
+    const sig = askSignature(src.questions);
+    const answers = "answers" in src ? structuredClone(src.answers ?? {}) : {};
+    const out: ClosedSet[] = [];
+    for (const s of [...this.sets.values()]) {
+      if (s.setId === setId || Math.abs(s.createdAt - src.createdAt) > COPY_WINDOW_MS || askSignature(s.questions) !== sig) continue;
+      this.sets.delete(s.setId);
+      const c: ClosedSet = { ...closedFields(s), answered: true, answeredAt: now, answerVia: "copy", answers, closedAt: now, reason: "closed", edited: true };
+      this.closed.set(s.setId, c);
+      out.push(c);
+    }
+    if (out.length) this.save();
+    return out;
   }
 
   /** Expired sets whose menus still need the "⌛ Expired · 🔁 Ask again" edit. */
@@ -520,11 +643,29 @@ export class AskStore {
   }
 }
 
-export type AnswerVia = "pick" | "other" | "reply" | "text" | "reaction" | "stack-thread" | "late";
+export type AnswerVia = "pick" | "other" | "reply" | "text" | "reaction" | "stack-thread" | "late" | "voice" | "copy";
+/** The bot's own turn for an answer arrives within this time of the answer itself. */
+export const ANSWER_ECHO_MS = 5_000;
+/** Copies of one ask in several channels are posted within this time of each other. */
+export const COPY_WINDOW_MS = 30_000;
+/** Questions and options of a set, for matching copies of one ask. */
+export function askSignature(questions: AskQuestion[]): string {
+  return JSON.stringify(questions.map((q) => [q.question.trim(), q.options.map((o) => o.trim())]));
+}
 
 function closedFields(s: AskSet): Omit<ClosedSet, "closedAt" | "reason"> {
-  const { setId, channelId, questions, messageIds, createdAt, sourceId, answered, answeredAt, answerVia, partIds } = s;
-  return { setId, channelId, questions, messageIds, createdAt, sourceId, ...(partIds ? { partIds } : {}), ...(answered ? { answered, answeredAt, answerVia } : {}) };
+  const { setId, channelId, questions, messageIds, createdAt, sourceId, answered, answeredAt, answerVia, partIds, answerIds, clarify } = s;
+  return { setId, channelId, questions, messageIds, createdAt, sourceId, ...(partIds ? { partIds } : {}), ...(answerIds?.length ? { answerIds } : {}), ...(answered ? { answered, answeredAt, answerVia } : {}), ...(clarify ? { clarify } : {}) };
+}
+
+/**
+ * Card noreask-clarify: the owner only asked back about this question ("what do you mean?") or put it off ("remind me
+ * later"): an "Other" text that
+ * asks for context, or a reply to the menu that did. A real pick or answer wins.
+ */
+function askedBack(c: ClosedSet, q: AskQuestion): boolean {
+  const a = c.answers?.[q.id] ?? [];
+  return a.length ? isOpenAnswer(a) : Boolean(c.clarify?.[q.id]);
 }
 
 /** Same question text, ignoring case, spaces and punctuation. */
@@ -536,7 +677,8 @@ const normQ = (q: string) => q.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 export function dropRepeatedQuestions(questions: AskQuestion[], open: AskSet[], answered: ClosedSet[] = []): { keep: AskQuestion[]; repeated: { question: string; messageId?: string; answered?: boolean }[] } {
   const openQ = new Map<string, string | undefined>();
   const doneQ = new Map<string, string | undefined>();
-  for (const c of answered) for (const q of c.questions) doneQ.set(normQ(q.question), c.messageIds?.[q.id] ?? Object.values(c.messageIds ?? {})[0]);
+  // A question the owner only asked back about (card noreask-clarify) is still open: its follow-up menu posts.
+  for (const c of answered) for (const q of c.questions) if (!askedBack(c, q)) doneQ.set(normQ(q.question), c.messageIds?.[q.id] ?? Object.values(c.messageIds ?? {})[0]);
   for (const s of open)
     for (const q of s.questions) if (!(s.answers[q.id]?.length)) openQ.set(normQ(q.question), s.messageIds?.[q.id] ?? Object.values(s.messageIds ?? {})[0]);
   const keep: AskQuestion[] = [];

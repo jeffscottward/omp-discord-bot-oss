@@ -127,7 +127,7 @@ describe("POST /drain", () => {
  */
 describe("restart-when-idle.sh", () => {
   const SCRIPT = resolve(import.meta.dir, "../scripts/restart-when-idle.sh");
-  async function run(opts: { gateFails?: boolean; giveUpAfter?: number; health: (n: number, drained: boolean) => object }) {
+  async function run(opts: { ciFails?: boolean; gateFails?: boolean; giveUpAfter?: number; headMoves?: boolean; health: (n: number, drained: boolean) => object }) {
     const dir = mkdtempSync("/tmp/rwi-");
     const notes = join(dir, "notes");
     const safeLog = join(dir, "safe.log");
@@ -135,6 +135,9 @@ describe("restart-when-idle.sh", () => {
     writeFileSync(join(dir, "notify"), `#!/bin/sh\nn=$(( $(cat ${dir}/cnt 2>/dev/null || echo 0) + 1 )); echo $n > ${dir}/cnt\nprintf 'ch=%s %s\\n---\\n' "\${OMP_NOTIFY_CHANNEL:-default}" "$*" >> ${notes}\necho "posted 90$n"\n`, { mode: 0o755 });
     writeFileSync(join(dir, "safe"), `#!/bin/sh\necho called >> ${safeLog}\necho "OK: healthy at abc"\n`, { mode: 0o755 });
     writeFileSync(join(dir, "gate"), opts.gateFails ? "#!/bin/sh\necho 'GATE FAIL at abc: tests (bun test)'\nexit 1\n" : "#!/bin/sh\necho 'GATE OK at abc'\n", { mode: 0o755 });
+    writeFileSync(join(dir, "ci"), opts.ciFails ? `#!/bin/sh\necho "$1 $2" >> ${dir}/ci.log\necho 'CI NOT GREEN at aaaaaaa: pipeline none'\nexit 2\n` : `#!/bin/sh\necho "$1 $2" >> ${dir}/ci.log\necho 'CI GREEN at aaaaaaa'\n`, { mode: 0o755 });
+    // Fake HEAD: the first call (before the gate) prints sha A; later calls print B when headMoves.
+    writeFileSync(join(dir, "head"), `#!/bin/sh\nn=$(( $(cat ${dir}/hcnt 2>/dev/null || echo 0) + 1 )); echo $n > ${dir}/hcnt\nif [ $n -gt 1 ] && [ "${opts.headMoves ? 1 : 0}" = 1 ]; then echo bbbbbbbbbb; else echo aaaaaaaaaa; fi\n`, { mode: 0o755 });
     let polls = 0;
     let drained = false;
     const drains: { on: boolean; ttlSec: number }[] = [];
@@ -167,6 +170,8 @@ describe("restart-when-idle.sh", () => {
         OMP_RESTART_GATE: join(dir, "gate"),
         OMP_RESTART_NOTIFY: join(dir, "notify"),
         OMP_RESTART_LOCK: join(dir, "lock"),
+        OMP_RESTART_HEAD: join(dir, "head"),
+        OMP_RESTART_CI: join(dir, "ci"),
         OMP_RESTART_DRAIN_AFTER: "30",
         ...(opts.giveUpAfter ? { OMP_RESTART_GIVE_UP_AFTER: String(opts.giveUpAfter) } : {}),
       },
@@ -182,7 +187,7 @@ describe("restart-when-idle.sh", () => {
         return "";
       }
     };
-    return { code, drains, posts, polls, notes: read(notes), safeCalls: read(safeLog).split("\n").filter(Boolean).length };
+    return { code, drains, posts, polls, notes: read(notes), safeCalls: read(safeLog).split("\n").filter(Boolean).length, ciLog: read(join(dir, "ci.log")) };
   }
   const busy = { ready: true, voice: false, running: [{ id: 1 }], queued: [{ id: 2, key: "mirror-123" }], finishing: 0, boards: 0, approvals: 0 };
 
@@ -274,5 +279,94 @@ describe("restart-when-idle.sh", () => {
 
   test("give-up limit is 2 h by default", () => {
     expect(readFileSync(SCRIPT, "utf8")).toMatch(/^GIVE_UP_AFTER_DEFAULT=7200\b/m);
+  });
+
+  test("HEAD moves during the gate/wait: no restart at the unchecked commit, ONE #omp-alerts notice", async () => {
+    const r = await run({ headMoves: true, health: () => ({ ...busy, running: [], queued: [] }) });
+    expect(r.code).toBe(5);
+    expect(r.safeCalls).toBe(0);
+    expect(r.posts.length).toBe(1);
+    expect(r.posts[0]!.channel).toBe("omp-alerts");
+    expect(r.posts[0]!.text).toContain("aaaaaaa");
+    expect(r.posts[0]!.text).toContain("bbbbbbb");
+    expect(r.notes).not.toContain("Restarting the bot now");
+  });
+
+  test("CI not green for the gated SHA: no drain, no restart, the reason is posted", async () => {
+    const r = await run({ ciFails: true, health: () => ({ ...busy, running: [], queued: [] }) });
+    expect(r.code).toBe(6);
+    expect(r.safeCalls).toBe(0);
+    expect(r.drains).toEqual([]);
+    expect(r.ciLog).toBe("aaaaaaaaaa 1800\n");
+    expect(r.notes).toContain("no green GitLab pipeline");
+    expect(r.notes).toContain("aaaaaaa");
+  });
+
+  test("green CI: the CI check runs on the gated SHA before the restart", async () => {
+    const r = await run({ health: () => ({ ...busy, running: [], queued: [] }) });
+    expect(r.code).toBe(0);
+    expect(r.ciLog).toBe("aaaaaaaaaa 1800\n");
+    expect(r.safeCalls).toBe(1);
+  });
+
+  test("safe-restart.sh checks CI for the exact loaded SHA inside the lock, after the HEAD check", () => {
+    const src = readFileSync(resolve(import.meta.dir, "../scripts/safe-restart.sh"), "utf8");
+    const ci = src.indexOf('scripts/ci-green.sh} "$NOW" 0');
+    expect(ci).toBeGreaterThan(src.indexOf('[ "$NOW" != "$GATED" ]'));
+    expect(ci).toBeLessThan(src.indexOf('systemctl --user restart "$UNIT"'));
+  });
+
+  test("safe-restart.sh re-checks HEAD after its own gate", () => {
+    const src = readFileSync(resolve(import.meta.dir, "../scripts/safe-restart.sh"), "utf8");
+    expect(src.indexOf('GATED="$(git rev-parse HEAD)"')).toBeLessThan(src.indexOf("scripts/restart-gate.sh 2>&1"));
+    expect(src.indexOf("git diff --quiet HEAD")).toBeLessThan(src.indexOf('GATED="$(git rev-parse HEAD)"'));
+    expect(src.indexOf("flock -w 30 8")).toBeLessThan(src.indexOf('NOW="$(git rev-parse HEAD)"'));
+    expect(src.indexOf('[ "$NOW" != "$GATED" ]')).toBeLessThan(src.indexOf('systemctl --user restart "$UNIT"'));
+  });
+});
+
+/** scripts/ci-green.sh against a fake GitLab pipelines API. */
+describe("ci-green.sh", () => {
+  const SCRIPT = resolve(import.meta.dir, "../scripts/ci-green.sh");
+  async function ci(statuses: string[][], wait = 0) {
+    const dir = mkdtempSync("/tmp/cig-");
+    writeFileSync(join(dir, "tok"), "t0k\n");
+    let n = 0;
+    const seen: string[] = [];
+    const srv = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        const u = new URL(req.url);
+        seen.push(`${u.searchParams.get("sha")} ${req.headers.get("private-token")}`);
+        const list = statuses[Math.min(n++, statuses.length - 1)]!;
+        return Response.json(list.map((status, i) => ({ id: 100 - i, status })));
+      },
+    });
+    const p = Bun.spawn(["bash", SCRIPT, "abcdef1234", String(wait)], {
+      env: { ...process.env, OMP_GITLAB_API: `http://127.0.0.1:${srv.port}`, OMP_GITLAB_TOKEN_FILE: join(dir, "tok"), OMP_CI_SLEEP: "true", OMP_CI_POLL: "10" },
+      stdout: "pipe",
+    });
+    const code = await p.exited;
+    const out = await new Response(p.stdout).text();
+    srv.stop(true);
+    return { code, out, seen };
+  }
+  test("success for the exact SHA = 0; token sent as header, never printed", async () => {
+    const r = await ci([["success"]]);
+    expect(r.code).toBe(0);
+    expect(r.seen[0]).toBe("abcdef1234 t0k");
+    expect(r.out).not.toContain("t0k");
+  });
+  test("no pipeline = 2; failed = 1; a retried success after a failure = 0", async () => {
+    expect((await ci([[]])).code).toBe(2);
+    expect((await ci([["failed"]])).code).toBe(1);
+    expect((await ci([["failed", "success"]])).code).toBe(0);
+  });
+  test("pending is awaited up to the limit", async () => {
+    expect((await ci([["running"], ["running"], ["success"]], 60)).code).toBe(0);
+    const r = await ci([["pending"]], 30);
+    expect(r.code).toBe(2);
+    expect(r.seen.length).toBe(4);
   });
 });

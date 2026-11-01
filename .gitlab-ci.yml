@@ -1,0 +1,18 @@
+# Optional GitLab CI (self-hosted runner). The GitHub workflow in .github/workflows/ci.yml runs the same checks.
+stages: [test]
+test:
+  stage: test
+  image: docker.io/oven/bun:1
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git python3 jq ca-certificates chromium procps curl >/dev/null
+    - git config --global user.email ci@main.local && git config --global user.name ci
+    - mkdir -p ~/.omp/agent && cp test/fixtures/ci-models.yml ~/.omp/agent/models.yml
+    # CI runs as root in a container: Chrome needs --no-sandbox there (never on the main host).
+    - printf '#!/bin/sh\nexec chromium --no-sandbox "$@"\n' > /usr/local/bin/ci-chrome && chmod +x /usr/local/bin/ci-chrome
+  variables:
+    OMP_TABLES_CHROME: ci-chrome
+  script:
+    - bun install --frozen-lockfile
+    - bunx tsc --noEmit -p .
+    - bun test test/
+    - bun run lint:mentions

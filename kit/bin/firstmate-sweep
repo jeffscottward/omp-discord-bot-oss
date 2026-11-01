@@ -61,6 +61,7 @@ HOME = os.path.expanduser("~")
 HERE = os.environ.get("FM_DIR") or os.path.join(os.environ.get("REPORTS_WEB_DIR") or os.path.join(HOME, ".local/share/omp-discord/reports-web"), "firstmate")
 IDLE = os.environ.get("FIRSTMATE_SWEEP_IDLE") or os.path.join(HERE, "idle.json")  # env overrides: tests only
 LOG = os.path.join(HERE, "sweep.log")
+AUDIT = os.environ.get("FIRSTMATE_SWEEP_AUDIT") or os.path.join(HERE, "audit.json")  # fm-audit flow cards
 STALE_IDLE_S = 600  # idle.json older than this means fm-autoclear is not running
 RUNS = os.path.join(HERE, "sweep-runs")
 TASK = os.environ.get("FIRSTMATE_SWEEP_TASK") or os.path.join(HERE, "sweep-task.md")
@@ -114,8 +115,24 @@ def main(dry):
     if age > STALE_IDLE_S:
         log(f"skip: idle.json is {int(age)} s old (fm-autoclear not running?)")
         return 0
+    # Owner 2026-10-31 (card dashboard-autoflow): fm-audit (fm-tick step) lists stuck cards in audit.json `flow`
+    # (unblocked, needs check, no job, answered); the sweep handles them next to the idle cards.
+    flow = []
+    try:
+        if time.time() - os.path.getmtime(AUDIT) < STALE_IDLE_S:
+            flow = [f for f in (json.load(open(AUDIT)).get("flow") or []) if f.get("id")]
+    except Exception as e:
+        log(f"audit.json not read ({e}); idle cards only")
+    fset = {f["id"] for f in flow}
+    items = [i for i in items if i.get("id") not in fset] + flow  # a card in both keeps its auditor kind
+    try:  # owner hold list (hold.json): cards the owner reviews himself are never swept (owner 2026-10-31)
+        held = set((json.load(open(os.path.join(os.path.dirname(IDLE), "hold.json"))).get("cards") or {}))
+    except Exception:
+        held = set()
+    items = [i for i in items if i.get("id") not in held]
+    flow = [f for f in flow if f["id"] not in held]
     if not items:
-        log("skip: no idle cards")
+        log("skip: no idle or auditor cards")
         return 0
     all_tabs = tabs()
     old = [t for t in all_tabs if t.get("label") == LABEL]
@@ -129,6 +146,7 @@ def main(dry):
                 herdr("tab", "close", t["tab_id"], check=False)
             log(f"{'DRY ' if dry else ''}closed stale sweep tab {t['tab_id']} (last start {int(age / 60)} min ago)")
     ids = [i["id"] for i in items]
+    fids = {f["id"] for f in flow}
     ws = next((t["workspace_id"] for t in all_tabs if t.get("label") == HOME_TAB), None) or \
         (all_tabs[0]["workspace_id"] if all_tabs else None)
     if not ws:
@@ -165,7 +183,8 @@ def main(dry):
             return 1
         time.sleep(3)
         herdr("agent", "prompt", pane,
-              f"Read {TASK} and carry it out fully. Run id: {run_id}. Idle cards: {', '.join(ids)}. "
+              f"Read {TASK} and carry it out fully. Run id: {run_id}. Idle cards: {', '.join(i for i in ids if i not in fids) or 'none'}. "
+              f"Auditor cards (audit.json flow): {'; '.join(f['id'] + ' = ' + str(f.get('kind')) for f in flow) or 'none'}. "
               f"Receipt file: {receipt}. Deadline: 45 min.")
         seen_work, quiet = False, 0
         while time.time() - started < DEADLINE_S:

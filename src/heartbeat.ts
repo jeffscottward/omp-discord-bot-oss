@@ -322,7 +322,9 @@ export function formatHeartbeat(v: HeartbeatView): string {
     gone: "❌ **The agent process has exited.** The answer should arrive shortly.",
   }[vd];
   const lines = [`${WORKING_EMOJI} Working… ${dur(v.now - v.startedAt)}`, `${head} · checked <t:${Math.floor(v.now / 1000)}:T>`];
-  if (v.model) lines.push(`🤖 Model: \`${clean(v.model, 80)}\`${v.thinking ? ` · thinking ${clean(v.thinking, 30)}` : ""}`);
+  if (v.model) lines.push(`🤖 Model: \`${clean(v.model, 80)}\``);
+  // Owner 2026-10-31: reasoning level on its own 🧠 line below the model line.
+  if (v.model && v.thinking) lines.push(`🧠 Reasoning: ${clean(v.thinking, 30)}`);
   const p = v.pending.at(-1);
   if (p) {
     lines.push(`🔧 Running ${toolText(p, v.now)}${v.pending.length > 1 ? ` +${v.pending.length - 1} more` : ""}`);

@@ -319,7 +319,7 @@ decision, and record the new date.
 ## 🧠 Reply tail and finance tables (2026-10-21, card discord-reply-footer)
 
 - The model signature and the dashboard link form one bullet list at the end of a reply: content, exactly one blank line, `- 🧠 <provider/model>`, `- ⚓ [Open …](<url>)`. Without a dashboard link the list has only the 🧠 line. With audio, the list stays on the audio message, above the spacer. If the list does not fit in 2000 characters, it goes in its own follow-up message; the 🧠 line is never dropped. Copy posts get no tail. Code: `src/replytail.ts`.
-- Tables in finance channels (channel, parent or category name matches finance/newsletter/market/long-options/broker, or an id in `OMP_TRADING_CHANNEL_IDS`) are PNG only, with no page under /reports/tables/. This also covers example-bot `/post` calls to those channels. The account-number rule stays.
+- Tables in finance channels (channel, parent or category name matches finance/newsletter/market, or an id in `OMP_FINANCE_CHANNEL_IDS`) are PNG only, with no page under /reports/tables/. This also covers example-bot `/post` calls to those channels. The account-number rule stays.
 
 ## 🧠-local-model channel (owner 2026-10-19, card local-model-channel)
 - Channel `🧠-local-model` (100000000000000036) in 🔔 Alerts, outside the mirrored categories so sync never moves or archives it.
@@ -363,4 +363,5 @@ decision, and record the new date.
 - Restart gate: `scripts/restart-when-idle.sh` restarts only when typecheck and tests pass at HEAD. A failed gate
   keeps the old code running and posts the failure; check the journal before assuming a fix is live.
 
-- Stacks are not a fixed set (owner 2026-10-24): add one with `bun scripts/stack-add.ts --name <slug> --emoji <e> --title <t> --keywords "a,b" [--areas ...]` (writes router.stacks in config.json, schedules an idle restart). Create a new stack whenever a new domain of work appears; its thread is made on the first routed message. 🎮 fun covers apps, plugins, ports, emulators and 3D models.
+- Stacks are not a fixed set (owner 2026-10-24): add one with `bun scripts/stack-add.ts --name <slug> --emoji <e> --title <t> --keywords "a,b" [--areas ...]` (writes the stack catalog `~/.config/omp-discord/stacks.json`; the bot re-reads it within 10 s, no restart). Create a new stack whenever a new domain of work appears; its thread is made on the first routed message. 🎮 fun covers games, modding, recomps, emulators and 3D models.
+- Every request goes to a stack (owner 2026-10-28, card stack-catalog): ONE catalog file (`src/stackcatalog.ts`, 19 stacks from a judge_batch scan of the owner's requests) is read by the router and fm-spawn. fm-spawn `--stack` takes any name and adds an unknown one; a card area with no stack makes a new stack. A job whose pane gets no channel within 2 min is posted in its stack thread with a ❌ Stop button (Esc into the pane, `src/panestop.ts`) and FIRSTMATE gets an alert; mirrored pane status messages carry the same Stop. When every main pane category is full, the mirror creates the next "🖥️ Main N" category with the same overwrites and saves it in `mirror.overflow`.

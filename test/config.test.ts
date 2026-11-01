@@ -7,7 +7,8 @@ const ROOT = join(import.meta.dir, "..");
 
 describe("config", () => {
   test("tests run with the fake fixture config, never the real one", () => {
-    expect(process.env.OMP_BOT_CONFIG).toBe(join(import.meta.dir, "fixtures", "config.test.json"));
+    expect(process.env.OMP_BOT_CONFIG).toEndWith("config.test.json");
+    expect(process.env.OMP_BOT_CONFIG).not.toBe(join(import.meta.dir, "fixtures", "config.test.json")); // a tmp copy
     expect(CONFIG.hostLabel).toBe("test-host");
   });
   test("missing file gives the generic defaults (no personal values)", () => {

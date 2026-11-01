@@ -69,15 +69,15 @@
 <polygon fill="#58a6ff" stroke="#58a6ff" points="295.05,-390.3 285.78,-385.17 289.83,-394.96 295.05,-390.3"/>
 <text xml:space="preserve" text-anchor="middle" x="330.97" y="-408.55" font-family="DejaVu Sans" font-size="11.00" fill="#8b949e">no rule</text>
 </g>
-<!-- s_trading -->
+<!-- s_finance -->
 <g id="node6" class="node">
-<title>s_trading</title>
+<title>s_finance</title>
 <path fill="#161b22" stroke="#58a6ff" stroke-width="2" d="M923.75,-178.25C923.75,-178.25 870.25,-178.25 870.25,-178.25 864.25,-178.25 858.25,-172.25 858.25,-166.25 858.25,-166.25 858.25,-154.25 858.25,-154.25 858.25,-148.25 864.25,-142.25 870.25,-142.25 870.25,-142.25 923.75,-142.25 923.75,-142.25 929.75,-142.25 935.75,-148.25 935.75,-154.25 935.75,-154.25 935.75,-166.25 935.75,-166.25 935.75,-172.25 929.75,-178.25 923.75,-178.25"/>
 <text xml:space="preserve" text-anchor="middle" x="897" y="-156.15" font-family="DejaVu Sans" font-size="13.00" fill="#e6edf3">💹 finance</text>
 </g>
-<!-- rules&#45;&gt;s_trading -->
+<!-- rules&#45;&gt;s_finance -->
 <g id="edge5" class="edge">
-<title>rules&#45;&gt;s_trading</title>
+<title>rules&#45;&gt;s_finance</title>
 <path fill="none" stroke="#30363d" d="M393.68,-439.32C407.31,-433.07 422.38,-425.93 436,-419 465.03,-404.22 471.56,-399.15 500,-383.25 629.53,-310.86 782.81,-225.13 855.18,-184.65"/>
 <polygon fill="#30363d" stroke="#30363d" points="856.5,-187.92 863.52,-179.98 853.08,-181.81 856.5,-187.92"/>
 </g>
@@ -174,9 +174,9 @@
 <text xml:space="preserve" text-anchor="middle" x="575" y="-56.4" font-family="DejaVu Sans" font-size="13.00" fill="#e6edf3">📈 Report up (mux)</text>
 <text xml:space="preserve" text-anchor="middle" x="575" y="-39.9" font-family="DejaVu Sans" font-size="13.00" fill="#e6edf3">router note ✅/❌ · board · stacks.json · /health</text>
 </g>
-<!-- s_trading&#45;&gt;report -->
+<!-- s_finance&#45;&gt;report -->
 <g id="edge12" class="edge">
-<title>s_trading&#45;&gt;report</title>
+<title>s_finance&#45;&gt;report</title>
 <path fill="none" stroke="#30363d" stroke-dasharray="5,2" d="M863.66,-141.27C840.21,-129.18 807.83,-113.58 778,-103 747.64,-92.23 713.92,-82.94 682.82,-75.41"/>
 <polygon fill="#30363d" stroke="#30363d" points="683.61,-73.44 677.29,-74.08 682.63,-77.52 683.61,-73.44"/>
 </g>

@@ -12,7 +12,7 @@ Template for FIRSTMATE side-session task files (Orca #3, 2026-10-19). Copy it to
 ## Rules
 - No `git push`, `gh pr create/merge/close`, deploys, service restarts or deletions unless the card records the owner's approval for that exact action. `omp-approve` does not work in Herdr panes.
 - Owner questions only through the bot loopback /post with a fenced ```ask JSON block.
-- Back up files before you edit them. Finance code, orders, gates and live configs stay unchanged unless the card says otherwise.
+- Back up files before you edit them. Finance cards are worked like any card (owner 2026-10-31). Hard limit: never change finance code, payments, gates or live configs, and never start, stop, restart or reconfigure live finance units or timers; those stay owner decisions (one ask menu).
 - Heartbeat: a running card with no pane activity and no `fm beat` for 30 min is flagged "silent 30 min; no receipt; needs check". The pane counts as active only between tool calls, so one long command (build, download, test suite, `longjob`) needs a background beat. Run it in the same shell command: `( while sleep 900; do fm beat <card-id> "<what runs>"; done ) & B=$!; <long command>; rc=$?; kill $B; (exit $rc)`
 
 ## Acceptance
@@ -21,6 +21,7 @@ Template for FIRSTMATE side-session task files (Orca #3, 2026-10-19). Copy it to
 ## Finish: receipt (required, last step)
 Write the worker-done receipt. fm-autoclear applies it to the card within one minute:
 - Done: `fm receipt <card-id> done "<one-line result>" --evidence "<commit/file/unit/URL>" [--evidence ...]`
+- Owner decisions go to FIRSTMATE as an ask menu; never only in a report. Before a done receipt, post ONE ```ask block in FIRSTMATE (bot /post, channel firstmate) with each open decision as one question, and pass `--q <menu URL>`. `fm receipt ... done` refuses a summary or .md/.html evidence file with an open "Decisions for you"/"Needs you"/"Owner decision"/"Open questions" section; pass `--decisions-none` when nothing is open.
 - Failed: `fm receipt <card-id> failed "<what failed and where the log is>"`
 - Blocked on the owner (you posted an ask): `fm receipt <card-id> blocked "<what the owner must decide>" --q <Discord ask message link>` (or `--src <message link>`)
 - Blocked on another card: `fm receipt <card-id> blocked "<what it waits for>" --blocked-by <card-id>[,<card-id>]`

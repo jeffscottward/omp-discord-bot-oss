@@ -97,12 +97,25 @@ export interface MarkOptions {
   file?: string;
   fm?: string;
   log?: (s: string) => void;
+  /** Expand menu ids to their answer text ids: only when the whole set is answered (a partial answer must not queue sibling cards). */
+  expand?: boolean;
+}
+
+/** Owner 2026-10-31 (card needs-you-route-answered): extra message ids for a response (menu ids -> answer text ids). */
+let refExpander: (ids: string[]) => string[] = () => [];
+export function setRefExpander(fn: (ids: string[]) => string[]): void {
+  refExpander = fn;
 }
 
 /** Mark every matching card as queued. Never throws; returns the ids marked. */
 export async function markQueued(refs: ResponseRefs, o: MarkOptions = {}): Promise<string[]> {
   const log = o.log ?? (() => {});
   if (!refs.messageIds.length && !refs.itemIds.length) return [];
+  if (o.expand) try {
+    refs = { ...refs, messageIds: [...new Set([...refs.messageIds, ...refExpander(refs.messageIds)])] };
+  } catch (e) {
+    log(`queued: expand failed: ${errText(e)}`);
+  }
   let items: Card[];
   try {
     items = parseCards(readFileSync(o.file ?? ITEMS_FILE, "utf8"));

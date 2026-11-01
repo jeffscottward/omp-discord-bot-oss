@@ -1,0 +1,8 @@
+[Unit]
+Description=Hourly Discord cleanup: purge learned/duplicate pane channels + delete old 🛑 Stopped messages (M4, card infra-bot-consolidation; JSON copies kept)
+Documentation=file://%h/Github/tools/omp-discord-bot/systemd/omp-discord-cleanup.steps
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1260
+ExecStart=%h/Github/tools/self-healing-harness/bin/tick-runner omp-discord-cleanup %h/Github/tools/omp-discord-bot/systemd/omp-discord-cleanup.steps

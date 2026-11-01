@@ -31,7 +31,7 @@ describe("rows", () => {
     expect(by["card:old"]).toBeUndefined();
     expect(by["card:f1"]).toMatchObject({ state: "failed", at: NOW - 1800_000 });
     expect(by["card:nojob"]).toBeUndefined();
-    expect(by["card:tr"]?.title).toBe("Finance card tr");
+    expect(by["card:tr"]?.title).toBe("tr");
   });
 
   test("bot jobs: live first, finished kept 24 h, a live id wins over its saved finish", () => {
@@ -84,8 +84,10 @@ function fakeChannel(botId: string) {
     };
     return m;
   };
+  const sends: { flags?: number }[] = [];
   const ch: BoardChannel = {
     send: async (o) => {
+      sends.push({ flags: o.flags });
       const m = mk(o.content);
       list.unshift(m);
       return m;
@@ -93,11 +95,11 @@ function fakeChannel(botId: string) {
     messages: { fetch: async () => new Map(list.map((m) => [m.id, m])) },
   };
   const post = (content: string, author: string) => list.unshift(mk(content, author));
-  return { ch, list, post };
+  return { ch, list, post, sends };
 }
 
 describe("MasterQueueBoard", () => {
-  test("keeps one board at the bottom (the ⏳ Queue box may sit below), edits in place, keeps finished jobs across a restart", async () => {
+  test("keeps one board at the bottom (the ⏳ Queue box may sit below), never edits (new silent post replaces the old board), keeps finished jobs across a restart", async () => {
     const dir = mkdtempSync(join(tmpdir(), "mq-"));
     const items = join(dir, "items.json");
     mkdirSync(join(dir, "receipts"));
@@ -124,14 +126,19 @@ describe("MasterQueueBoard", () => {
     expect(f.list[0]!.content).toContain("owner task");
     expect(f.list[0]!.content).toContain("Side session job");
 
-    // The ⏳ Queue box below the board: no reprint, edit in place.
+    // Rows change: a NEW silent board is posted and the old one deleted; no message is edited (owner 2026-10-30).
+    let edits = 0;
+    for (const m of f.list) { const e = m.edit; m.edit = async (o) => (edits++, e(o)); }
     f.post("⏳ **Queue**", "bot");
     const id = f.list[1]!.id;
     live = [];
     b.finished(1, "done", { title: "owner task", channelId: "c1", link: MSG });
     await b.refresh();
-    expect(f.list[1]!.id).toBe(id);
-    expect(f.list[1]!.content).toContain("🏁 **Finished, last 12 h:** 1");
+    expect(edits).toBe(0);
+    expect(f.list.some((m) => m.id === id)).toBe(false);
+    expect(f.list[0]!.content).toContain("🏁 **Finished, last 12 h:** 1");
+    expect(f.list[1]!.content).toBe("⏳ **Queue**");
+    expect(f.sends.at(-1)!.flags! & 4096).toBe(4096);
 
     // Owner writes: the board moves back to the bottom.
     f.post("hi", "owner");
@@ -144,7 +151,7 @@ describe("MasterQueueBoard", () => {
     expect(b2.rows().some((r) => r.key === "job:1" && r.state === "done")).toBe(true);
   });
 
-  test("same rows: no edit when only the `updated` stamp changed (5-min throttle applies)", async () => {
+  test("same rows: no repost for stamp or elapsed-time changes within 10 min; never an edit", async () => {
     const dir = mkdtempSync(join(tmpdir(), "mq-"));
     mkdirSync(join(dir, "receipts"));
     const items = join(dir, "items.json");
@@ -171,9 +178,16 @@ describe("MasterQueueBoard", () => {
     now += 2_000;
     await b.refresh();
     expect(edits).toBe(0);
+    expect(f.list[0]!.id).toBe(board.id);
     now += 300_001;
     await b.refresh();
-    expect(edits).toBe(1);
+    expect(edits).toBe(0);
+    expect(f.list[0]!.id).toBe(board.id); // only "1m" -> "6m" changed: no repost yet
+    now += 300_000;
+    await b.refresh();
+    expect(edits).toBe(0);
+    expect(f.list[0]!.id).not.toBe(board.id); // after 10 min the elapsed time is refreshed by a new post
+    expect(f.list.filter((m) => isMasterBoard(m.content)).length).toBe(1);
   });
 });
 
@@ -265,7 +279,7 @@ describe("bots section (owner 2026-10-24)", () => {
     const { renderMaster } = await import("../src/masterqueue.ts");
     const rows = cardRows([
       { id: "b1", t: "Discord bot", job: "omp-discord-bot.service", s: "running" },
-      { id: "b2", t: "Copier", job: ["remote:copybook-copier.timer"], s: "running" },
+      { id: "b2", t: "Sync", job: ["remote:example-sync.timer"], s: "running" },
       { id: "j1", t: "Real job", job: "wB:p1", s: "running" },
     ], new Map(), NOW, DASH);
     expect(rows.filter((r) => r.state === "bot").map((r) => r.key)).toEqual(["card:b1", "card:b2"]);
@@ -395,4 +409,19 @@ test("master queue needs rows are action blocks with the unblock count (owner 20
   expect(l).toContain("🏃 Pick a host");
   expect(l).toContain("👉 1. Pick A");
   expect(l).toContain("🔓 unblocks 2 cards");
+});
+
+test("needs-you alerts-only mode: no board in FIRSTMATE, one ping per new card (owner 2026-10-27)", async () => {
+  const { NeedsYouBoard } = await import("../src/needsyou.ts");
+  const dir = mkdtempSync(join(tmpdir(), "nyao-"));
+  const items = join(dir, "items.json");
+  writeFileSync(items, JSON.stringify({ items: [] }));
+  const fm = fakeChannel("bot");
+  const nb = new NeedsYouBoard({ getChannel: async () => fm.ch, botId: () => "bot", itemsFile: items, stateFile: join(dir, "s.json"), dash: DASH, log: () => {}, now: () => NOW, alertsOnly: true });
+  await nb.refresh();
+  expect(fm.list.length).toBe(0);
+  writeFileSync(items, JSON.stringify({ items: [{ id: "w1", t: "Do it", s: "waiting", q: "https://discord.com/channels/1/2/3", action: "Tap it", cts: NOW }] }));
+  await nb.refresh();
+  expect(fm.list.length).toBe(1);
+  expect(fm.list[0]!.content.startsWith("🔔")).toBe(true);
 });

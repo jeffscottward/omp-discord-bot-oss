@@ -269,9 +269,17 @@ export class SessionCommands {
     );
   }
 
-  /** 🔁 Retry row under a failed run (main.ts keeps the original message). */
-  static retryRow(jobId: number): ActionRowBuilder<ButtonBuilder> {
-    return new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId(`${PREFIX}retry:${jobId}`).setLabel("Retry").setEmoji("🔁").setStyle(ButtonStyle.Primary));
+  /**
+   * 🔁 Force retry row under a failed run (main.ts keeps the original message). Owner 2026-10-30: while an
+   * automatic retry waits, a disabled "⏳ Cooling down" button next to it shows when it runs.
+   */
+  static retryRow(jobId: number, coolingUntil?: Date): ActionRowBuilder<ButtonBuilder> {
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId(`${PREFIX}retry:${jobId}`).setLabel("Force retry").setEmoji("🔁").setStyle(ButtonStyle.Primary));
+    if (coolingUntil) {
+      const hhmm = coolingUntil.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" });
+      row.addComponents(new ButtonBuilder().setCustomId(`${PREFIX}cooling:${jobId}`).setLabel(`Cooling down · auto-retry ${hhmm}`).setEmoji("⏳").setStyle(ButtonStyle.Secondary).setDisabled(true));
+    }
+    return row;
   }
 
   // ----- dispatch -----

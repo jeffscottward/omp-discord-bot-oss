@@ -1,7 +1,7 @@
 """Local Kokoro text-to-speech for Discord replies (owner request 2026-10-13: every reply gets audio).
 Runs with ~/Github/tools/kokoro-tts/.venv (onnxruntime-gpu + CUDA 13 wheels), fp32 model on the GPU,
-voice af_heart (same as the peer machine voice-notify tool). Unix socket $XDG_RUNTIME_DIR/omp-tts.sock.
-Request: one JSON line {"text": ..., "out": "/path/file.ogg"}. Reply: {"ok": true, "seconds": n} or {"error": ...}.
+voice af_heart (same as the second machine voice-notify tool). Unix socket $XDG_RUNTIME_DIR/omp-tts.sock.
+Request: one JSON line {"text": ..., "out": "/path/file.ogg", "voice": "af_heart"} (voice optional; unknown -> af_heart). Reply: {"ok": true, "seconds": n} or {"error": ...}.
 """
 import ctypes, glob, json, os, site, socket, subprocess
 
@@ -25,6 +25,7 @@ tts.create("Ready.", voice="af_heart", speed=1.0, lang="en-us")  # warm up
 path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omp-tts.sock")
 if os.path.exists(path):
     os.unlink(path)
+VOICES = set(tts.get_voices())
 srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 srv.bind(path)
 os.chmod(path, 0o600)
@@ -36,11 +37,16 @@ while True:
     with conn:
         try:
             req = json.loads(conn.makefile().readline())
-            samples, rate = tts.create(req["text"][:8000], voice="af_heart", speed=1.05, lang="en-us")
+            voice = req.get("voice") if req.get("voice") in VOICES else "af_heart"
+            lang = "en-gb" if voice[:1] == "b" else "en-us"
+            samples, rate = tts.create(req["text"][:8000], voice=voice, speed=1.05, lang=lang)
             pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16).tobytes()
             subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "-",
                             "-c:a", "libopus", "-b:a", "32k", req["out"]], input=pcm, check=True, timeout=60)
             reply = {"ok": True, "seconds": round(len(samples) / rate, 1)}
         except Exception as e:  # class only
             reply = {"error": type(e).__name__}
-        conn.sendall((json.dumps(reply) + "\n").encode())
+        try:
+            conn.sendall((json.dumps(reply) + "\n").encode())
+        except OSError:  # client gave up (timeout/half-close); keep serving
+            pass

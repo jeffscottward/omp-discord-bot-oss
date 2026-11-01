@@ -24,6 +24,9 @@ healthy() {
   return 1
 }
 
+# Uncommitted changes to tracked files would load code the gate did not check against a commit.
+git diff --quiet HEAD || { echo "NOT RESTARTED: the checkout has uncommitted changes" >&2; exit 3; }
+GATED="$(git rev-parse HEAD)"
 gate="$(scripts/restart-gate.sh 2>&1)"
 if [ $? -ne 0 ]; then
   echo "$gate" >&2
@@ -31,6 +34,21 @@ if [ $? -ne 0 ]; then
   exit 3
 fi
 echo "$(tail -n 1 <<<"$gate")"
+# Hold the integrate lock (ff-merges take it) from the HEAD check through the start, so no merge lands
+# between check and load. Wait at most 30 s: a caller inside that lock (integration step) must not deadlock;
+# then the HEAD check alone applies.
+exec 8>"${OMP_INTEGRATE_LOCK:-/tmp/omp-discord-bot-integrate.lock}"
+flock -w 30 8 || echo "warn: integrate lock busy; continuing with the HEAD check only" >&2
+# Gated-commit rule: HEAD must still be the commit the gate checked.
+NOW="$(git rev-parse HEAD)"
+if [ "$NOW" != "$GATED" ]; then
+  echo "NOT RESTARTED: HEAD moved from ${GATED:0:7} to ${NOW:0:7} during the checks" >&2
+  exit 3
+fi
+# Deploy rule: the exact SHA that loads needs a green GitLab pipeline (no wait here: the integrate lock is held).
+# OMP_SAFE_RESTART_CI = test hook. A failure revert below loads without CI on purpose (recovery).
+ci="$(${OMP_SAFE_RESTART_CI:-scripts/ci-green.sh} "$NOW" 0 2>&1)" || { echo "$ci" >&2; echo "NOT RESTARTED: $(tail -n 1 <<<"$ci")" >&2; exit 3; }
+echo "$(tail -n 1 <<<"$ci")"
 systemctl --user restart "$UNIT"
 if healthy; then echo "OK: $UNIT healthy at $(git rev-parse --short HEAD)"; exit 0; fi
 

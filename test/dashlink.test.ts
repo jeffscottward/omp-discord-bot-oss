@@ -41,7 +41,7 @@ describe("reply dashboard deep link", () => {
     const src = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
     const done = src.slice(src.indexOf("onDone: async (res, err)"), src.indexOf("jobKeys.set(id, target.id);"));
     // The success path has one sendText call; with late audio it gets audio=undefined and the link ends the text.
-    expect(done).toContain('typeof ready === "string" && ready !== "late" ? ready : undefined, audioName(text), [], startedAt, fmRun, undefined, res.model ?? models.defaultModel());');
+    expect(done).toContain('typeof ready === "string" && ready !== "late" ? ready : undefined, audioName(text), [], startedAt, fmRun, undefined, modelWithThinking(res.model ?? models.defaultModel(), lastThinking(res.sessionFile)));');
     expect(done.match(/sendText\(/g)?.length).toBe(5);
     expect(done.match(/\[\], startedAt, fmRun/g)?.length).toBe(5);
     expect(src).toContain("const dashLine = noDash ? \"\" : dashboardLine(text, runStartMs, runId);");

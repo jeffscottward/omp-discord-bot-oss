@@ -25,7 +25,7 @@ Afterwards, empty legacy archive categories are deleted (--drop-categories).
 Usage: purge-archive.py [--dry-run] [--json] [--drop-categories] [--ignore-learned] [--empty-dupes]
 --ignore-learned: owner override (2026-10-24): delete without waiting for the learners; protected holds (open card, ask menu, queued job, keep list) still apply; OMP logs stay on disk.
 --empty-dupes (owner 2026-10-25, hourly timer): also delete a closed pane channel (agents.json entry archived, no live
-  pane uses it) in a pane mirror category (mirror.categories.local/peer, mirror.overflow) that has NO OMP session log
+  pane uses it) in a pane mirror category (mirror.categories.local/peer, mirror.overflow/overflowSecond, mirror.stackCategories) that has NO OMP session log
   and NO message or thread (nothing to learn, nothing to copy). Without it such a channel is held forever: after the
   2026-10-24 reboots the P6 resume opened duplicate tabs, the mirror made 20 empty duplicate channels for them, and the
   full 🖥️ Main category (50/50) then blocked every new pane channel. The delete step re-reads the messages and threads
@@ -199,7 +199,9 @@ def main():
     guild = cfg["guildId"]
     arch = [x for x in [cfg.get("mirror", {}).get("categories", {}).get("archive")] + cfg.get("mirror", {}).get("archives", []) if x]
     mcfg = cfg.get("mirror", {})
-    PANE_CATS.update(x for x in [(mcfg.get("categories") or {}).get("local"), (mcfg.get("categories") or {}).get("peer")] + (mcfg.get("overflow") or []) if x)
+    PANE_CATS.update(x for x in [(mcfg.get("categories") or {}).get("local"), (mcfg.get("categories") or {}).get("peer")] + (mcfg.get("overflow") or []) + (mcfg.get("overflowSecond") or []) if x)
+    # Owner 2026-10-30 (card bot-upgrades-1030): main pane channels also live in one category per stack.
+    PANE_CATS.update(x for ids in (mcfg.get("stackCategories") or {}).values() if isinstance(ids, list) for x in ids if isinstance(x, str) and x)
     # Standing channels: keepChannelIds plus every configured channel id (FIRSTMATE, needs-you, alerts, voice, ...).
     # Names are not used: closed pane channels named like "...-firstmate-sweep" are ordinary side channels.
     keep = set(cfg.get("keepChannelIds", []))

@@ -84,6 +84,7 @@ ITEMS = os.path.join(HERE, "items.json")
 RUNNING = os.path.join(HERE, "running.json")
 LOG = os.path.join(HERE, "autoclear.log")
 IDLE = os.path.join(HERE, "idle.json")
+HOLD = os.path.join(HERE, "hold.json")  # owner holds {"cards": {id: reason}}: never edited, never listed as idle
 IDLE_S = 2 * 3600  # R10: a partial card unchanged this long, with no job and no open blocker, is idle
 RECEIPTS = os.path.join(HERE, "receipts")
 RESULTS = ("done", "failed", "blocked")
@@ -93,8 +94,8 @@ QCACHE = os.path.join(HOME, ".cache/fm-autoclear/answers.json")
 FM = os.environ.get("FM_BIN") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "fm")
 BOT_ENV = os.environ.get("OMP_BOT_ENV") or os.path.join(HOME, ".config/omp-discord/bot.env")
 # Cards in these areas, or with these words in the title, are never changed automatically (log only).
-SKIP_AREAS = {x.strip().lower() for x in (os.environ.get("FM_SKIP_AREAS") or "finance").split(",") if x.strip()}
-SKIP_WORDS = re.compile(r"\b(" + (os.environ.get("FM_SKIP_WORDS") or "order|trade|finance") + r")\b", re.I)
+SKIP_AREAS = {x.strip().lower() for x in (os.environ.get("FM_SKIP_AREAS") or "").split(",") if x.strip()}  # owner 2026-10-31: no area is exempt by default
+SKIP_WORDS = re.compile(r"\b(" + os.environ["FM_SKIP_WORDS"] + r")\b", re.I) if os.environ.get("FM_SKIP_WORDS") else re.compile(r"(?!x)x")  # opt-in; default matches nothing
 # Host labels in job tags ("<host>:<unit>"): this machine, plus the optional read-only peer host (build-running.py).
 LOCAL_HOST = os.environ.get("FM_HOST_LABEL") or "local"
 HOSTS = {LOCAL_HOST} | ({os.environ["FM_PEER_HOST"]} if os.environ.get("FM_PEER_HOST") else set())
@@ -132,6 +133,14 @@ def finance(it):
         return True  # time gates clear themselves on their date; never auto-close them
     # Owner 2026-10-22: "finance" is decided by the card's area only, never by title words.
     return str(it.get("area", "")).lower() in SKIP_AREAS
+
+
+def holds():
+    """Owner hold list (hold.json): cards the owner reviews himself."""
+    try:
+        return dict(json.load(open(HOLD)).get("cards") or {})
+    except Exception:
+        return {}
 
 
 def report_path(l):
@@ -283,6 +292,8 @@ def _decide(it, ctx):
     iid, s, note = it.get("id"), it.get("s"), it.get("n", "") or ""
     if not iid or s == "done" or it.get("until") or str(iid).startswith("gate-"):
         return []  # time gates clear themselves on their date; never touched, not even by a receipt
+    if iid in ctx.get("holds", {}):
+        return []  # owner hold (hold.json): the owner reviews this card himself; never edited
     # R11 receipt: a new worker-done receipt closes the card by contract (before every other rule).
     # Owner 2026-10-22: this also applies to finance cards (tracker only; it never touches orders).
     rec = ctx.get("receipt", lambda _i: None)(iid)
@@ -370,7 +381,10 @@ def idle_scan(items, ctx):
         if not iid or it.get("s") != "partial":
             continue
         if finance(it):
-            skipped.append({"id": iid, "reason": "finance card: verify only, no automatic sweep"})
+            skipped.append({"id": iid, "reason": "time gate or skipped area: no automatic sweep"})
+            continue
+        if iid in ctx.get("holds", {}):
+            skipped.append({"id": iid, "reason": "owner hold: " + str(ctx["holds"][iid])[:80]})
             continue
         open_bb = [b for b in as_list(it.get("blockedBy")) if state.get(b) not in (None, "done")]
         if open_bb:
@@ -520,7 +534,7 @@ def main(dry):
         run = {}
     fresh = time.time() - os.path.getmtime(RUNNING) < 300 if os.path.exists(RUNNING) else False
     ctx = {"jobs": run.get("jobs") or [], "jobs_ok": bool(run.get("jobsOk")) and fresh,
-           "item_jobs": run.get("itemJobs") or {}, "services": run.get("services") or [], "file": real_file,
+           "item_jobs": run.get("itemJobs") or {}, "services": run.get("services") or [], "file": real_file, "holds": holds(),
            "l_count": __import__("collections").Counter(i.get("l") for i in items if i.get("l")), "answer": make_answer(), "unit": real_unit,
            "receipt": real_receipt}
     try:

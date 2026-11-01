@@ -56,3 +56,23 @@ test("imageOnly: PNG, no page directory", async () => {
   expect(existsSync(r.files[0]!.path)).toBe(true);
   for (const d of r.tmpDirs ?? []) rmSync(d, { recursive: true, force: true });
 });
+
+test("lastThinking reads the last level and marks auto picks", () => {
+  const { lastThinking, modelWithThinking } = require("../src/replytail.ts");
+  const log = [
+    '{"type":"thinking_level_change","id":"a","thinkingLevel":"low","configured":"auto"}',
+    '{"type":"message","x":1}',
+    '{"type":"thinking_level_change","id":"b","runtime":{"version":"1"},"thinkingLevel":"high","configured":"auto"}',
+  ].join("\n");
+  expect(lastThinking("f", () => log)).toBe("high (auto)");
+  expect(lastThinking("f", () => '{"type":"thinking_level_change","thinkingLevel":"xhigh"}')).toBe("xhigh");
+  expect(lastThinking(undefined)).toBeUndefined();
+  expect(lastThinking("/nope/missing.jsonl")).toBeUndefined();
+  expect(modelWithThinking("m", "high (auto)")).toBe("m\n- 🧩 thinking high (auto)");
+  expect(modelWithThinking("m", undefined)).toBe("m");
+});
+
+test("thinking level is its own bullet in the tail", () => {
+  const { modelWithThinking } = require("../src/replytail.ts");
+  expect(buildTail(modelWithThinking("anthropic/claude-opus-5-5", "low (auto)"), "⚓ d")).toBe("- 🧠 anthropic/claude-opus-5-5\n- 🧩 thinking low (auto)\n- ⚓ d");
+});

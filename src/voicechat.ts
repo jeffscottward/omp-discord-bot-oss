@@ -44,6 +44,18 @@ export interface VoiceChatOptions {
   log: (...a: unknown[]) => void;
 }
 
+/** What happened to one spoken answer: played, cut off by the owner (barge-in), or not played at all. */
+// "missed": the owner left before it was spoken; it is kept and said when the owner rejoins (card voicecall-drop).
+export type SpeakResult = "said" | "interrupted" | "failed" | "missed";
+/** Card voicecall-drop (2026-10-31): an answer that arrives while the call reconnects waits this long for it. */
+export const RECONNECT_WAIT_MS = 45_000;
+/** Card voicecall-drop (rejoin, 2026-10-31): hold music never runs longer than this without a spoken progress line. */
+export const HOLD_CUE_MS = 45_000;
+export const HOLD_CUE_TEXT = "Still working on it.";
+/** An answer that finished after the owner left is said on the next join within this time. */
+export const MISSED_TTL_MS = 15 * 60_000;
+export const MISSED_LEAD_TEXT = "Here is the answer that came in after you left.";
+
 const BARGE_PACKETS = 20; // 20 ms frames: ~0.4 s of continuous speech
 export class VoiceChat {
   private readonly opts: VoiceChatOptions;
@@ -54,7 +66,18 @@ export class VoiceChat {
   private timer: NodeJS.Timeout | undefined;
   private utterance: OggOpusFile | null = null;
   /** Ready-to-play files (48 kHz stereo Ogg Opus), played strictly in order. */
-  private readonly queue: string[] = [];
+  private readonly queue: { file: string; done: (r: SpeakResult) => void; cue?: boolean; resumeHold?: string[] }[] = [];
+  /** Answers that finished after the owner left (newest last); said on the next join. */
+  private missed: { file: string; at: number }[] = [];
+  private holdCueTimer: NodeJS.Timeout | undefined;
+  protected holdCueMs = HOLD_CUE_MS;
+  /** Card voice-answer-closes-menu (owner 2026-10-31): hold music never plays longer than this without a run ending it. */
+  protected holdMaxMs = 10 * 60_000;
+  private holdMaxTimer: NodeJS.Timeout | undefined;
+  /** Start of the current hold session; a resume after a progress line keeps it, so the max is not pushed back. */
+  private holdSince = 0;
+  /** A consumed menu answer blocks a hold that "One moment." queued until this time. */
+  private noHoldUntil = 0;
   private pumping = false;
   /** We are talking until this moment, so the microphone echo of our own voice is dropped. */
   private speakingUntil = 0;
@@ -204,6 +227,39 @@ export class VoiceChat {
     const c = this.connection;
     if (c) this.pingTimer = setInterval(() => this.dbg?.ev("ping", { ws: c.ping.ws ?? null, udp: c.ping.udp ?? null }), 5_000);
     this.opts.log("voice: owner joined; voice mode on");
+    void this.replayMissed();
+  }
+
+  /** Keep an unspoken answer for the next join (at most 3, newest kept). */
+  private keepMissed(file: string): void {
+    this.missed.push({ file, at: Date.now() });
+    for (const old of this.missed.splice(0, Math.max(0, this.missed.length - 3))) rmSync(dirname(old.file), { recursive: true, force: true });
+    this.opts.log("voice: answer finished after the owner left; kept for the next join");
+  }
+
+  /** The owner is back: say the answers that came in while away (fresh ones only), after one lead-in line. */
+  private async replayMissed(): Promise<void> {
+    const all = this.missed.splice(0);
+    const fresh = all.filter((m) => Date.now() - m.at < MISSED_TTL_MS);
+    for (const m of all) if (!fresh.includes(m)) rmSync(dirname(m.file), { recursive: true, force: true });
+    if (!fresh.length) return;
+    this.opts.log(`voice: saying ${fresh.length} answer(s) missed while the owner was away`);
+    const lead = await this.synth(MISSED_LEAD_TEXT).catch(() => null);
+    const leadReady = lead ? await this.toDiscordOpus(lead) : null;
+    if (lead) rmSync(dirname(lead), { recursive: true, force: true });
+    if (!this.ownerHere) {
+      this.missed.unshift(...fresh);
+      if (leadReady) rmSync(dirname(leadReady), { recursive: true, force: true });
+      return;
+    }
+    if (leadReady) this.queue.push({ file: leadReady, done: () => {}, cue: true });
+    for (const m of fresh) this.queue.push({ file: m.file, done: () => {} });
+    void this.pump();
+  }
+
+  /** Text to speech (a test can replace it). */
+  protected synth(text: string): Promise<string | null> {
+    return synthesize(text);
   }
 
   /** The owner left: end the session, stop any audio, stay connected. */
@@ -216,11 +272,21 @@ export class VoiceChat {
     if (this.dbg) this.opts.log(`voice: debug capture saved -> ${this.dbg.dir}`);
     this.dbg = null;
     this.holdOn = false;
+    clearTimeout(this.holdMaxTimer);
+    clearInterval(this.holdCueTimer);
     this.holdAfterSpeech = null;
     this.holdResource = null;
     this.utterance = null;
     this.seg.reset();
-    for (const f of this.queue.splice(0)) rmSync(dirname(f), { recursive: true, force: true });
+    for (const q of this.queue.splice(0)) {
+      if (q.cue) {
+        rmSync(dirname(q.file), { recursive: true, force: true });
+        q.done("failed");
+      } else {
+        this.keepMissed(q.file);
+        q.done("missed");
+      }
+    }
     try {
       this.player.stop(true);
     } catch {}
@@ -299,7 +365,10 @@ export class VoiceChat {
     this.bargedIn = true;
     this.dbg?.ev("barge-in", { packets: kept.length });
     this.opts.log(`voice: owner interrupted; stopping speech (${this.queue.length} queued dropped)`);
-    for (const f of this.queue.splice(0)) rmSync(dirname(f), { recursive: true, force: true });
+    for (const q of this.queue.splice(0)) {
+      rmSync(dirname(q.file), { recursive: true, force: true });
+      q.done("interrupted");
+    }
     this.speakingUntil = 0;
     this.seg.reset();
     this.utterance = new OggOpusFile();
@@ -343,8 +412,8 @@ export class VoiceChat {
 
   /** Say something that was not posted as text (the voice-only question prompts). */
   async speak(text: string): Promise<void> {
-    if (!this.active) return;
-    const file = await synthesize(text);
+    if (!this.ownerHere) return;
+    const file = await this.synth(text);
     if (!file) return;
     try {
       await this.speakFile(file);
@@ -357,16 +426,45 @@ export class VoiceChat {
    * Play an existing TTS file (the same .ogg posted as the 🔊 attachment). It is re-encoded into
    * the queue's own temp dir, so the caller can delete the original straight away.
    */
-  async speakFile(src: string): Promise<void> {
-    if (!this.active) return;
+  async speakFile(src: string): Promise<SpeakResult> {
+    // Card voicecall-drop: the owner counts, not the connection. During a reconnect (connection null for a
+    // few seconds) the answer waits in the queue; pump() waits for the call to be ready again.
     const ready = await this.toDiscordOpus(src);
-    if (!ready) return;
-    this.queue.push(ready);
+    if (!ready) return "failed";
+    if (!this.ownerHere) {
+      this.keepMissed(ready);
+      return "missed";
+    }
+    const { promise, resolve } = Promise.withResolvers<SpeakResult>();
+    this.queue.push({ file: ready, done: resolve });
     void this.pump();
+    return promise;
+  }
+
+  /** True when audio can go out now: connected, Ready, and the player subscribed. */
+  protected connectedReady(): boolean {
+    return this.connection !== null && this.connection.state.status === VoiceConnectionStatus.Ready;
+  }
+
+  /** Wait (polling) until the call is ready again after a drop; false after `ms` or when the owner leaves. */
+  protected async waitReady(ms: number): Promise<boolean> {
+    const end = Date.now() + ms;
+    while (!this.connectedReady()) {
+      if (!this.ownerHere || Date.now() >= end) return false;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return true;
+  }
+
+  /** Play one ready file to the end. Throws when it does not start or does not finish. */
+  protected async playOne(file: string): Promise<void> {
+    this.player.play(createAudioResource(createReadStream(file), { inputType: StreamType.OggOpus }));
+    await entersState(this.player, AudioPlayerStatus.Playing, 10_000);
+    await entersState(this.player, AudioPlayerStatus.Idle, 10 * 60_000);
   }
 
   /** Re-encode to what the voice gateway wants: 48 kHz stereo Ogg Opus. */
-  private toDiscordOpus(src: string): Promise<string | null> {
+  protected toDiscordOpus(src: string): Promise<string | null> {
     const dir = mkdtempSync(join(tmpdir(), "voice-say-"));
     const out = join(dir, "say.ogg");
     const { promise, resolve } = Promise.withResolvers<string | null>();
@@ -405,14 +503,17 @@ export class VoiceChat {
   }
 
   /** Start hold music (preferred clip first, random point, 2 s fade-in) until stopHold() or speech. */
-  startHold(tracks: string[]): void {
-    if (!this.connection || !tracks.length || this.holdOn) return;
+  startHold(tracks: string[], resumedAfterCue = false): void {
+    if (!this.hasConnection() || !tracks.length || this.holdOn || Date.now() < this.noHoldUntil) return;
     // Still saying "One moment.": start right after it finishes (see pump()).
     if (this.pumping) {
       this.holdAfterSpeech = tracks;
       return;
     }
     this.holdOn = true;
+    clearTimeout(this.holdMaxTimer);
+    if (!resumedAfterCue || !this.holdSince) this.holdSince = Date.now();
+    this.holdMaxTimer = setTimeout(() => void this.holdTimedOut(), Math.max(0, this.holdSince + this.holdMaxMs - Date.now()));
     // Owner preference 2026-10-14: the Cowboy Bebop mix (SJdPa6Tua4k) plays first; others follow.
     const fav = tracks.filter((t) => t.includes("SJdPa6Tua4k"));
     const rest = tracks.filter((t) => !fav.includes(t)).sort(() => Math.random() - 0.5);
@@ -422,6 +523,41 @@ export class VoiceChat {
     const room = Math.max(0, this.duration(this.holdTrack) - 120); // leave at least 2 min to play
     this.holdOffset = Math.floor(Math.random() * room);
     this.playHold("afade=t=in:d=2");
+    clearInterval(this.holdCueTimer);
+    this.holdCueTimer = setInterval(() => void this.holdCue(), this.holdCueMs);
+    this.opts.log(`voice: hold music on; progress line every ${this.holdCueMs} ms`);
+  }
+
+  /** Hold music has played for holdCueMs: say one short progress line, then the music goes on. */
+  private async holdCue(): Promise<void> {
+    if (!this.holdOn || this.pumping || !this.ownerHere) {
+      this.opts.log(`voice: progress line skipped (holdOn=${this.holdOn} pumping=${this.pumping} ownerHere=${this.ownerHere})`);
+      return;
+    }
+    const tracks = this.holdList;
+    const file = await this.synth(HOLD_CUE_TEXT).catch(() => null);
+    if (!file) {
+      this.opts.log("voice: progress line skipped (speech synthesis failed)");
+      return;
+    }
+    try {
+      const ready = await this.toDiscordOpus(file);
+      if (!ready || !this.holdOn || !this.ownerHere) {
+        if (ready) rmSync(dirname(ready), { recursive: true, force: true });
+        this.opts.log(`voice: progress line dropped (ready=${!!ready} holdOn=${this.holdOn} ownerHere=${this.ownerHere})`);
+        return;
+      }
+      this.opts.log("voice: progress line queued");
+      this.dbg?.ev("hold-cue");
+      this.queue.push({ file: ready, done: () => {}, cue: true, resumeHold: tracks });
+      void this.pump();
+    } finally {
+      rmSync(dirname(file), { recursive: true, force: true });
+    }
+  }
+
+  protected hasConnection(): boolean {
+    return this.connection !== null;
   }
 
   private holdList: string[] = [];
@@ -438,7 +574,7 @@ export class VoiceChat {
     return d;
   }
 
-  private playHold(filter: string): void {
+  protected playHold(filter: string): void {
     this.holdResource = this.clip(this.holdTrack, this.holdOffset, filter);
     this.dbg?.ev("hold-start", { track: this.holdTrack.split("/").pop(), offset: this.holdOffset });
     this.player.play(this.holdResource);
@@ -454,11 +590,43 @@ export class VoiceChat {
     this.playHold("anull");
   }
 
+  /** True while hold music plays or waits to start after the current speech. */
+  get holding(): boolean {
+    return this.holdOn || this.holdAfterSpeech !== null;
+  }
+
+  /** Hold ran holdMaxMs with no run ending it: stop it and say so once. */
+  private async holdTimedOut(): Promise<void> {
+    if (!this.holdOn) return;
+    this.holdSince = 0;
+    this.opts.log(`voice: hold music stopped after the ${Math.round(this.holdMaxMs / 60_000)} min limit`);
+    await this.stopHold();
+    await this.speak("I stopped the hold music. The answer will show in Discord.").catch(() => {});
+  }
+
+  /**
+   * Card voice-answer-closes-menu (owner 2026-10-31): the voice turn was a menu answer, not a run. Cancel the hold that
+   * "One moment." queued and say one short confirmation instead.
+   */
+  async confirmInstead(text: string): Promise<void> {
+    // The "One moment." -> startHold chain may still be pending: block it, whatever the order.
+    this.noHoldUntil = Date.now() + 15_000;
+    await this.stopHold();
+    await this.speak(text).catch(() => {});
+    await this.stopHold();
+  }
+
   /** Fade the hold music out (1.5 s) and wait until it is silent. Safe to call when not playing. */
   async stopHold(): Promise<void> {
     this.holdAfterSpeech = null;
+    clearInterval(this.holdCueTimer);
+    clearTimeout(this.holdMaxTimer);
     if (!this.holdOn) return;
     this.holdOn = false;
+    await this.fadeOutHold();
+  }
+
+  protected async fadeOutHold(): Promise<void> {
     const pos = this.holdOffset + (this.holdResource?.playbackDuration ?? 0) / 1000;
     this.dbg?.ev("hold-stop", { playedMs: this.holdResource?.playbackDuration ?? 0 });
     this.holdResource = null;
@@ -478,23 +646,43 @@ export class VoiceChat {
     this.pumping = true;
     // Speech wins: fade any hold music out before the first utterance.
     await this.stopHold();
+    let resume: string[] | null = null;
     try {
-      while (this.queue.length && this.active) {
-        const file = this.queue.shift()!;
+      while (this.queue.length && this.ownerHere) {
+        const item = this.queue.shift()!;
+        resume = item.resumeHold ?? null;
+        const file = item.file;
+        let result: SpeakResult = "failed";
         this.speakingUntil = Number.MAX_SAFE_INTEGER; // reset below, once we stop talking
         const startedAt = Date.now();
         try {
-          this.dbg?.clip(file, "speech");
-          this.player.play(createAudioResource(createReadStream(file), { inputType: StreamType.OggOpus }));
-          await entersState(this.player, AudioPlayerStatus.Playing, 10_000);
-          this.dbg?.ev("speech-playing", { msToStart: Date.now() - startedAt });
-          await entersState(this.player, AudioPlayerStatus.Idle, 10 * 60_000);
-          this.dbg?.ev("speech-done", { ms: Date.now() - startedAt });
-          this.opts.log(`voice: said ${Date.now() - startedAt} ms (${this.queue.length} waiting)`);
-        } catch (e) {
-          this.opts.log(`voice play: ${(e as Error).message}`);
+          // Card voicecall-drop: a drop (e.g. during hold music) makes the player lose its subscriber, and
+          // a play then fails at once. Wait for the rejoin, and try once more if the call drops mid-answer.
+          for (let attempt = 1; attempt <= 2 && result === "failed"; attempt++) {
+            if (!(await this.waitReady(RECONNECT_WAIT_MS))) {
+              this.opts.log(`voice: call not ready after ${RECONNECT_WAIT_MS} ms; answer not spoken`);
+              break;
+            }
+            try {
+              this.dbg?.clip(file, "speech");
+              await this.playOne(file);
+              this.dbg?.ev("speech-done", { ms: Date.now() - startedAt });
+              this.opts.log(`voice: said ${Date.now() - startedAt} ms (${this.queue.length} waiting)`);
+              result = "said";
+            } catch (e) {
+              if (this.bargedIn) { result = "interrupted"; break; }
+              this.opts.log(`voice play (attempt ${attempt}): ${(e as Error).message}`);
+            }
+          }
         } finally {
-          rmSync(dirname(file), { recursive: true, force: true });
+          if (result === "failed" && this.bargedIn) result = "interrupted";
+          if (result === "failed" && !this.ownerHere && !item.cue) {
+            this.keepMissed(file); // the owner left while it waited: say it on the next join
+            item.done("missed");
+          } else {
+            item.done(result);
+            rmSync(dirname(file), { recursive: true, force: true });
+          }
           if (this.bargedIn) {
             this.bargedIn = false; // keep the owner's words that are being recorded
           } else {
@@ -504,11 +692,22 @@ export class VoiceChat {
           }
         }
       }
+      // Owner left with answers still queued: report them as not spoken.
+      for (const q of this.queue.splice(0)) {
+        if (q.cue) {
+          rmSync(dirname(q.file), { recursive: true, force: true });
+          q.done("failed");
+        } else {
+          this.keepMissed(q.file);
+          q.done("missed");
+        }
+      }
     } finally {
       this.pumping = false;
     }
-    const pending = this.holdAfterSpeech;
+    const fresh = this.holdAfterSpeech;
+    const pending = fresh ?? (this.ownerHere ? resume : null);
     this.holdAfterSpeech = null;
-    if (pending) this.startHold(pending);
+    if (pending) this.startHold(pending, !fresh);
   }
 }

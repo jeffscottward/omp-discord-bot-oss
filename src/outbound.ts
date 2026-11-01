@@ -36,6 +36,25 @@ function proseMessages(raw: string): OutMsg[] {
  * their own messages containing only the fenced block; a block too long for one message is
  * attached as a .txt instead. The prose around them stays in normal messages.
  */
+/** Card empty-answer-fix (owner 2026-10-31): true when the answer has no prose left to post. */
+export function isBlankAnswer(text: string): boolean {
+  return !tablesToCode(text.trim()).trim();
+}
+
+/**
+ * Card empty-answer-fix: decide what an answer without prose posts. Prose messages are skipped when the answer is
+ * blank; files/audio/links still go out in a message without placeholder text. `fallback` is the one real line to post
+ * only when nothing at all was posted (for example an ask-only answer whose questions were all dropped).
+ */
+export function emptyAnswerPlan(o: { prose: string; files: number; audio: boolean; links: number }): { blank: boolean; carrier: boolean } {
+  const blank = isBlankAnswer(o.prose);
+  return { blank, carrier: blank && (o.files > 0 || o.audio || o.links > 0) };
+}
+export const EMPTY_FALLBACK = "↩️ No new text or question: the owner already answered this earlier.";
+export function emptyAnswerFallback(blank: boolean, postedCount: number): string | undefined {
+  return blank && postedCount === 0 ? EMPTY_FALLBACK : undefined;
+}
+
 export function prepareOutbound(text: string): Outbound {
   const r = redact(tablesToCode(text.trim()) || "(empty answer)");
   const known = redactKnownSecrets(r.text);

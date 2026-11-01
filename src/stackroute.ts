@@ -12,6 +12,7 @@ import { readCards } from "./masterqueue.ts";
 import {
   cardAreasFor,
   GENERAL,
+  mergeStacks,
   loadRouterState,
   routeMessage,
   routeNote,
@@ -24,6 +25,7 @@ import {
   type RouterState,
   type StackDef,
 } from "./router.ts";
+import { catalogMtime, parseCatalog, readCatalogEntries } from "./stackcatalog.ts";
 
 const QUIET = { flags: MessageFlags.SuppressNotifications as const, allowedMentions: { parse: [] as [] } };
 
@@ -43,14 +45,53 @@ export class StackRouter {
 
   constructor(
     readonly cfg: RouterConfig,
-    private readonly opts: { stateFile: string; statusFile: string; itemsFile: string; guildId: string; judge?: Judge; log: (s: string) => void },
+    private readonly opts: {
+      stateFile: string;
+      statusFile: string;
+      itemsFile: string;
+      guildId: string;
+      judge?: Judge;
+      log: (s: string) => void;
+      /** The stack catalog (src/stackcatalog.ts): re-read by refresh() when it changes. */
+      catalogFile?: string;
+      /** Legacy config.json `router.stacks`, merged under the catalog. */
+      legacyStacks?: Partial<StackDef>[];
+    },
   ) {
     this.st = loadRouterState(opts.stateFile);
     this.tracker = new StackTracker(cfg, opts.statusFile);
     this.tracker.threads = this.st.threads;
+    this.refresh();
+  }
+
+  private catalogAt = -1;
+  /**
+   * Owner 2026-10-28: re-read the stack catalog when its file changed (scripts/stack-add.ts or fm-spawn's
+   * auto-create added a stack), so a new stack routes at once without a bot restart. Mutates cfg.stacks in place
+   * (StackTracker and main share this cfg object). Returns true when the stacks were reloaded.
+   */
+  refresh(): boolean {
+    const file = this.opts.catalogFile;
+    if (!file) return false;
+    const at = catalogMtime(file);
+    if (at === this.catalogAt) return false;
+    this.catalogAt = at;
+    const before = this.cfg.stacks.length;
+    let entries: Record<string, unknown>[];
+    try {
+      entries = readCatalogEntries(file);
+    } catch (e) {
+      // A broken hand-edit must not drop the routing to the code defaults: keep the stacks we have.
+      this.opts.log(`router: stack catalog ${file} unreadable, keeping ${before} stacks: ${(e as Error).message}`);
+      return false;
+    }
+    this.cfg.stacks = mergeStacks([...(this.opts.legacyStacks ?? []), ...parseCatalog(entries).stacks]);
+    this.opts.log(`router: stack catalog loaded: ${this.cfg.stacks.length} stacks (was ${before})`);
+    return true;
   }
 
   stack(name: string): StackDef | undefined {
+    this.refresh();
     return this.cfg.stacks.find((s) => s.name === name);
   }
   stackByThread(threadId: string | null | undefined): StackDef | undefined {
@@ -79,6 +120,7 @@ export class StackRouter {
   }
 
   async decide(text: string, ctx: RouteContext): Promise<RouteDecision> {
+    this.refresh();
     const t0 = Date.now();
     const d = await routeMessage(text, ctx, this.cfg, this.opts.judge);
     this.opts.log(`router: → ${d.stack} by=${d.by} conf=${d.confidence.toFixed(2)} (${d.detail}) ms=${Date.now() - t0}`);

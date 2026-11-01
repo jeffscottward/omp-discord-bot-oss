@@ -29,13 +29,13 @@ const MWB = "~/Github/finance/example-bot";
 
 // Each probe prints "<name>=<rc>" (rc 0 = the action succeeded).
 const MUST_FAIL: [string, string][] = [
-  ["ibapi_gateway_public", PY_CONNECT("1.2.3.4", 4003)],
-  ["ibapi_gateway_tailnet", PY_CONNECT("100.64.0.10", 4003)],
-  ["ibapi_gateway_name", PY_CONNECT("ib-gateway", 4004)],
-  ["ssh_vps_docker", "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 remote 'docker exec broker-nautilus-exec-node-watchdog-1 true'"],
-  ["ssh_vps_ip", "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 root@1.2.3.4 true"],
+  ["broker_gateway_public", PY_CONNECT("1.2.3.4", 4443)],
+  ["broker_gateway_tailnet", PY_CONNECT("100.64.0.10", 4443)],
+  ["broker_gateway_name", PY_CONNECT("broker-gateway", 4444)],
+  ["ssh_remote_docker", "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 remote 'docker exec exec-node-watchdog-1 true'"],
+  ["ssh_remote_ip", "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 root@1.2.3.4 true"],
   ["ssh_via_proxy", "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ProxyCommand='socat - PROXY:127.0.0.1:%h:%p,proxyport=3128' root@1.2.3.4 true"],
-  ["ssh_mac", "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 peer-host true"],
+  ["ssh_peer", "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 peer-host true"],
   ["ssh_key_visible", "ls ~/.ssh | grep -qv -e '^config$' -e '^known_hosts$'"],
   ["sudo_real", "/usr/bin/sudo -n true"],
   ["sudo_wrapper", "sudo -n true"],

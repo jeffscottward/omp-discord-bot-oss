@@ -155,16 +155,16 @@ describe("git notes in the status (owner 2026-10-15)", () => {
 
 test("channel titles get a topic emoji (owner 2026-10-17)", async () => {
   const { channelTitle } = await import("../src/mirror.ts");
-  expect(channelTitle("primary-github-firstmate", "primary")).toBe("👷‍♂️-primary-github-firstmate");
-  expect(channelTitle("primary-github-kb-notes", "primary")).toBe("📚-primary-github-kb-notes");
-  expect(channelTitle("primary-github-example-app", "primary")).toBe("🧩-primary-github-example-app");
-  expect(channelTitle("peer-home-misc", "peer")).toBe("💻-peer-home-misc");
-  expect(channelTitle("primary-github-harness-dev", "primary")).toBe("🧰-primary-github-harness-dev");
+  expect(channelTitle("main-github-firstmate", "main")).toBe("👷‍♂️-main-github-firstmate");
+  expect(channelTitle("main-github-kb-notes", "main")).toBe("📚-main-github-kb-notes");
+  expect(channelTitle("main-github-webapp-research", "main")).toBe("📊-main-github-webapp-research");
+  expect(channelTitle("second-home-misc", "second")).toBe("💻-second-home-misc");
+  expect(channelTitle("main-github-harness-dev", "main")).toBe("🧰-main-github-harness-dev");
 });
 
 test("channels sort by emoji group, then name (owner 2026-10-17)", async () => {
   const { channelTitle, sortKey } = await import("../src/mirror.ts");
-  const names = ["primary-github-example-app", "primary-github-firstmate", "primary-github-kb-notes", "primary-github-harness", "primary-github-zzz"];
-  const sorted = names.map((n) => channelTitle(n, "primary")).sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
-  expect(sorted).toEqual(["👷‍♂️-primary-github-firstmate", "📚-primary-github-kb-notes", "🧩-primary-github-example-app", "🧰-primary-github-harness", "🤖-primary-github-zzz"]);
+  const names = ["main-github-webapp-research", "main-github-firstmate", "main-github-kb-notes", "main-github-harness", "main-github-zzz"];
+  const sorted = names.map((n) => channelTitle(n, "main")).sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
+  expect(sorted).toEqual(["👷‍♂️-main-github-firstmate", "📚-main-github-kb-notes", "📊-main-github-webapp-research", "🧰-main-github-harness", "🤖-main-github-zzz"]);
 });

@@ -13,11 +13,15 @@
 import { spawn } from "node:child_process";
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { ChannelType, type Client, type Guild, type SendableChannels, type TextChannel } from "discord.js";
-import { CONFIG, FIRSTMATE_SESSION, GUILD_ID, STATE_DIR } from "./config.ts";
+import { dirname, join } from "node:path";
+import { ChannelType, ThreadAutoArchiveDuration, type Client, type Guild, type SendableChannels, type TextChannel, type ThreadChannel } from "discord.js";
+import { CONFIG, CONFIG_FILE, FIRSTMATE_SESSION, FM_DIR, GUILD_ID, STATE_DIR } from "./config.ts";
 import { askInfo, isQuestionReply, questionLine, type AskInfo, type PaneWait } from "./quickreply.ts";
 import { freshWatch, watchCheck, watchEvents, type WatchAction, type WatchState } from "./stall.ts";
+import { channelMention } from "./mention.ts";
+import { routerConfig, type StackDef } from "./router.ts";
+import { catalogMtime, loadCatalog } from "./stackcatalog.ts";
+import { categoryOrder, paneStack, parseStackCategories, stackCategoryName, type StackCard } from "./stackcats.ts";
 
 /** Internal machine keys: "main" is always this machine; "second" is the optional peer from config.mirror.peers[0]. */
 export type Machine = "main" | "second";
@@ -38,9 +42,71 @@ export function pickArchive(ids: string[], count: (id: string) => number): strin
 }
 /** Overflow categories for this machine's live pane channels (config.mirror.overflow), used in order. */
 export const OVERFLOW_IDS: string[] = CONFIG.mirror.overflow.filter(Boolean);
+/** Overflow categories for the second machine's live pane channels (config.mirror.overflowSecond). */
+export const OVERFLOW_IDS_SECOND: string[] = (CONFIG.mirror.overflowSecond ?? []).filter(Boolean);
+const overflowList = (m: string): string[] => (m === "main" ? OVERFLOW_IDS : OVERFLOW_IDS_SECOND);
+const overflowKey = (m: string): "overflow" | "overflowSecond" => (m === "main" ? "overflow" : "overflowSecond");
 /** First pane category with room: the machine's own category, then its overflow categories. */
 export function pickPaneCategory(ids: string[], count: (id: string) => number): string | undefined {
   return ids.find((id) => count(id) < CATEGORY_LIMIT);
+}
+/** Discord allows at most 500 channels (categories included) in one server; keep a margin. */
+export const GUILD_CHANNEL_LIMIT = 500;
+/** After a failed overflow-category create, wait this long before the next try (no create storm). */
+export const OVERFLOW_RETRY_MS = 60 * 60_000;
+/** Name of the next overflow category: "🖥️ Main" + 3 categories so far -> "🖥️ Main 4". */
+export function overflowName(baseName: string, existing: number): string {
+  return `${baseName.replace(/\s+\d+$/, "")} ${existing + 1}`;
+}
+/** Owner 2026-10-30 (card bot-upgrades-1030): at least this long between two category creates (one at a time). */
+export const STACK_CATEGORY_GAP_MS = 60_000;
+/** Channel moves into stack categories per sync pass (no PATCH burst). */
+export const MOVES_PER_PASS = 5;
+/** Every pane category in config.json: both machines' categories, their overflow and the stack categories. */
+export function paneCategoryIds(): Set<string> {
+  const stackIds = Object.values(parseStackCategories(CONFIG.mirror.stackCategories)).flat();
+  return new Set([CATEGORY_IDS.main, CATEGORY_IDS.second, ...OVERFLOW_IDS, ...OVERFLOW_IDS_SECOND, ...stackIds].filter(Boolean));
+}
+
+let stackCache: { at: number; stacks: StackDef[] } | null = null;
+/** Stacks for the split: code defaults + legacy config router.stacks + the catalog; re-read when the catalog changes. */
+function defaultStacks(): StackDef[] {
+  const at = catalogMtime();
+  if (!stackCache || stackCache.at !== at) stackCache = { at, stacks: routerConfig(CONFIG.router, loadCatalog().stacks).stacks };
+  return stackCache.stacks;
+}
+let cardCache: { file: string; at: number; cards: StackCard[] } | null = null;
+/** FIRSTMATE cards (items.json, read-only); re-read when the file changes. Unreadable: no cards. */
+function defaultCards(): StackCard[] {
+  const file = process.env.OMP_FM_ITEMS ?? join(FM_DIR, "items.json");
+  try {
+    const at = statSync(file).mtimeMs;
+    if (cardCache?.file === file && cardCache.at === at) return cardCache.cards;
+    const d: unknown = JSON.parse(readFileSync(file, "utf8"));
+    const items = d && typeof d === "object" && "items" in d && Array.isArray(d.items) ? (d.items as StackCard[]) : [];
+    cardCache = { file, at, cards: items.filter((x) => x && typeof x === "object") };
+    return cardCache.cards;
+  } catch {
+    return [];
+  }
+}
+/**
+ * Owner 2026-10-28: save the overflow category list in config.json `mirror.overflow` (backup first, 0600,
+ * tmp + rename), so a category the mirror created stays in use after a restart.
+ */
+export function saveOverflowIds(ids: string[], file = CONFIG_FILE, key: "overflow" | "overflowSecond" = "overflow"): void {
+  saveMirrorValue(key, [...ids], file);
+}
+/** Save one `mirror.<key>` value in config.json (backup first, 0600, tmp + rename). */
+export function saveMirrorValue(key: string, value: unknown, file = CONFIG_FILE): void {
+  const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
+  if (!raw || typeof raw !== "object") throw new Error("config.json is not an object");
+  const cfg = raw as Record<string, unknown>; // parsed config object; only `mirror` is read and replaced
+  const mirror = cfg.mirror && typeof cfg.mirror === "object" ? (cfg.mirror as Record<string, unknown>) : {};
+  cfg.mirror = { ...mirror, [key]: value };
+  writeFileSync(`${file}.before-overflow-${Date.now()}`, readFileSync(file), { mode: 0o600 });
+  writeFileSync(`${file}.tmp`, `${JSON.stringify(cfg, null, 2)}\n`, { mode: 0o600 });
+  renameSync(`${file}.tmp`, file);
 }
 /**
  * Owner 2026-10-24: a channel create that Discord rate-limits for longer than this fails at once (discord.js
@@ -48,7 +114,8 @@ export function pickPaneCategory(ids: string[], count: (id: string) => number): 
  */
 export const CREATE_WAIT_MAX_MS = 60_000;
 export function rejectLongChannelCreate(d: { method: string; route: string; timeToReset: number }): boolean {
-  return d.method.toUpperCase() === "POST" && d.route === "/guilds/:id/channels" && d.timeToReset > CREATE_WAIT_MAX_MS;
+  // Owner 2026-10-30: thread creates (🧵 jobs fallback) also fail at once instead of waiting hours inside sync.
+  return d.method.toUpperCase() === "POST" && (d.route === "/guilds/:id/channels" || d.route === "/channels/:id/threads") && d.timeToReset > CREATE_WAIT_MAX_MS;
 }
 /** A discord.js RateLimitError (thrown because of rejectOnRateLimit): its wait in ms, else null. */
 export function rateLimitWait(err: unknown): number | null {
@@ -86,10 +153,14 @@ export type MirrorEntry = {
   offset?: number;
   /** Live progress of the pane's current turn (owner 2026-10-15). */
   progress?: Progress;
+  /** Last thinking level seen in this session (kept while no turn is open, so the next status shows it). */
+  thinking?: string;
   /** Plan P5: open tool calls, stall line and automatic-continue state (src/stall.ts). */
   watch?: WatchState;
   /** Orca #2 (owner 2026-10-19): the pane waits for the owner; its card has quick-reply buttons. */
   wait?: PaneWait;
+  /** Owner 2026-10-30: the entry maps a public thread in the 🧵 jobs channel (channel creates were blocked). */
+  threadOnly?: boolean;
 };
 
 /** One tool step of a running turn, for the live status message. */
@@ -112,6 +183,8 @@ export type Progress = {
   git?: ProgressStep[];
   /** Owner 2026-10-19: "provider/model" of the pane's session (same lines as the bridge's Working message). */
   model?: string;
+  /** Owner 2026-10-31 (card reply-thinking-level): effective thinking level, "low (auto)" for a router pick. */
+  thinking?: string;
   /** Owner 2026-10-19: latest tool call, shown as the last line; `done` once its result arrived. */
   lastTool?: { ts: number; tool: string; intent: string; callId?: string; done: boolean };
 };
@@ -132,7 +205,9 @@ export type SessionEvent =
   | { kind: "stopped"; ts: number; reason: string; error?: string }
   | { kind: "git"; ts: number; label: string }
   /** Owner 2026-10-19: the model the session uses (model_change entry or an assistant message). */
-  | { kind: "model"; ts: number; model: string };
+  | { kind: "model"; ts: number; model: string }
+  /** Owner 2026-10-31: the thinking level from the last thinking_level_change entry. */
+  | { kind: "thinking"; ts: number; level: string };
 
 export type LivePane = { machine: Machine; paneId: string; tabId: string; workspace: string; tab: string; name: string; short?: string; cwd: string; sessionFile: string | null };
 
@@ -378,10 +453,17 @@ export function sessionEvents(chunk: Buffer, now = Date.now()): { events: Sessio
         id?: string;
         timestamp?: string;
         model?: unknown;
+        thinkingLevel?: unknown;
+        configured?: unknown;
         message?: { role?: string; stopReason?: string; content?: unknown; toolCallId?: string; isError?: boolean; errorMessage?: unknown; provider?: unknown; model?: unknown };
       };
       if (e.type === "model_change" && typeof e.model === "string") {
         events.push({ kind: "model", ts: e.timestamp ? Date.parse(e.timestamp) || now : now, model: e.model });
+        continue;
+      }
+      if (e.type === "thinking_level_change" && typeof e.thinkingLevel === "string" && e.thinkingLevel) {
+        const level = e.configured === "auto" ? `${e.thinkingLevel} (auto)` : e.thinkingLevel;
+        events.push({ kind: "thinking", ts: e.timestamp ? Date.parse(e.timestamp) || now : now, level });
         continue;
       }
       if (e.type !== "message" || !e.message) continue;
@@ -462,7 +544,10 @@ export function renderProgress(tab: string, p: Progress): string {
   const lines = p.steps.map((x) => (x.label.startsWith("💬 ") ? `${x.label}` : `• <t:${Math.floor(x.ts / 1000)}:t> ${x.label}`));
   const task = p.task ? [`📝 **Task:** ${p.task}`] : [];
   // Owner 2026-10-19: the same 🤖 Model and 🛠️ Last tool lines as the bridge's Working message.
-  const model = p.model ? [`🤖 Model: \`${p.model.replace(/[`*_~|<>@]/g, "").slice(0, 80)}\``] : [];
+  // Owner 2026-10-31: reasoning level on its own 🧠 line below the model line.
+  const model = p.model
+    ? [`🤖 Model: \`${p.model.replace(/[`*_~|<>@]/g, "").slice(0, 80)}\``, ...(p.thinking ? [`🧠 Reasoning: ${p.thinking.replace(/[`*_~|<>@]/g, "").slice(0, 30)}`] : [])]
+    : [];
   const lt = p.lastTool;
   const last = lt
     ? `🛠️ **Last tool:** \`${lt.tool.replace(/[`*_~|<>@]/g, "").slice(0, 30)}\`${lt.intent ? `: ${lt.intent}` : ""} · ${lt.done ? "done" : "running"} · called <t:${Math.floor(lt.ts / 1000)}:R>`
@@ -477,7 +562,7 @@ export function applyEvent(p: Progress | undefined, ev: SessionEvent): { p: Prog
     case "turn": {
       // A steering message during a running turn keeps the same status message.
       if (p?.state === "working") return { p, urgent: false };
-      return { p: { ...fresh(ev.ts), task: ev.text || undefined, model: p?.model }, urgent: false };
+      return { p: { ...fresh(ev.ts), task: ev.text || undefined, model: p?.model, thinking: p?.thinking }, urgent: false };
     }
     case "note": {
       const cur = p?.state === "working" ? p : fresh(ev.ts);
@@ -501,6 +586,9 @@ export function applyEvent(p: Progress | undefined, ev: SessionEvent): { p: Prog
     case "model":
       if (!p || p.model === ev.model) return { p, urgent: false };
       return { p: { ...p, model: ev.model }, urgent: false };
+    case "thinking":
+      if (!p || p.thinking === ev.level) return { p, urgent: false };
+      return { p: { ...p, thinking: ev.level }, urgent: false };
     case "reply":
     case "stopped":
       // No tool steps in this turn: no status message is needed, the reply says it all.
@@ -568,19 +656,204 @@ export class Mirror {
   alert: ((text: string) => void) | null = null;
   /** Categories already reported full in this bot run. */
   #fullAlerted = new Set<string>();
+  /** Category id -> time until it counts as full (Discord said full while the cache count was lower). */
+  #fullUntil = new Map<string, number>();
   #categoryFull(key: string, text: string): void {
     if (this.#fullAlerted.has(key)) return;
     this.#fullAlerted.add(key);
     this.alert?.(`⚠️ Discord category limit: ${text}.`);
   }
-  /** Owner 2026-10-24: Discord blocked channel creates until this time (ms); the sync skips creates until then. */
-  createPausedUntil = 0;
+  /** Owner 2026-10-24: Discord blocked channel creates until this time (ms); the sync skips creates until then.
+   * Owner 2026-10-30: saved in create-pause.json next to agents.json, so a restart does not send a refused create. */
+  #pausedUntil = 0;
+  get createPausedUntil(): number {
+    return this.#pausedUntil;
+  }
+  set createPausedUntil(v: number) {
+    this.#pausedUntil = v;
+    try {
+      mkdirSync(dirname(this.file), { recursive: true });
+      const f = join(dirname(this.file), "create-pause.json");
+      writeFileSync(`${f}.tmp`, JSON.stringify({ until: v }), { mode: 0o600 });
+      renameSync(`${f}.tmp`, f);
+    } catch (e) {
+      log(`saving create pause failed: ${(e as Error).message}`);
+    }
+  }
+  /** Text channel that holds pane threads while creates are blocked (config mirror.threadHome). */
+  threadHome: string = CONFIG.mirror.threadHome ?? "";
   /** Pane id -> last "no channel" reason logged, so a skipped create logs once, not every 15 s (4,062 lines in 36 h). */
   #skipLogged = new Map<string, string>();
   #skip(p: LivePane, why: string): null {
     if (this.#skipLogged.get(p.paneId) !== why) log(`no channel for ${p.name} (${p.machine}:${p.paneId}): ${why}`);
     this.#skipLogged.set(p.paneId, why);
     return null;
+  }
+  /** config.json that keeps `mirror.overflow` (tests point it at a scratch file). */
+  configFile = CONFIG_FILE;
+  /** Last overflow-category create attempt (ms); at most one try per OVERFLOW_RETRY_MS after a failure. */
+  #overflowFailedAt = 0;
+  /** Last failed 🧵 jobs channel create and last failed thread-to-channel move (ms); retried after OVERFLOW_RETRY_MS.
+   * One shared move time: a refused create stops every thread-only pane's move for the window, not one pane only. */
+  #homeFailedAt = 0;
+  #promoteFailedAt = 0;
+  /** Thread creates refused (permission, thread cap, rate limit) until this time (ms). */
+  #threadBlockedUntil = 0;
+  /** Owner 2026-10-30 (card mirror-create-loop): Herdr tab -> last refused channel create (ms). One try per pane per
+   * OVERFLOW_RETRY_MS; rate limits (createPausedUntil) and full categories (#fullUntil) have their own gates.
+   * Keyed by tab id: a Herdr restart changes pane ids, not tab ids. */
+  #paneCreateFailedAt = new Map<string, number>();
+  /** Channel id -> last failed move into a stack category (ms); retried after OVERFLOW_RETRY_MS. */
+  #moveFailedAt = new Map<string, number>();
+  /** Posts one line to FIRSTMATE (set by main); null: #omp-alerts (`alert`). */
+  alertFirstmate: ((text: string) => void) | null = null;
+  /** One FIRSTMATE alert per key in this bot run. */
+  #alertOnce(key: string, text: string): void {
+    if (this.#fullAlerted.has(key)) return;
+    this.#fullAlerted.add(key);
+    (this.alertFirstmate ?? this.alert)?.(text);
+  }
+  /** Owner 2026-10-30 (card bot-upgrades-1030): stack name -> category ids (config mirror.stackCategories).
+   * null: no split (main panes use 🖥️ Main + overflow). Tests set it. */
+  stackCats: Record<string, string[]> | null = CONFIG.mirror.stackCategories ? parseStackCategories(CONFIG.mirror.stackCategories) : null;
+  /** Stacks and FIRSTMATE cards for paneStack() (tests replace them). */
+  stacks: () => StackDef[] = defaultStacks;
+  cards: () => StackCard[] = defaultCards;
+  /** Last category create of any kind (ms) and last failed stack-category create (ms, all stacks share it):
+   * one category at a time, and one try per hour after a failure. */
+  #lastCatCreate = 0;
+  #catFailedAt = 0;
+  /**
+   * Permission overwrites for a new pane category, copied from the first existing category among `ids`
+   * (🖥️ Main first). Null when none exists: the caller must not create a category with server default permissions.
+   */
+  #overwrites(guild: Guild, ids: string[]): { id: string; type: number; allow: bigint; deny: bigint }[] | null {
+    for (const id of ids) {
+      const c = id ? guild.channels.cache.get(id) : undefined;
+      if (c && "permissionOverwrites" in c) return [...c.permissionOverwrites.cache.values()].map((o) => ({ id: o.id, type: o.type, allow: o.allow.bitfield, deny: o.deny.bitfield }));
+    }
+    return null;
+  }
+  /**
+   * Owner 2026-10-30 (card bot-upgrades-1030): create the next category of a stack ("💹 finance", then
+   * "💹 finance 2") with the 🖥️ Main permission overwrites, after the last pane category, and save it in config.json
+   * `mirror.stackCategories`. At most one category create per STACK_CATEGORY_GAP_MS, never during a create pause,
+   * and one try per OVERFLOW_RETRY_MS after any failure (all stacks). Returns the id or undefined. Public for tests.
+   */
+  async addStackCategory(guild: Guild, stack: StackDef, ids: string[], baseId: string): Promise<string | undefined> {
+    const now = Date.now();
+    if (!this.stackCats || now < this.createPausedUntil || now - this.#lastCatCreate < STACK_CATEGORY_GAP_MS) return undefined;
+    if (now - this.#catFailedAt < OVERFLOW_RETRY_MS) return undefined;
+    const channels = [...guild.channels.cache.values()].filter((c) => !c.isThread?.()).length;
+    if (channels >= GUILD_CHANNEL_LIMIT - 10) {
+      this.#catFailedAt = now;
+      this.#categoryFull("guild-limit", `the server has ${channels}/${GUILD_CHANNEL_LIMIT} channels; no new stack category`);
+      return undefined;
+    }
+    const allIds = [baseId, ...Object.values(this.stackCats).flat(), ...overflowList("main")];
+    const permissionOverwrites = this.#overwrites(guild, allIds);
+    if (!permissionOverwrites) {
+      this.#catFailedAt = now;
+      this.#alertOnce("stackcat-noperm", "⚠️ No pane category is left to copy permissions from, so the bot does not create stack categories (a new one would use the server default permissions). Create one category with the right permissions and add its id to config.json mirror.stackCategories.");
+      return undefined;
+    }
+    this.#lastCatCreate = now;
+    const positions = allIds
+      .map((id) => guild.channels.cache.get(id))
+      .map((c) => (c && "position" in c && typeof c.position === "number" ? c.position : -1))
+      .filter((x) => x >= 0);
+    // The next unused name: after "💹 finance" was deleted, "💹 finance 2" stays and the new one is "💹 finance 3".
+    const taken = new Set(ids.map((id) => guild.channels.cache.get(id)?.name));
+    let k = ids.length;
+    while (taken.has(stackCategoryName(stack, k))) k++;
+    const name = stackCategoryName(stack, k);
+    try {
+      const cat = await guild.channels.create({ name, type: ChannelType.GuildCategory, permissionOverwrites, ...(positions.length ? { position: Math.max(...positions) + 1 } : {}), reason: `stack ${stack.name} pane channels` });
+      this.stackCats[stack.name] = [...ids, cat.id];
+      log(`created stack category ${name} (${cat.id})`);
+      await this.orderCategories(guild, baseId);
+      try {
+        saveMirrorValue("stackCategories", this.stackCats, this.configFile);
+      } catch (e) {
+        log(`stack category ${cat.id} made, but saving config.json failed: ${(e as Error).message}`);
+        this.alert?.(`⚠️ Created category "${name}" (${cat.id}) but could not save it in config.json mirror.stackCategories: ${(e as Error).message}. Add the id by hand before the next bot restart.`);
+      }
+      return cat.id;
+    } catch (err) {
+      this.#catFailedAt = Date.now();
+      const wait = rateLimitWait(err);
+      if (wait !== null) this.createPausedUntil = Date.now() + wait;
+      log(`create stack category ${name} failed: ${(err as Error).message}`);
+      if (wait === null) this.#alertOnce("stackcat-fail", `⚠️ Could not create category "${name}" (${(err as Error).message}). Pane channels stay in 🖥️ Main; the bot tries one stack category again in one hour.`);
+      return undefined;
+    }
+  }
+  /** Category order fixed in this bot run (one try per run; each new stack category orders again). */
+  #catsOrdered = false;
+  /**
+   * Owner 2026-10-30 (review): keep 🖥️ Main and the stack categories together (stacks by name, each stack's
+   * overflow after it); the other categories keep their order. One bulk PATCH, only when the order is off.
+   */
+  async orderCategories(guild: Guild, baseId: string): Promise<void> {
+    this.#catsOrdered = true;
+    if (!this.stackCats) return;
+    const group = [baseId, ...Object.keys(this.stackCats).sort().flatMap((s) => this.stackCats?.[s] ?? [])];
+    const cats = [...guild.channels.cache.values()]
+      .filter((c) => c.type === ChannelType.GuildCategory)
+      .map((c) => ({ id: c.id, position: "position" in c && typeof c.position === "number" ? c.position : 0 }));
+    const want = categoryOrder(cats, group);
+    const now = categoryOrder(cats, []);
+    if (want.join() === now.join() && new Set(cats.map((c) => c.position)).size === cats.length) return;
+    log(`order ${want.length} categories`);
+    await guild.channels.setPositions(want.map((id, i) => ({ channel: id, position: i }))).catch((err: Error) => log(`category order failed: ${err.message}`));
+  }
+  /**
+   * Owner 2026-10-28 (card stack-catalog): create the next pane overflow category with the same permission
+   * overwrites as the machine's own category, add it to OVERFLOW_IDS and `cats`, and save it in config.json.
+   * Returns its id, or undefined (alerted once) when it cannot be made. Public for tests.
+   */
+  async addOverflow(guild: Guild, baseId: string, cats: string[], machine = "main"): Promise<string | undefined> {
+    const list = overflowList(machine);
+    if (Date.now() - this.#overflowFailedAt < OVERFLOW_RETRY_MS || Date.now() - this.#lastCatCreate < STACK_CATEGORY_GAP_MS) return undefined;
+    // Threads do not count toward the server limit (the cache holds active threads too).
+    const channels = [...guild.channels.cache.values()].filter((c) => !c.isThread?.()).length;
+    if (channels >= GUILD_CHANNEL_LIMIT - 10) {
+      this.#overflowFailedAt = Date.now();
+      this.#categoryFull("guild-limit", `the server has ${channels}/${GUILD_CHANNEL_LIMIT} channels; no new pane category`);
+      return undefined;
+    }
+    const base = guild.channels.cache.get(baseId);
+    const last = guild.channels.cache.get(cats[cats.length - 1] ?? baseId);
+    const name = overflowName(base?.name ?? "🖥️ Main", cats.length);
+    // Never a pane category with server default permissions (owner privacy): copy 🖥️ Main, else an overflow category.
+    const permissionOverwrites = this.#overwrites(guild, [baseId, ...cats]);
+    if (!permissionOverwrites) {
+      this.#overflowFailedAt = Date.now();
+      this.#categoryFull("no-perm-source", `no ${machine} pane category is left to copy permissions from; no new pane category`);
+      return undefined;
+    }
+    this.#lastCatCreate = Date.now();
+    try {
+      const cat = await guild.channels.create({ name, type: ChannelType.GuildCategory, permissionOverwrites, ...(last && "position" in last ? { position: last.position + 1 } : {}), reason: "pane categories full" });
+      list.push(cat.id);
+      cats.push(cat.id);
+      try {
+        saveOverflowIds(list, this.configFile, overflowKey(machine));
+      } catch (e) {
+        log(`overflow category ${cat.id} made, but saving config.json failed: ${(e as Error).message}`);
+        this.alert?.(`⚠️ Created pane category "${name}" (${cat.id}) but could not save it in config.json mirror.overflow: ${(e as Error).message}. Add the id by hand before the next bot restart.`);
+      }
+      log(`created overflow category ${name} (${cat.id}); pane categories: ${cats.length}`);
+      this.alert?.(`🗂️ All pane categories were full: created category "${name}" for new pane channels.`);
+      return cat.id;
+    } catch (err) {
+      this.#overflowFailedAt = Date.now();
+      const wait = rateLimitWait(err);
+      if (wait !== null) this.createPausedUntil = Date.now() + wait;
+      log(`create overflow category ${name} failed: ${(err as Error).message}`);
+      this.#categoryFull(`overflow:${Math.floor(Date.now() / OVERFLOW_RETRY_MS)}`, `pane categories are full and creating "${name}" failed (${(err as Error).message}); new panes get no channel`);
+      return undefined;
+    }
   }
 
   constructor(
@@ -589,11 +862,15 @@ export class Mirror {
     /** Channel ids detached from their pane: never updated, renamed, archived or tailed. */
     private detached: Set<string> = DETACHED_CHANNEL_IDS,
   ) {
+    try {
+      const saved: unknown = JSON.parse(readFileSync(join(dirname(file), "create-pause.json"), "utf8"));
+      if (saved && typeof saved === "object" && "until" in saved && typeof saved.until === "number") this.#pausedUntil = saved.until;
+    } catch { /* no saved pause */ }
     if (!existsSync(file)) return;
     try {
       this.entries = (JSON.parse(readFileSync(file, "utf8")) as MirrorEntry[]).map(
-        ({ machine, paneId, tabId, workspace, tab, name, channelId, archived, cwd, sessionFile, offset, progress, watch, wait }) =>
-          ({ machine, paneId, tabId, workspace, tab, name, channelId, archived, cwd, sessionFile, offset, progress, watch, wait }),
+        ({ machine, paneId, tabId, workspace, tab, name, channelId, archived, cwd, sessionFile, offset, progress, watch, wait, threadOnly }) =>
+          ({ machine, paneId, tabId, workspace, tab, name, channelId, archived, cwd, sessionFile, offset, progress, watch, wait, ...(threadOnly ? { threadOnly } : {}) }),
       );
     } catch {
       this.entries = [];
@@ -608,9 +885,33 @@ export class Mirror {
     chmodSync(this.file, 0o600);
   }
 
+  /** Owner 2026-10-30: the live channel of a card's `job` token (pane id, tab id, tab label or channel name). Main only: card jobs are main panes, ids repeat per machine. */
+  byJob(token: string): MirrorEntry | undefined {
+    const t = token.trim().toLowerCase();
+    if (!t) return undefined;
+    const live = this.entries.filter((e) => e.machine === "main" && !e.archived && !this.detached.has(e.channelId));
+    // Ids first, labels only when no id matches; more than one channel = unresolved (never guess).
+    for (const keys of [(e: MirrorEntry) => [e.paneId, e.tabId], (e: MirrorEntry) => [e.tab, e.name]]) {
+      const hits = new Set(live.filter((e) => keys(e).some((v) => v?.toLowerCase() === t)).map((e) => e.channelId));
+      if (hits.size === 1) return live.find((e) => e.channelId === [...hits][0]);
+      if (hits.size > 1) return undefined;
+    }
+    return undefined;
+  }
+
   byChannel(channelId: string): MirrorEntry | undefined {
     if (this.detached.has(channelId)) return undefined; // local-omp channels: never a pane route
     return this.entries.find((e) => e.channelId === channelId);
+  }
+
+  /**
+   * Owner 2026-10-30: the pane entry for a message channel, and the thread id when the message is in a thread
+   * under the pane channel. A pane thread in the 🧵 jobs channel is the pane's own channel (threadId null).
+   */
+  resolve(channelId: string, parentId: string | null): { entry: MirrorEntry | undefined; threadId: string | null } {
+    const own = this.byChannel(channelId);
+    if (own?.threadOnly) return { entry: own, threadId: null };
+    return { entry: this.byChannel(parentId ?? channelId), threadId: parentId ? channelId : null };
   }
 
   /** Reconcile live panes (one host) into entries; pure apart from entry mutation. Returns work to do. */
@@ -639,6 +940,53 @@ export class Mirror {
     }
     const archive = this.entries.filter((x) => x.machine === machine && !x.archived && !claimed.has(x));
     return { create, update, archive };
+  }
+
+  /**
+   * The text channel that holds pane threads: config mirror.threadHome, else #omp-alerts (owner 2026-10-31).
+   * Never creates a channel; returns undefined when neither channel exists. Single source of truth for
+   * #thread(); public for tests.
+   */
+  async threadHomeChannel(guild: Guild): Promise<TextChannel | undefined> {
+    // Owner 2026-10-31: job threads open in #omp-alerts (an existing channel); the bot never creates a 🧵-jobs channel.
+    const id = this.threadHome || CONFIG.alertsChannelId || "";
+    const have = id ? guild.channels.cache.get(id) : undefined;
+    return have?.type === ChannelType.GuildText ? (have as TextChannel) : undefined;
+  }
+
+
+  /** A public thread for the pane in the thread home (threadHomeChannel); its first message holds the topic text. */
+  async #thread(guild: Guild, p: LivePane, why: string): Promise<{ id: string; threadOnly: true } | null> {
+    // Only an existing home is used (no create call): mirror.threadHome, else #omp-alerts.
+    const home = await this.threadHomeChannel(guild);
+    if (!home) return this.#skip(p, `${why}; no thread home (mirror.threadHome or #omp-alerts)`);
+    // A refused thread create (permission, thread cap, rate limit) is retried only after the block ends.
+    if (Date.now() < this.#threadBlockedUntil) return this.#skip(p, `${why}; thread creates blocked until ${new Date(this.#threadBlockedUntil).toISOString()}`);
+    try {
+      const t = await home.threads.create({ name: channelTitle(p.name, p.machine, p.short).slice(0, 100), type: ChannelType.PublicThread, autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek, reason: why });
+      await t.send({ content: `🧵 ${this.#topic(p)}\nNo own channel yet: ${why}. This thread moves to a channel when Discord allows it.`, allowedMentions: { parse: [] } }).catch(() => {});
+      this.#skipLogged.delete(p.paneId);
+      log(`created thread ${t.id} for ${p.name} (${p.machine}:${p.paneId}): ${why}`);
+      return { id: t.id, threadOnly: true };
+    } catch (err) {
+      this.#threadBlockedUntil = Date.now() + (rateLimitWait(err) ?? OVERFLOW_RETRY_MS);
+      return this.#skip(p, `${why}; thread create failed: ${(err as Error).message}`);
+    }
+  }
+
+  /** Move a thread-only entry to its new channel: link it in the thread, remap, archive the thread. */
+  async #promote(guild: Guild, e: MirrorEntry, channelId: string): Promise<void> {
+    const old = (guild.channels.cache.get(e.channelId) ?? (await this.client?.channels.fetch(e.channelId).catch(() => null))) as ThreadChannel | null | undefined;
+    log(`moved ${e.name} from thread ${e.channelId} to channel ${channelId}`);
+    e.channelId = channelId;
+    delete e.threadOnly;
+    e.progress = undefined; // the status message lives in the thread
+    // An open card moves with the pane: tail() posts it again in the channel (msgId unset).
+    e.wait = e.wait && !e.wait.sending ? { ...e.wait, msgId: undefined } : undefined;
+    if (old?.isThread()) {
+      await old.send({ content: `➡️ This pane now has its own channel: ${channelMention(channelId, "a new channel")}.`, allowedMentions: { parse: [] } }).catch(() => {});
+      await old.setArchived(true).catch(() => {});
+    }
   }
 
   #topic(p: LivePane): string {
@@ -703,20 +1051,115 @@ export class Mirror {
     // A full category (50 channels) must not stop the whole sync pass: catch per pane, alert once.
     // Owner 2026-10-24: never call Discord when every pane category is full or Discord paused channel creates.
     // Retrying every 15 s (4,062 creates in 36 h) made Discord block all channel creates for about 17 h.
-    const cats = [parentId ?? "", ...(machine === "main" ? OVERFLOW_IDS : [])];
-    const count = (id: string) => [...guild.channels.cache.values()].filter((c) => c.parentId === id).length;
-    const make = async (p: LivePane) => {
+    // Owner 2026-10-30: a deleted overflow category (CHANNEL_PARENT_INVALID, "0 channels") must never block new
+    // channels: drop ids Discord no longer has, save the list, and let addOverflow make the next one.
+    const ovf = overflowList(machine);
+    if (guild.channels.cache.size > 0) {
+      const gone = ovf.filter((id) => !guild.channels.cache.has(id));
+      if (gone.length) {
+        for (const id of gone) ovf.splice(ovf.indexOf(id), 1);
+        log(`dropped deleted overflow categories: ${gone.join(", ")}`);
+        try {
+          saveOverflowIds(ovf, this.configFile, overflowKey(machine));
+        } catch (e) {
+          log(`saving config.json after dropping overflow categories failed: ${(e as Error).message}`);
+        }
+      }
+    }
+    // Owner 2026-10-30 (card mirror-create-loop): a deleted pane category is never a create target. A category
+    // exists when the cache has it or a cached channel names it as parent (an empty cache: assume it exists).
+    const exists = (id: string) => guild.channels.cache.size === 0 || guild.channels.cache.has(id) || [...guild.channels.cache.values()].some((c) => c.parentId === id);
+    const baseGone = !!parentId && !exists(parentId);
+    if (baseGone && !this.#fullAlerted.has(`missing:${parentId}`)) {
+      this.#fullAlerted.add(`missing:${parentId}`);
+      log(`${machine} pane category ${parentId} no longer exists; new channels use the overflow or stack categories`);
+    }
+    const cats = [...(baseGone ? [] : [parentId ?? ""]), ...ovf];
+    // Owner 2026-10-30: Discord says "maximum number of channels" while the cache count is lower -> treat the
+    // category as full for an hour, so the next or a new overflow category gets the channel.
+    const count = (id: string) => ((this.#fullUntil.get(id) ?? 0) > Date.now() ? CATEGORY_LIMIT : [...guild.channels.cache.values()].filter((c) => c.parentId === id).length);
+    // Owner 2026-10-30 (card bot-upgrades-1030): main pane channels go to the category of their stack. A deleted
+    // stack category id is dropped (and saved). Without a stack category (not made yet, or full and its next one
+    // cannot be made yet) the channel uses 🖥️ Main + overflow as before.
+    const split = machine === "main" && this.stackCats !== null;
+    const stackCats = this.stackCats ?? {};
+    const stacks = split ? this.stacks() : [];
+    const cards = split ? this.cards() : [];
+    if (split && guild.channels.cache.size > 0) {
+      let dropped = false;
+      for (const [s, ids] of Object.entries(stackCats)) {
+        const keep = ids.filter(exists);
+        if (keep.length === ids.length) continue;
+        dropped = true;
+        log(`dropped deleted ${s} stack categories: ${ids.filter((id) => !keep.includes(id)).join(", ")}`);
+        if (keep.length) stackCats[s] = keep;
+        else delete stackCats[s];
+      }
+      if (dropped) {
+        try {
+          saveMirrorValue("stackCategories", stackCats, this.configFile);
+        } catch (e) {
+          log(`saving config.json after dropping stack categories failed: ${(e as Error).message}`);
+        }
+      }
+    }
+    if (split && !this.#catsOrdered && !baseGone && parentId && guild.channels.cache.size > 0) await this.orderCategories(guild, parentId);
+    const stackOf = (p: LivePane | MirrorEntry) => paneStack(p, cards, stacks);
+    /** A category of stack `s` with room; with `create`, makes the stack's next category (one at a time, gated). */
+    const stackParent = async (s: string, create: boolean): Promise<string | undefined> => {
+      if (!split) return undefined;
+      const ids = stackCats[s] ?? [];
+      const room = pickPaneCategory(ids, count);
+      if (room !== undefined || !create) return room;
+      const def = stacks.find((x) => x.name === s);
+      return def ? this.addStackCategory(guild, def, ids, parentId ?? "") : undefined;
+    };
+    let moves = 0;
+    /** True once make() sent a channel create to Discord (a promote that only hit a local gate is not a failure). */
+    let attempted = false;
+    /** Move a channel into a stack category (counts toward MOVES_PER_PASS). A failed move waits OVERFLOW_RETRY_MS. */
+    const move = async (ch: TextChannel, target: string, s: string): Promise<boolean> => {
+      if (Date.now() - (this.#moveFailedAt.get(ch.id) ?? 0) < OVERFLOW_RETRY_MS) return false;
+      moves++;
+      try {
+        await ch.setParent(target, { lockPermissions: false });
+        this.#moveFailedAt.delete(ch.id);
+        log(`moved ${ch.name} to the ${s} stack category ${target}`);
+        return true;
+      } catch (err) {
+        this.#moveFailedAt.set(ch.id, Date.now());
+        log(`move ${ch.name} to ${target} failed: ${(err as Error).message}`);
+        if (/maximum number of channels/i.test((err as Error).message)) this.#fullUntil.set(target, Date.now() + OVERFLOW_RETRY_MS);
+        return false;
+      }
+    };
+    // Owner 2026-10-30 (card discord-thread-fallback): when no channel can be made, the pane gets a public thread
+    // in the 🧵 jobs channel, so the owner can still read replies, answer menus and type. allowThread=false: real channel only.
+    const make = async (p: LivePane, allowThread = true): Promise<{ id: string; threadOnly?: true } | null> => {
       const now = Date.now();
-      if (now < this.createPausedUntil) return this.#skip(p, `Discord blocks channel creates until ${new Date(this.createPausedUntil).toISOString()}`);
-      const parent = pickPaneCategory(cats, count);
+      const fallback = (why: string) => (allowThread ? this.#thread(guild, p, why) : this.#skip(p, why));
+      if (now < this.createPausedUntil) return fallback(`Discord blocks channel creates until ${new Date(this.createPausedUntil).toISOString()}`);
+      // Owner 2026-10-30 (card mirror-create-loop): after a refused create, one try per pane per hour.
+      const failKey = p.tabId ? `${p.tabId}:${p.name}` : p.paneId;
+      const failedAt = this.#paneCreateFailedAt.get(failKey) ?? 0;
+      if (now - failedAt < OVERFLOW_RETRY_MS) return fallback(`the last channel create failed at ${new Date(failedAt).toISOString()}; next try after ${new Date(failedAt + OVERFLOW_RETRY_MS).toISOString()}`);
+      let parent = await stackParent(stackOf(p), true);
+      if (Date.now() < this.createPausedUntil) return fallback(`Discord blocks channel creates until ${new Date(this.createPausedUntil).toISOString()}`);
+      parent ??= pickPaneCategory(cats, count);
+      // Owner 2026-10-28: every main pane category full -> create the next "🖥️ Main N" overflow category.
+      // With the stack split, stack categories replace that: the pane waits in a 🧵 thread for its stack category.
+      if (parent === undefined && parentId && !split) parent = await this.addOverflow(guild, parentId, cats, machine);
       if (parent === undefined) {
-        this.#categoryFull(parentId ?? "", `${machine} pane category is full (${count(parentId ?? "")}/${CATEGORY_LIMIT}); new panes get no channel`);
-        return this.#skip(p, `pane categories full (${cats.length} × ${CATEGORY_LIMIT})`);
+        if (split) this.#categoryFull(`stackwait:${parentId}`, `${machine} pane categories are full and the stack category cannot be made yet (one category create per minute, one try per hour after a failure); new panes use a 🧵 thread meanwhile`);
+        else this.#categoryFull(parentId ?? "", `${machine} pane category is full (${count(parentId ?? "")}/${CATEGORY_LIMIT}); new panes get no channel`);
+        return fallback(`pane categories full (${cats.length} × ${CATEGORY_LIMIT})`);
       }
       log(`create channel ${p.name} for ${machine}:${p.paneId}`);
+      attempted = true;
       try {
         const ch = await guild.channels.create({ name: channelTitle(p.name, machine, p.short), type: ChannelType.GuildText, parent: parent || undefined, topic: this.#topic(p) });
         this.#skipLogged.delete(p.paneId);
+        this.#paneCreateFailedAt.delete(failKey);
         return ch;
       } catch (err) {
         const wait = rateLimitWait(err);
@@ -725,26 +1168,66 @@ export class Mirror {
           const until = new Date(this.createPausedUntil);
           log(`channel creates rate-limited by Discord for ${Math.round(wait / 60_000)} min (until ${until.toISOString()})`);
           this.#categoryFull(`ratelimit:${Math.floor(this.createPausedUntil / 3_600_000)}`, `Discord blocks new channels until ${until.toTimeString().slice(0, 5)} (rate limit); new panes get their channel after that`);
-          return this.#skip(p, `Discord blocks channel creates until ${until.toISOString()}`);
+          return fallback(`Discord blocks channel creates until ${until.toISOString()}`);
         }
         const n = count(parent);
-        log(`create channel ${p.name} failed (${n} channels in category): ${(err as Error).message}`);
-        if (n >= CATEGORY_LIMIT || /maximum number of channels/i.test((err as Error).message)) this.#categoryFull(parent, `${machine} pane category is full (${n}/${CATEGORY_LIMIT}); no channel for ${p.name}`);
-        return null;
+        const msg = (err as Error).message;
+        log(`create channel ${p.name} failed (${n} channels in category): ${msg}`);
+        // Category vanished between cache and create: forget it so the next pass picks or makes another one.
+        if (/CHANNEL_PARENT_INVALID|Category does not exist/i.test(msg)) {
+          if (ovf.includes(parent)) {
+            ovf.splice(ovf.indexOf(parent), 1);
+            try { saveOverflowIds(ovf, this.configFile, overflowKey(machine)); } catch { /* logged on next prune */ }
+          }
+          for (const [s, ids] of Object.entries(stackCats)) {
+            if (!ids.includes(parent)) continue;
+            if (ids.length > 1) stackCats[s] = ids.filter((id) => id !== parent);
+            else delete stackCats[s];
+            try { saveMirrorValue("stackCategories", stackCats, this.configFile); } catch { /* logged on next prune */ }
+          }
+        }
+        if (/maximum number of channels in category/i.test(msg)) this.#fullUntil.set(parent, Date.now() + OVERFLOW_RETRY_MS);
+        if (n >= CATEGORY_LIMIT || /maximum number of channels/i.test(msg)) this.#categoryFull(parent, `${machine} pane category is full (${n}/${CATEGORY_LIMIT}); no channel for ${p.name}`);
+        else {
+          // Not a full category (that one has its own gate): this pane waits an hour; FIRSTMATE hears once per error.
+          this.#paneCreateFailedAt.set(failKey, Date.now());
+          this.#alertOnce(`createfail:${msg.slice(0, 80)}`, `⚠️ Channel create for ${p.name} failed: ${msg}. Each pane tries again at most once per hour; it uses a 🧵 thread meanwhile.`);
+        }
+        return fallback(`channel create failed: ${msg}`);
       }
     };
     for (const p of create) {
       const ch = await make(p);
-      if (ch) this.entries.push({ ...p, channelId: ch.id, archived: false, offset: undefined });
+      if (ch) this.entries.push({ ...p, channelId: ch.id, archived: false, offset: undefined, ...(ch.threadOnly ? { threadOnly: true } : {}) });
     }
     for (const { e, p } of update) {
-      const ch = guild.channels.cache.get(e.channelId) as TextChannel | undefined;
-      if (!ch) {
+      if (e.threadOnly) {
+        // Creates allowed again: make the real channel, link it in the thread, remap, archive the thread.
+        // At most one try per OVERFLOW_RETRY_MS: a refused create must not repeat every 15 s.
+        if (Date.now() >= this.createPausedUntil && Date.now() - this.#promoteFailedAt >= OVERFLOW_RETRY_MS) {
+          attempted = false;
+          const fresh = await make(p, false);
+          if (fresh) {
+            this.#promoteFailedAt = 0;
+            await this.#promote(guild, e, fresh.id);
+          } else if (attempted) this.#promoteFailedAt = Date.now();
+        } else if (!guild.channels.cache.has(e.channelId) && this.client) {
+          // Only Discord's "Unknown Channel" (10003) means the thread was deleted; other fetch errors keep it.
+          const gone = await this.client.channels.fetch(e.channelId).then(
+            () => false,
+            (err: unknown) => err !== null && typeof err === "object" && "code" in err && err.code === 10003,
+          );
+          const again = gone ? await this.#thread(guild, p, "the pane thread was deleted") : null;
+          if (again) e.channelId = again.id;
+        }
+      } else if (!guild.channels.cache.get(e.channelId)) {
         // make() logs the create (or the skip reason once); no line every 15 s while creates are blocked.
         const fresh = await make(p);
         if (!fresh) continue;
         e.channelId = fresh.id;
+        if (fresh.threadOnly) e.threadOnly = true;
       } else {
+        const ch = guild.channels.cache.get(e.channelId) as TextChannel;
         // A rename blocked by Discord's limit (2 per 10 min) must not stall every later sync.
         const title = channelTitle(p.name, machine, p.short);
         if (ch.name.replace(/\uFE0F/g, "") !== title.replace(/\uFE0F/g, "")) {
@@ -753,8 +1236,19 @@ export class Mirror {
         }
         // Owner 2026-10-18: channels the owner put in the 📌 Pinned category stay there.
         const pinned = /pinned/i.test(ch.parent?.name ?? "");
-        // Owner 2026-10-24: a channel in an overflow category stays there (moving it back fails while 🖥️ Main is full).
-        if (!pinned && !cats.includes(ch.parentId ?? "")) await ch.setParent(parentId, { lockPermissions: false }).catch(() => {});
+        // Owner 2026-10-30: a pane channel moves to its stack category (made here when missing, one at a time).
+        let moved = false;
+        if (split && !pinned && moves < MOVES_PER_PASS) {
+          const s = stackOf(p);
+          if (!(stackCats[s] ?? []).includes(ch.parentId ?? "")) {
+            const target = await stackParent(s, true);
+            if (target !== undefined && target !== ch.parentId) moved = await move(ch, target, s);
+          }
+        }
+        // Owner 2026-10-24: a channel in an overflow or stack category stays there (moving it back fails while 🖥️ Main is full).
+        const paneCats = new Set([...cats, ...Object.values(stackCats).flat()]);
+        // A full 🖥️ Main would refuse the move: no PATCH every pass.
+        if (!moved && !pinned && !baseGone && !paneCats.has(ch.parentId ?? "") && count(parentId ?? "") < CATEGORY_LIMIT) await ch.setParent(parentId, { lockPermissions: false }).catch(() => {});
         if (ch.topic !== this.#topic(p)) await ch.setTopic(this.#topic(p)).catch(() => {});
       }
       if (e.sessionFile !== p.sessionFile) {
@@ -766,13 +1260,30 @@ export class Mirror {
     for (const e of archive) {
       const ch = guild.channels.cache.get(e.channelId) as TextChannel | undefined;
       log(`archive ${e.name}`);
+      if (e.threadOnly) {
+        const t = guild.channels.cache.get(e.channelId);
+        if (t?.isThread()) void t.setArchived(true).catch(() => {});
+      }
       // Owner 2026-10-23: "archive" = delete. The channel stays where it is; scripts/purge-archive.py deletes it
       // after the learners (daily-skill-bot) processed its OMP logs. No archive category, no move, no categoryFull.
       void ch;
       e.archived = true;
       this.#halt(e, "pane closed");
     }
-    for (const id of cats) await this.#sort(guild, id);
+    // Owner 2026-10-30: channels of closed panes (not purged yet) leave 🖥️ Main and overflow too, when their stack
+    // category exists and has room (no category is made for them).
+    if (split) {
+      for (const e of this.entries) {
+        if (moves >= MOVES_PER_PASS) break;
+        if (e.machine !== machine || !e.archived || e.threadOnly || this.detached.has(e.channelId)) continue;
+        const ch = guild.channels.cache.get(e.channelId) as TextChannel | undefined;
+        if (!ch || ch.type !== ChannelType.GuildText || !cats.includes(ch.parentId ?? "")) continue;
+        const s = stackOf(e);
+        const target = await stackParent(s, false);
+        if (target !== undefined) await move(ch, target, s);
+      }
+    }
+    for (const id of new Set([...cats, ...(split ? Object.values(stackCats).flat() : [])])) await this.#sort(guild, id);
   }
 
   /** Keep the category's text channels sorted by emoji group; one bulk PATCH only when the order is off. */
@@ -868,6 +1379,11 @@ export class Mirror {
         if (status && (await this.#flush(e, status, false))) dirty = true;
         if (e.archived || !e.sessionFile || this.busy.has(e.channelId) || this.detached.has(e.channelId)) continue;
         if (e.machine !== "main" && this.hostOk.get(e.machine) === false) continue;
+        // A wait card that moved with its pane (thread -> channel, see #promote) opens again in the new channel.
+        if (onWait && e.wait && !e.wait.msgId && !e.wait.sending) {
+          e.wait.msgId = await onWait(e, e.wait, { open: true }).catch((err: Error) => (log(`wait card failed: ${err.message}`), undefined));
+          dirty = true;
+        }
         const start = e.offset;
         const r = await this.#read(e, start ?? 0);
         if (!r) continue;
@@ -887,7 +1403,10 @@ export class Mirror {
         const answered = new Set(events.flatMap((ev) => (ev.kind === "result" ? [ev.callId] : [])));
         for (const [n, ev] of events.entries()) {
           if (status) {
-            const { p, urgent } = applyEvent(e.progress, ev);
+            if (ev.kind === "thinking") e.thinking = ev.level;
+            const r0 = applyEvent(e.progress, ev);
+            const urgent = r0.urgent;
+            const p = r0.p && e.thinking && !r0.p.thinking ? { ...r0.p, thinking: e.thinking } : r0.p;
             // A turn start alone posts nothing; the status message appears with the first tool step.
             if (p && p !== e.progress && ((p.state === "working" && p.count > 0) || urgent)) this.#pending.add(e.channelId);
             e.progress = p;

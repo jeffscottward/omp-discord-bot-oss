@@ -4,9 +4,9 @@
 // tab, then move the channel to 📦 Archive (never delete). Unsure channels: ONE batched ask block in
 // #main-github-firstmate via the bot's loopback /post, at most once per channel per week.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { CONFIG, FIRSTMATE_CHANNEL_ID, FM_DIR, GUILD_ID, HTTP_PORT, OWNER_ID, STATE_DIR } from "../src/config.ts";
-import { ARCHIVE_IDS, CATEGORY_IDS, DETACHED_CHANNEL_IDS, HOSTS, pickArchive, sh, type MirrorEntry } from "../src/mirror.ts";
+import { ARCHIVE_IDS, DETACHED_CHANNEL_IDS, HOSTS, paneCategoryIds, pickArchive, sh, type MirrorEntry } from "../src/mirror.ts";
 import { classify, discord, dueForAsk, fetchMessages, loadToken, paneBusy, sessionEnded, trackerOpen, type Verdict } from "../src/cleanup.ts";
 import { askedAgainOpen, askSetId, CLOSED_LINE, discordLink, menuQuestion, staleCards, staleMenus, type Card, type ChannelState, type MenuMsg } from "../src/cardsweep.ts";
 import { ASK_TTL_MS } from "../src/ask.ts";
@@ -73,11 +73,13 @@ async function sessionTail(e: MirrorEntry): Promise<string> {
 
 const results: { e: MirrorEntry; v: Verdict; idleH: number; tabPanes: Pane[] }[] = [];
 const seen = new Set<string>();
+const paneCats = paneCategoryIds();
 for (const e of entries) {
   if (e.archived || seen.has(e.channelId) || DETACHED_CHANNEL_IDS.has(e.channelId) || CONFIG.keepChannelIds.includes(e.channelId)) continue; // keep: standing channels (owner 2026-10-22)
   seen.add(e.channelId);
   const ch = chanById.get(e.channelId);
-  if (!ch || (ch.parent_id !== CATEGORY_IDS.main && ch.parent_id !== CATEGORY_IDS.second)) continue; // pinned/archived/other: leave
+  // Owner 2026-10-30: pane channels live in 🖥️ Main, 💻 Second, their overflow and the stack categories.
+  if (!ch || !paneCats.has(ch.parent_id ?? "")) continue; // pinned/archived/other: leave
   const panes = panesByHost.get(e.machine);
   if (!panes) { log(`skip ${ch.name}: ${e.machine} unreadable`); continue; }
   const msgs = await fetchMessages(token, e.channelId, 20).catch(() => []);
@@ -205,7 +207,9 @@ const chanState = (id: string): ChannelState => {
   return ARCHIVE_IDS.includes(cat ?? "") ? "archived" : "live";
 };
 const cards = (existsSync(TRACKER) ? JSON.parse(readFileSync(TRACKER, "utf8")).items ?? [] : []) as Card[];
-const flagged = staleCards(cards, chanState, closedMenus);
+const HOLD = join(dirname(TRACKER), "hold.json"); // owner hold list (owner 2026-10-31): never change these cards
+const held = new Set<string>(Object.keys((existsSync(HOLD) ? (JSON.parse(readFileSync(HOLD, "utf8")) as { cards?: Record<string, string> }).cards : undefined) ?? {}));
+const flagged = staleCards(cards, chanState, closedMenus, held);
 for (const f of flagged) {
   const card = cards.find((c) => c.id === f.id)!;
   const note = `🧹 Card sweep: ${f.reason}; needs check.${card.n ? ` ${card.n}` : ""}`;

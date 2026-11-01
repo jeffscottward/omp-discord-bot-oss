@@ -1,7 +1,11 @@
+import { mirrorSpokenSource, speakInPlace } from "./speakedit.ts";
+import { ownerNtfy } from "./ownerntfy.ts";
+import { RESUME_PREFIX, resumeDecision, pauseNotice } from "./resumebtn.ts";
 import { spawnSync } from "node:child_process";
 import { channelMention, mentionable, setMentionCheck } from "./mention.ts";
-import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { connect as netConnect } from "node:net";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
 import {
@@ -17,6 +21,7 @@ import {
   ButtonStyle,
   type ChatInputCommandInteraction,
   ChannelType,
+  ComponentType,
   Client,
   Events,
   GatewayIntentBits,
@@ -37,6 +42,7 @@ import {
   type Channel,
   type MessageReaction,
   type PartialMessageReaction,
+  type StringSelectMenuInteraction,
 } from "discord.js";
 import { blockFromContent } from "./blocks.ts";
 import { BUSY_TEXT, buttonAllowed, FIRSTMATE_PANE, FirstmateSender, SEND_BUTTON_ID } from "./firstmate.ts";
@@ -46,7 +52,11 @@ import { Approvals, APPROVE_PREFIX } from "./approvals.ts";
 import { activeButtonRuns } from "../gate/run.ts";
 import { extractAttachments } from "./attach.ts";
 import { isVoice, transcribe, transcribeFile } from "./voice.ts";
+import { postVoiceHeader, voiceHeaderParts } from "./voicehead.ts";
 import { speakable, synthesize } from "./speech.ts";
+import * as voicepick from "./voicepick.ts";
+import { answerLabel, findAnswered, leavesOpen } from "./reask.ts";
+import { jevMenuJudge, matchMenuAnswer, menuCandidates, type MenuCandidate } from "./textanswer.ts";
 import { ASK_PREFIX, AskStore, answersText, dropRepeatedQuestions, extractAsk, isOtherOption, lateHeader, menuTotal, recoverLine, TapBatcher, type AskQuestion, type AnswerVia, type LateKind } from "./ask.ts";
 import { LocalModelChat, routeMessage } from "./localmodel.ts";
 import { instanceFor, LocalOmpChat, routeMessage as routeLocalOmp } from "./localomp.ts";
@@ -54,11 +64,16 @@ import { LABEL as VENICE_LABEL, veniceProfile } from "./venice.ts";
 import { DEFAULT_TOOLS as UNCENSORED_TOOLS, LABEL as UNCENSORED_LABEL, uncensoredProfile } from "./firstmate-uncensored.ts";
 import { DoneFollowUps, followUpText, isDoneEmoji, isOwnerDone, markOwnerDone } from "./reactdone.ts";
 import { ALERT_CHANNELS, BOT_ENV_FILE, CONFIG, CONFIG_FILE, commandEnabled, DASHBOARD_BASE_URL, DEV_CHANNEL_ID, FIRSTMATE_CHANNEL_ID, FIRSTMATE_SESSION, FM_DIR, LOCAL_MODEL_CHANNEL_ID, NEEDS_YOU_CHANNEL_ID, SESSIONS_DIR, STATE_DIR, CHANNELS, GUILD_ID, IDLE_TIMEOUT_MS, MAX_CONCURRENT, OMP_BIN, OWNER_ID, RUN_TIMEOUT_MS, trusted, VOICE_CHANNEL_ID, VOICE_FALLBACK_CHANNEL_ID, VOICE_TRANSCRIPT_CHANNEL_ID, WORKING_EMOJI } from "./config.ts";
-import { NeedsYouBoard, type BoardChannel, type MenuSource } from "./needsyou.ts";
+import { isAlert, NeedsYouBoard, type BoardChannel, type MenuSource } from "./needsyou.ts";
 import { herdrPlace, isMasterBoard, MasterQueueBoard, TITLE_MAX, parseHerdrPanes, parseHerdrTabs, queueBoxAllowed, type HerdrPane, type HerdrTab, type JobPlace, type LiveJob } from "./masterqueue.ts";
 import { cancelQueuedJob } from "./cancel.ts";
 import { clearPause, HELD_FILE, holdAlert, parseDuration, pauseLine, pauseTransition, readPause, restoreHeld, resumeDigest, setPause, takeHeld } from "./alertpause.ts";
-import { forcedStack, GENERAL, jevJudge, routerConfig, stackPreamble } from "./router.ts";
+import { MAINT_BIN, MAINT_PREFIX, maintButton, maintLine, readMaintPause } from "./maintpause.ts";
+import { forcedStack, GENERAL, jevJudge, routerConfig, stackPreamble, type RouteDecision, type StackDef } from "./router.ts";
+import { jevJobJudge, JOBROUTE_PREFIX, jobRouteClickAllowed, matchJob, openJobs, type JobMatch, type OpenJob } from "./jobmatch.ts";
+import { readCards } from "./masterqueue.ts";
+import { STACKS_FILE } from "./stackcatalog.ts";
+import { PANE_STOP_PREFIX, paneStopId, parsePaneStopId, stopPane } from "./panestop.ts";
 import { StackRouter, stackRouterFiles, stackSessionKey } from "./stackroute.ts";
 import { parseSpokenNumbers, spokenIntent } from "./spoken.ts";
 import { VoiceChat } from "./voicechat.ts";
@@ -70,9 +85,9 @@ import { Triage, triagePrompt, type Incident } from "./triage.ts";
 import { hasSession, isolatedTag, modelArgs, sessionDir, onApprovalRequest, qwenSessionKey, refreshDiscovery, resetSession, runHeartbeat, runOmp, stopRun, type RunResult } from "./omp.ts";
 import { HEARTBEAT_MS, lastActivity } from "./heartbeat.ts";
 import { refreshSecretValues } from "./secrets.ts";
-import { prepareCopy, prepareOutbound } from "./outbound.ts";
+import { emptyAnswerFallback, emptyAnswerPlan, type OutMsg, prepareCopy, prepareOutbound } from "./outbound.ts";
 import { renderTables, tableLineCount } from "./tablerender.ts";
-import { attachTail, buildTail, isFinanceChannel } from "./replytail.ts";
+import { attachTail, buildTail, isFinanceChannel, lastThinking, modelWithThinking } from "./replytail.ts";
 import { messageProvenance, route, threadName, timeLimitContinue, unrestrictedRoute, watchdogContinue } from "./policy.ts";
 import { ASK_BLOCK_RULE, buildPrompt, setOwnerInVoiceProbe, type PromptInput } from "./preamble.ts";
 import { ARCHIVE_IDS, HOSTS, Mirror, oneLine, rejectLongChannelCreate, sh, sideSessionKey, type MirrorEntry, type WaitHandler } from "./mirror.ts";
@@ -80,7 +95,7 @@ import { choicesFor, closedCard, PaneInjector, QR_MODAL_PREFIX, QR_PREFIX, redac
 import { redactKnownSecrets } from "./secrets.ts";
 import { MAX_CONTINUES, STALL_MS, type WatchAction } from "./stall.ts";
 import { JobQueue, jobPreview } from "./queue.ts";
-import { loadQueueState, saveQueueState, type SavedJob } from "./queuestate.ts";
+import { loadQueueState, saveQueueState, voiceRestoreDecision, type SavedJob } from "./queuestate.ts";
 import { redact } from "./redact.ts";
 import { noteIsLate, showWorking } from "./working.ts";
 import { rigReport, type StatKind } from "./rigstats.ts";
@@ -90,11 +105,11 @@ import { fitLines, markRestarted, pendingLine, pendingRestart, recordPendingBoar
 import { maskedLabelText } from "./links.ts";
 import { dashboardLine, stripTokens } from "./dashlink.ts";
 import { ASK_CANCEL_PREFIX, ASK_DELETE_PREFIX, askRows } from "./askrows.ts";
-import { FM_BIN, ITEMS_FILE, markQueued, messageIdOf, parseCards, QUEUED_BY, responseRefs } from "./queued.ts";
+import { FM_BIN, ITEMS_FILE, markQueued, messageIdOf, parseCards, QUEUED_BY, responseRefs, setRefExpander } from "./queued.ts";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
-import { AUTO_RETRY_DELAY_MS, classifyFailure, failureText, RetryLedger, shouldAutoRetry } from "./failcause.ts";
+import { autoRetryDelay, classifyFailure, failureText, RetryLedger } from "./failcause.ts";
 import { backLink, excerpt, logExcerpt, HANDOFF_MENU_NAME, HANDOFF_PREFIX, handoffCard, handoffPrompt, sourceLogs } from "./handoff.ts";
 import { autoCheckQuietMs, CHECK_PREFIX, childProcs, formatCheck, waitReason } from "./diagnose.ts";
 import { shortcutConfigured, startShortcutServer } from "./shortcut.ts";
@@ -116,15 +131,21 @@ const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 
 /** Plan P1: waiting jobs are saved to disk and queued again after a restart (src/queuestate.ts). */
 const savedAtStart = loadQueueState(STATE_DIR);
-const queue = new JobQueue<RunResult>(MAX_CONCURRENT, { startId: savedAtStart.nextId });
+// Card omp-pause-button: while omp-maintenance's paused.json exists no queued job starts (running jobs finish).
+const queue = new JobQueue<RunResult>(MAX_CONCURRENT, { startId: savedAtStart.nextId, paused: () => readMaintPause() !== null });
 /** Waiting jobs that can be rebuilt after a restart, by job id. */
 const savedJobs = new Map<number, SavedJob>();
+/**
+ * Card voicecall-drop (2026-10-31): a voice-call turn that is RUNNING is saved too, so a restart in the
+ * middle of it (the owner heard "One moment", then the bot restarted) runs the turn again and speaks the answer.
+ */
+const runningVoice = new Map<number, SavedJob>();
 /** Saved jobs from before the restart that are not queued again yet (they stay in the file until then). */
 let toRestore: SavedJob[] = savedAtStart.jobs;
 function saveQueue(): void {
   const waiting = new Set(queue.status().queued.map((q) => q.id));
   for (const id of savedJobs.keys()) if (!waiting.has(id)) savedJobs.delete(id);
-  saveQueueState(STATE_DIR, { nextId: queue.peekNextId(), jobs: [...toRestore, ...savedJobs.values()] });
+  saveQueueState(STATE_DIR, { nextId: queue.peekNextId(), jobs: [...toRestore, ...runningVoice.values(), ...savedJobs.values()] });
 }
 /**
  * FIRSTMATE fan-out router (owner 2026-10-23, card fm-router; src/router.ts, src/stackroute.ts): owner messages
@@ -137,7 +158,11 @@ const stackRouter = new StackRouter(routerConfig(CONFIG.router), {
   guildId: GUILD_ID,
   judge: jevJudge({ ompBin: OMP_BIN }),
   log: (s) => log(s),
+  catalogFile: STACKS_FILE,
+  legacyStacks: CONFIG.router?.stacks ?? [],
 });
+// Owner 2026-10-28: stacks added to the catalog (stack-add.ts, fm-spawn auto-create) route without a restart.
+setInterval(() => stackRouter.refresh(), 10_000);
 queue.groupLimits = { stack: stackRouter.cfg.maxParallelStacks };
 /** Stack name per queue job (board rows: `→ stack: <name>`). */
 const jobStacks = new Map<number, string>();
@@ -207,6 +232,10 @@ mirror.alert = (text) => {
   if (alertHeld(DEV_CHANNEL_ID, text)) return;
   void privateChannel(DEV_CHANNEL_ID).then(async (ch) => { await ch?.send({ content: text, allowedMentions: { parse: [] } }); }).catch(() => undefined);
 };
+/** Owner 2026-10-30 (card mirror-create-loop): a refused channel create is reported once in FIRSTMATE. */
+mirror.alertFirstmate = FIRSTMATE_CHANNEL_ID
+  ? (text) => { void privateChannel(FIRSTMATE_CHANNEL_ID).then(async (ch) => { await ch?.send({ content: text, allowedMentions: { parse: [] } }); }).catch(() => undefined); }
+  : null;
 /** Plan P12: incident triage runs in #omp-alerts threads (src/triage.ts). */
 const triage = new Triage(STATE_DIR);
 // /models (owner 2026-10-19): per-channel model override, saved in the state dir.
@@ -238,6 +267,7 @@ const approvals = new Approvals({
       const sent = await ch.send({ content: m.content, components: last ? [row] : [], ...NO_PINGS });
       if (last) url = sent.url;
     }
+    ownerNtfy(`approval:${id}`, "approval", `Approve ${id}: ${text.split("\n").find((l) => l.trim()) ?? ""}`, url, { log });
     return url;
   },
   log,
@@ -249,6 +279,27 @@ const firstmate = new FirstmateSender({ log });
  * Outbound: privacy filter + split. Paste blocks go out as their own messages (only the fenced
  * block) with "Send to FIRSTMATE" + "Open FIRSTMATE in HEELER". `links` go on the last message.
  */
+/** 🔊 On-demand speech (owner 2026-10-31): answer text per message id, kept for the latest answers only. */
+const SPEAK_PREFIX = "speak:";
+const speakTexts = new Map<string, { text: string; name: string }>();
+async function addSpeakButton(m: Message, text: string, name: string): Promise<void> {
+  speakTexts.set(m.id, { text, name });
+  if (speakTexts.size > 500) speakTexts.delete(speakTexts.keys().next().value!);
+  const rows = m.components.map((r) => ActionRowBuilder.from(r as never) as ActionRowBuilder<ButtonBuilder>);
+  const btn = new ButtonBuilder().setCustomId(`${SPEAK_PREFIX}${m.id}`).setEmoji("🔊").setStyle(ButtonStyle.Secondary);
+  const last = rows.at(-1);
+  // A row with a select menu has room for nothing else; the button then gets its own row.
+  const buttonsOnly = last?.components.every((c) => c.data.type === ComponentType.Button) ?? false;
+  if (last && buttonsOnly && last.components.length < 5) last.addComponents(btn);
+  else if (rows.length < 5) rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(btn));
+  else return;
+  await m.edit({ components: rows }).catch((e) => log(`speak button: ${(e as Error).message}`));
+}
+async function handleSpeakButton(i: ButtonInteraction): Promise<void> {
+  const id = i.customId.slice(SPEAK_PREFIX.length);
+  const saved = speakTexts.get(id) ?? { text: i.message.content, name: "answer.ogg" };
+  await speakInPlace(i, saved, { synthesize, fileSize: (p) => statSync(p).size, log });
+}
 /**
  * Owner 2026-10-15: name the spoken reply after the request instead of "reply.ogg", e.g.
  * "rename-the-audio-file.ogg". Discord needs the .ogg extension to show its audio player.
@@ -270,6 +321,8 @@ function audioName(prompt: string): string {
 interface SendSink {
   messages: Message[];
   asks: { setId: string; questions: AskQuestion[]; menus: Message[] }[];
+  /** Owner 2026-10-31 (card no-reask-answered): questions not posted because the owner already answered them. */
+  already?: { question: string; answer: string[]; url: string }[];
 }
 
 async function sendText(target: SendableChannels, text: string, links?: LinkButton[], replyTo?: Message, voiceTurn = false, audio?: string, audioFile = "omp-reply.ogg", extraFiles: { path: string; name: string }[] = [], runStartMs?: number, runId?: string, attachFrom?: string[], model?: string, noDash = false, sink?: SendSink): Promise<Message | undefined> {
@@ -290,11 +343,16 @@ async function sendText(target: SendableChannels, text: string, links?: LinkButt
   // Owner 2026-10-21: model + dashboard link form one bullet list after one blank line.
   const tailBlock = buildTail(model, dashLine || undefined);
   let followup: string | undefined;
-  const out = prepareOutbound(tbl.text);
+  // Card empty-answer-fix: an answer that is only an ask block (or only files) posts no "(empty answer)" message.
+  const plan = emptyAnswerPlan({ prose: tbl.text, files: att.files.length + tbl.files.length, audio: !!audio, links: (links ?? []).length });
+  let posted = 0;
+  const out = plan.blank && !plan.carrier ? { messages: [] as OutMsg[], hits: {} } : prepareOutbound(tbl.text);
+  if (plan.carrier) for (const m of out.messages) if (m.content === "(empty answer)") m.content = "";
   if (Object.keys(out.hits).length) log(`redacted outbound: ${JSON.stringify(out.hits)}`);
   const tail = links ?? [];
   let first: Message | undefined;
   let last: Message | undefined;
+  const answerIds: string[] = []; // card needs-you-route-answered: menus remember the answer text they follow
   const tablePngs = [...tbl.files];
   for (const [i, m] of out.messages.entries()) {
     const files = m.file ? [new AttachmentBuilder(Buffer.from(m.file.data, "utf8"), { name: m.file.name })] : [];
@@ -318,36 +376,109 @@ async function sendText(target: SendableChannels, text: string, links?: LinkButt
     const loud = audio ? withAudio : i === 0;
     const sent = own(await target.send({ content, files, components, ...reply, ...(loud ? NO_PINGS : QUIET) }));
     sink?.messages.push(sent);
+    posted++;
+    answerIds.push(sent.id);
     first ??= sent;
     last = sent;
     if (followup) {
       last = own(await target.send({ content: followup, ...QUIET }));
       sink?.messages.push(last);
+      answerIds.push(last.id);
     }
     followup = undefined;
   }
   for (const d of tbl.tmpDirs ?? []) rmSync(d, { recursive: true, force: true });
   // In voice mode the owner is offered the choice first (see offerQuestionsInVoice).
   // Owner 2026-10-27: a question whose menu is still open is not asked again; link the open menu instead.
+  if (ask.questions) ask.questions = (await stopAnsweredQuestions(target, ask.questions, text, sink, () => posted++)) ?? null;
   if (ask.questions) {
     const d = dropRepeatedQuestions(ask.questions, asks.openSets(target.id), asks.recentlyAnswered(target.id));
     if (d.repeated.length) {
       log(`ask: dropped ${d.repeated.length} repeated question(s) in ${target.id}`);
       const link = (r: { question: string; messageId?: string }) => (r.messageId ? `[${r.question.slice(0, 80)}](<https://discord.com/channels/${GUILD_ID}/${target.id}/${r.messageId}>)` : r.question.slice(0, 80));
       const waiting = d.repeated.filter((r) => !r.answered).map(link);
-      if (waiting.length) last = (await target.send({ content: `⏳ Still waiting: ${waiting.join(" · ")}`.slice(0, 1900), flags: 4 | 4096, allowedMentions: { parse: [] } }).catch(() => undefined)) ?? last;
+      if (waiting.length) {
+        const w = await target.send({ content: `⏳ Still waiting: ${waiting.join(" · ")}`.slice(0, 1900), flags: 4 | 4096, allowedMentions: { parse: [] } }).catch(() => undefined);
+        if (w) posted++;
+        last = w ?? last;
+      }
     }
     ask.questions = d.keep.length ? d.keep : null;
   }
   if (ask.questions) {
-    if (voicechat.active && voiceTurn) await offerQuestionsInVoice(target, ask.questions);
-    else last = (await sendQuestions(target, ask.questions, sink, replyTo?.id)) ?? last;
+    if (voicechat.active && voiceTurn) {
+      await offerQuestionsInVoice(target, ask.questions);
+      posted++;
+    }
+    else {
+      const q = await sendQuestions(target, ask.questions, sink, replyTo?.id, answerIds);
+      if (q) posted++;
+      last = q ?? last;
+    }
+  }
+  const fallback = emptyAnswerFallback(plan.blank, posted);
+  if (fallback) {
+    log(`empty answer: nothing left to post in ${target.id} (run ${runId ?? "?"}); sent fallback line`);
+    const f = own(await target.send({ content: fallback, ...(replyTo ? { reply: { messageReference: replyTo.id, failIfNotExists: false } } : {}), ...NO_PINGS }));
+    sink?.messages.push(f);
+    last = f;
   }
   void first;
   return last;
 }
 
 const asks = new AskStore(STATE_DIR);
+setRefExpander((ids) => asks.answerIdsFor(ids)); // card needs-you-route-answered
+
+/**
+ * Owner 2026-10-31 (card no-reask-answered): a question the owner answered in the last 7 days (any channel, same
+ * topic and options) is not posted again. The asking channel gets the earlier answer back (the session reads it
+ * there, and /post returns it as `alreadyAnswered`), and FIRSTMATE gets one short line. Returns the questions to post.
+ */
+async function stopAnsweredQuestions(target: SendableChannels, questions: AskQuestion[], context: string, sink?: SendSink, onSent?: () => void): Promise<AskQuestion[] | undefined> {
+  const answered = asks.answeredQuestions();
+  if (!answered.length) return questions;
+  const keep: AskQuestion[] = [];
+  const lines: string[] = [];
+  let sentReask: Message | undefined;
+  let repeat = false;
+  for (const q of questions) {
+    const m = findAnswered(q, answered, Date.now(), context);
+    if (!m) {
+      keep.push(q);
+      continue;
+    }
+    const e = m.earlier;
+    const url = e.messageId ? `https://discord.com/channels/${GUILD_ID}/${e.channelId}/${e.messageId}` : "";
+    log(`ask: not re-asked in ${target.id} (score ${m.score.toFixed(2)}): ${q.question.slice(0, 80)}`);
+    (sink ? (sink.already ??= []) : []).push({ question: q.question, answer: e.answer, url });
+    const key = `${target.id}|${e.channelId}|${e.messageId ?? e.question}`;
+    if (reaskFed.has(key)) repeat = true;
+    reaskFed.set(key, Date.now());
+    lines.push(`↩️ Already answered: **${answerLabel(e).slice(0, 300)}**${url ? ` (${url})` : ""} for "${q.question.slice(0, 120)}"`);
+  }
+  if (lines.length) {
+    const body = `${lines.join("\n")}\nThe owner's earlier answer stands; act on it. No new menu was posted.`.slice(0, 1900);
+    const sent = await target.send({ content: body, allowedMentions: { parse: [] } }).catch(() => undefined);
+    if (sent) sink?.messages.push(sent);
+    if (sent) onSent?.();
+    sentReask = sent;
+    if (FIRSTMATE_CHANNEL_ID && target.id !== FIRSTMATE_CHANNEL_ID && !repeat) {
+      const where = sent ? sent.url : channelMention(target.id);
+      const fm = await privateChannel(FIRSTMATE_CHANNEL_ID).catch(() => null);
+      for (const l of lines) await fm?.send({ content: `${l.slice(0, 1700)} · re-ask stopped in ${where}`, flags: 4 | 4096, allowedMentions: { parse: [] } }).catch(() => undefined);
+    }
+  }
+  // A run's own ask block (no /post caller to read `alreadyAnswered`): when nothing is left to ask, the earlier answers
+  // go back to the session as the owner's next turn, once per earlier answer (a session that asks again is not fed again).
+  if (lines.length && !keep.length && !sink && sentReask && !repeat) {
+    const text = `Answers (the owner already answered these earlier; do not ask again):\n${lines.join("\n")}`;
+    void handle(sentReask, { authorId: OWNER_ID, text }).catch((e) => log(`reask feed-back failed: ${(e as Error).message}`));
+  }
+  return keep.length ? keep : undefined;
+}
+/** Earlier answers already sent back per asking channel (in memory: after a restart one repeat is sent again). */
+const reaskFed = new Map<string, number>();
 
 /**
  * Voice conversation mode (src/voicechat.ts). The owner joining "🎧 OMP Voice" turns it on and
@@ -484,7 +615,9 @@ async function onVoiceTranscript(text: string): Promise<void> {
     return;
   }
   const member = await client.guilds.cache.get(GUILD_ID)?.members.fetch(OWNER_ID).catch(() => null);
-  const note = await target.send({ content: `🎙️ from **${member?.displayName ?? "the owner"}**: *${text.replace(/[*_`]/g, "")}*`, ...QUIET });
+  const parts = voiceHeaderParts(member?.displayName ?? "the owner", text);
+  const note = await target.send({ content: parts[0]!, ...QUIET });
+  for (const part of parts.slice(1)) await target.send({ content: part, ...QUIET }).catch((e) => log(`voice part: ${(e as Error).message}`));
   void transcriptLog(`🎙️ **${member?.displayName ?? "Owner"}:** ${text}`);
   // Owner pick 2026-10-13: short acknowledgement so the thinking time is not dead air.
   // Then quiet hold music until the answer is spoken (stops automatically when speech starts).
@@ -583,12 +716,14 @@ async function handleAskDelete(i: ButtonInteraction): Promise<void> {
 }
 
 /** `replyToId` (owner 2026-10-23): each menu is a reply to the owner's request, so it shows what it belongs to. */
-async function sendQuestions(target: SendableChannels, questions: AskQuestion[], sink?: SendSink, replyToId?: string): Promise<Message | undefined> {
+async function sendQuestions(target: SendableChannels, questions: AskQuestion[], sink?: SendSink, replyToId?: string, answerIds: string[] = []): Promise<Message | undefined> {
   const set = asks.create(target.id, questions, Date.now(), replyToId);
+  asks.recordAnswers(set.setId, answerIds);
   const reply = replyToId ? { reply: { messageReference: replyToId, failIfNotExists: false } } : {};
   const rec = sink ? { setId: set.setId, questions, menus: [] as Message[] } : null;
   if (rec) sink!.asks.push(rec);
   let lastQ: Message | undefined;
+  let firstMenu: string | undefined;
   for (const [qi, q] of questions.entries()) {
     const n = questions.length > 1 ? ` **Question ${qi + 1} of ${questions.length}**\n` : " ";
     // Owner 2026-10-23: {label, description} options show the description on the next line.
@@ -610,8 +745,11 @@ async function sendQuestions(target: SendableChannels, questions: AskQuestion[],
       asks.recordPart(set.setId, lastQ.id);
     }
     if (lastQ) asks.recordMessage(set.setId, qi, lastQ.id);
+    if (qi === 0) firstMenu = lastQ?.id;
     if (rec && lastQ) rec.menus[qi] = lastQ;
   }
+  // Owner 2026-10-30: one ntfy push per new ask menu (in addition to Discord).
+  if (lastQ) ownerNtfy(`ask:${set.setId}`, "input", questions.map((q) => q.question).join(" / "), firstMenu ? `https://discord.com/channels/${GUILD_ID}/${target.id}/${firstMenu}` : lastQ.url, { log });
   return lastQ;
 }
 
@@ -653,6 +791,9 @@ async function useLostTap(i: ButtonInteraction | ModalSubmitInteraction, pick: n
   const m = i.customId.match(/ask:([a-z0-9]+):(\d+)/);
   const setId = m?.[1] ?? `msg-${i.message.id}`;
   const late = (m ? asks.lateKind(setId) : null) ?? { kind: "lost" as const };
+  // Card noreask-clarify: the late tap's own input decides the clarify flag (the batched late turn carries no text).
+  // A ✏️ text that asks back or defers keeps the question open; a pick ("2") or a real answer clears the flag.
+  asks.markAnswered([i.message.id], "late", Date.now(), typed ?? String((pick ?? 0) + 1));
   lostTaps.add(setId, menuTotal(i.message.content), m?.[2] ?? i.message.id, line, { msg: i.message, authorId: i.user.id, kind: late.kind, ageMs: late.ageMs });
 }
 
@@ -776,6 +917,91 @@ async function handleAskModal(i: ModalSubmitInteraction): Promise<void> {
   }
   log(`ask ${r.setId}: all answered (with Other); sending as the owner's next turn`);
   await handle(i.message, { authorId: i.user.id, text: answersText(r), menuIds: Object.values(r.messageIds ?? {}) });
+}
+
+/** Reply to an open menu → answer that question as "✏️ Other" (same effects as the modal). True when consumed. */
+async function answerByReply(msg: Message, target: SendableChannels, replyRef: string, text: string, authorId: string): Promise<boolean> {
+  const qid = asks.questionForReply(replyRef);
+  if (!qid) return false;
+  if (leavesOpen(text)) {
+    log(`ask: reply to ${qid} asks back or defers; the menu stays open`);
+    return false;
+  }
+  const q = asks.question(qid);
+  const ticked = q?.multi ? [...asks.picks(qid)].map(String) : [];
+  const r = asks.answer(qid, ticked, Date.now(), text);
+  if (r === "unknown") return false;
+  const [, setId = "", qi = "0"] = qid.split(":");
+  const set = r === "partial" ? asks.openSets().find((s) => s.setId === setId) : r;
+  const menuId = set?.messageIds?.[qi] ?? replyRef;
+  const ch = msg.channel.isTextBased() ? msg.channel : target;
+  const menu = "messages" in ch ? await ch.messages.fetch(menuId).catch(() => null) : null;
+  if (menu) await menu.edit({ content: `${menu.content}\n\n✅ ✏️ *${text.replace(/[*_`]/g, "").slice(0, 300)}*`.slice(0, 2000), components: [] }).catch((e: Error) => log(`ask reply edit: ${e.message}`));
+  void statusReact.set(msg, "✅");
+  if (menuId !== replyRef) noteMenuAnswer([menuId], "reply"); // reply hit a non-last part of a long question
+  if (r === "partial") {
+    void markQueued(responseRefs([menuId], []), { log });
+    log(`ask ${setId}: question ${qi} answered by a reply; waiting for the rest`);
+    return true;
+  }
+  log(`ask ${r.setId}: all answered (last by a reply); sending as the owner's next turn`);
+  await handle(menu ?? msg, { authorId, text: answersText(r), menuIds: Object.values(r.messageIds ?? {}) });
+  return true;
+}
+
+const menuJudge = jevMenuJudge({
+  keyFn: async () => {
+    const p = Bun.spawn([OMP_BIN, "token", "openrouter"], { stdout: "pipe", stderr: "ignore" });
+    const out = (await new Response(p.stdout).text()).trim();
+    if ((await p.exited) !== 0 || !out) throw new Error("no openrouter credential");
+    return out;
+  },
+});
+/**
+ * Card voice-answer-closes-menu (owner 2026-10-31): text that is not a reply (a voice turn or typed message) and that
+ * the judge maps to an option of an open menu in this channel, its parent, or a stack thread, answers that menu:
+ * the pick is recorded, the menu is edited (buttons removed), Needs you clears, and the session gets one answers turn
+ * (the owner's words included). Unsure: the menu stays open, a note says so, and the text runs as a normal turn.
+ * True when consumed.
+ */
+async function answerByMatch(msg: Message, target: SendableChannels, text: string, authorId: string, byVoice: boolean, parentId: string | null, inCall = false): Promise<boolean> {
+  const chans = [msg.channelId, parentId, ...(msg.channelId === FIRSTMATE_CHANNEL_ID || parentId === FIRSTMATE_CHANNEL_ID ? Object.values(stackRouter.tracker.threads) : [])];
+  const open = asks.openSets();
+  const cands = menuCandidates(open, chans);
+  if (!cands.length) return false;
+  const m = await matchMenuAnswer(text, cands, menuJudge);
+  const how = byVoice ? "voice" : "text";
+  if (m.kind === "none") {
+    log(`ask match (${how}): no answer (${m.detail})`);
+    return false;
+  }
+  const link = (c: MenuCandidate) => (c.messageId ? `https://discord.com/channels/${msg.guildId ?? "@me"}/${open.find((s) => s.setId === c.setId)?.channelId ?? msg.channelId}/${c.messageId}` : `"${c.question.slice(0, 80)}"`);
+  if (m.kind === "unsure") {
+    log(`ask match (${how}): unsure (${m.detail})`);
+    if (m.cands.length === 1) await target.send({ content: `❔ Not sure this ${byVoice ? "spoken" : "typed"} message answers the open question ${link(m.cands[0]!)}. The menu stays open; tap an option there.`, ...QUIET }).catch(() => {});
+    return false;
+  }
+  const { cand, option } = m;
+  const set = open.find((s) => s.setId === cand.setId);
+  const r = asks.answer(AskStore.customId(cand.setId, cand.qi), [String(option)]);
+  if (r === "unknown") return false;
+  log(`ask ${cand.setId}: question ${cand.qi} answered by ${how} -> option ${option + 1} (${m.confidence.toFixed(2)})`);
+  // Card voice-answer-closes-menu: a call turn used as a menu answer starts no run, so no hold music; one short confirmation.
+  if (inCall) void voicechat.confirmInstead(`Got it: ${cand.options[option]!.replace(/^\W+/u, "").slice(0, 80)}. Menu closed.`);
+  const ch = set ? await client.channels.fetch(set.channelId).catch(() => null) : null;
+  const menu = cand.messageId && ch && "messages" in ch ? await ch.messages.fetch(cand.messageId).catch(() => null) : null;
+  const said = text.replace(/[*_`]/g, "").slice(0, 200);
+  if (menu) await menu.edit({ content: `${menu.content}\n\n✅ **${option + 1}** · ${byVoice ? "🎙️ answered by voice" : "⌨️ answered by text"}: *${said}*`.slice(0, 2000), components: [] }).catch((e: Error) => log(`ask match edit: ${e.message}`));
+  void statusReact.set(msg, "✅");
+  if (cand.messageId) noteMenuAnswer([cand.messageId], byVoice ? "voice" : "text", text);
+  if (r === "partial") {
+    void markQueued(responseRefs(cand.messageId ? [cand.messageId] : [], []), { log });
+    await target.send({ content: `✅ Recorded as the answer to ${link(cand)} → ${cand.options[option]}. The other questions of that menu are still open.`, ...QUIET }).catch(() => {});
+    return true;
+  }
+  const note = `${answersText(r)}\n(Owner's ${byVoice ? "spoken" : "typed"} words: "${text.trim().slice(0, 500)}")`;
+  await handle(menu ?? msg, { authorId, text: note, menuIds: Object.values(r.messageIds ?? {}) });
+  return true;
 }
 
 /** Discord CDN attachment of a long paste block (bridge's own message). */
@@ -967,6 +1193,22 @@ async function handleScrollback(i: ButtonInteraction): Promise<void> {
   for (const m of msgs.slice(1)) await i.followUp({ content: m, flags: MessageFlags.Ephemeral, ...NO_PINGS });
 }
 
+/** ❌ Stop on a terminal job (owner 2026-10-28): Esc into that exact OMP pane (src/panestop.ts). */
+async function handlePaneStop(i: ButtonInteraction): Promise<void> {
+  if (!quickReplyAllowed(i)) {
+    await i.reply({ content: "Only the owner can use this button.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const ref = parsePaneStopId(i.customId);
+  if (!ref) {
+    await i.reply({ content: "Unknown pane.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  const r = await stopPane(ref, herdrOn, log);
+  await i.editReply(r.text);
+}
+
 async function setReaction(msg: Message, emoji: string, on: boolean): Promise<void> {
   try {
     if (on) await msg.react(emoji);
@@ -1081,6 +1323,21 @@ async function handleUndoButton(i: ButtonInteraction): Promise<void> {
   });
 }
 
+/** ▶️ Resume after Stop (owner 2026-10-30): continue the same session; the original prompt is not resent. */
+async function handleResumeButton(i: ButtonInteraction): Promise<void> {
+  const d = resumeDecision(undoJobs, i.customId, i.user.id, OWNER_ID, i.message.author.id === client.user?.id);
+  if (d.kind === "denied") return void (await i.reply({ content: "Only the owner can resume.", flags: MessageFlags.Ephemeral }));
+  if (d.kind === "gone") {
+    // Keep 🗑️ Remove: it is stateless and still works (review 2026-10-31).
+    const rm = new ButtonBuilder().setCustomId(`${DUMP_PREFIX}${i.customId.slice(RESUME_PREFIX.length)}`).setLabel("Remove").setEmoji("🗑️").setStyle(ButtonStyle.Danger);
+    await i.update({ components: [new ActionRowBuilder<ButtonBuilder>().addComponents(rm)] }).catch(() => {});
+    return void (await i.followUp({ content: "Cannot resume this one any more (already resumed or undone, or the bot restarted). Type \"continue\" in the channel.", flags: MessageFlags.Ephemeral }).catch(() => {}));
+  }
+  undoJobs.delete(i.customId.slice(RESUME_PREFIX.length));
+  await i.update({ content: "🛑 Stopped. ▶️ Resumed.", components: [] });
+  await handle(d.job.msg, { authorId: i.user.id, text: d.text });
+}
+
 /** 🗑️ Remove after Stop (owner request 2026-10-21): red "Remove" → green "Confirm?" → deletes the 🛑 Stopped reply and
  * the stopped request message. Stateless (the request is the reply's reference), so it also works after a bot restart. */
 const DUMP_PREFIX = "dump:";
@@ -1088,6 +1345,7 @@ const DUMP_OK_PREFIX = "dumpok:";
 const DUMP_NO_PREFIX = "dumpno:";
 function stoppedRow(id: string | number): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`${RESUME_PREFIX}${id}`).setLabel("Resume").setEmoji("▶️").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`${UNDO_PREFIX}${id}`).setLabel("Undo its changes").setEmoji("🔙").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`${DUMP_PREFIX}${id}`).setLabel("Remove").setEmoji("🗑️").setStyle(ButtonStyle.Danger),
   );
@@ -1249,6 +1507,8 @@ function renderBoard(channelId: string, recent: string[]): string {
   const elsewhere = [...st.running, ...st.queued].filter((r) => !mine(r.id)).map((r) => r.label.match(/^#[\w-]+/)?.[0] ?? "another channel");
   const pending = pendingLine(pendingRestart(), elsewhere, queue.draining(), holdingJobs(channelId));
   if (pending) lines.push("\u200b", pending);
+  const maint = maintLine(readMaintPause());
+  if (maint) lines.push("\u200b", maint);
   if (recent.length) lines.push("\u200b", "🏁 **Finished**", "———————————", ...recent.slice(-5));
   return fitLines(lines);
 }
@@ -1344,7 +1604,7 @@ const HANDOFF_COMMANDS: (ApplicationCommandDataResolvable & { name: string })[] 
 function bridgeChannel(ch: Channel | null): ch is SendableChannels & { guildId: string } {
   if (!ch || ch.isDMBased() || !ch.isSendable() || !("guildId" in ch) || ch.guildId !== GUILD_ID) return false;
   const parentId = ch.isThread() ? ch.parentId : null;
-  if (mirror.byChannel(parentId ?? ch.id)) return true;
+  if (mirror.resolve(ch.id, parentId).entry) return true;
   const info = { authorId: OWNER_ID, authorIsBot: false, guildId: ch.guildId, channelId: ch.id, isDM: false, isThread: ch.isThread(), parentId };
   return Boolean(unrestrictedRoute(info, CONFIG.unrestrictedChannelIds)) || route(info).kind !== "ignore";
 }
@@ -1355,11 +1615,11 @@ async function doHandoff(srcId: string, destId: string, note: string | null, upT
   if (!src?.isTextBased() || src.isDMBased()) return "❌ The source channel is not readable.";
   if (!bridgeChannel(dest)) return `❌ ${channelMention(destId, "That channel")} is not a channel the bot answers in (mapped, mirrored or a thread under one). Pick another one.`;
   const parentId = src.isThread() ? src.parentId : null;
-  const entry = mirror.byChannel(parentId ?? srcId);
+  const { entry, threadId: srcThread } = mirror.resolve(srcId, parentId);
   const logs = sourceLogs({
     sessionsDir: SESSIONS_DIR,
     channelId: srcId,
-    sideKey: entry ? sideSessionKey(entry, src.isThread() ? srcId : null) : null,
+    sideKey: entry ? sideSessionKey(entry, srcThread) : null,
     paneSession: entry?.machine === "main" ? entry.sessionFile : null,
   });
   const fetched = await src.messages.fetch({ limit: 20, ...(upToMessageId ? { before: upToMessageId } : {}) }).catch(() => null);
@@ -1409,8 +1669,16 @@ async function editBoard(channelId: string, line: string): Promise<void> {
   if (/\*\*(Done|Stopped):\*\*/.test(line)) b.recent.push(line.trim().replace(/\*\*(Done|Stopped):\*\* /, ""));
   // Let the queue settle (the finished job is removed just before onDone).
   await new Promise((r) => setTimeout(r, 50));
-  b.text = renderBoard(channelId, b.recent);
-  await b.msg.edit({ content: b.text }).catch(() => {});
+  const text = renderBoard(channelId, b.recent);
+  if (text === b.text) return;
+  // Owner 2026-10-30 (card discord-queue-own-message): no edits; post a new silent board, delete the old one.
+  if (!b.msg.channel.isSendable()) return;
+  const fresh = await b.msg.channel.send({ content: text, components: [checkRow(channelId)], ...QUIET }).catch((e) => (log(`board post: ${(e as Error).message}`), null));
+  if (!fresh) return; // b.text unchanged: the next call retries
+  b.text = text;
+  const old = b.msg;
+  b.msg = fresh;
+  await old.delete().catch(() => {});
   if (b.text.includes("Restart pending")) recordPendingBoard(STATE_DIR, channelId, b.msg.id);
 }
 
@@ -1450,9 +1718,11 @@ async function reprintBoard(channelId: string, close: boolean, asked = Date.now(
   b.text = renderBoard(channelId, b.recent);
   const recent = await ch.messages.fetch({ limit: 30 }).catch((e) => (log(`board fetch: ${(e as Error).message}`), null));
   const tFetch = Date.now();
-  let action = "edit";
-  if (recent?.first()?.id === b.msg.id) await b.msg.edit({ content: b.text }).catch((e) => log(`board edit: ${(e as Error).message}`));
-  else {
+  let action = "keep";
+  // Owner 2026-10-30: the board is its own silent message; it is never edited, only replaced by a new post.
+  if (recent?.first()?.id === b.msg.id && b.msg.content === b.text) {
+    // already the newest message with the same text
+  } else {
     action = "post";
     const fresh = await ch.send({ content: b.text, components: [checkRow(channelId)], ...QUIET }).catch((e) => (log(`board post: ${(e as Error).message}`), null));
     if (fresh) {
@@ -1511,7 +1781,7 @@ function own<T extends Message | null | undefined>(m: T): T {
  */
 async function handle(
   msg: Message,
-  asOwner?: { authorId: string; text: string; fromVoice?: boolean; attachments?: { name: string; url: string }[]; restored?: boolean; menuIds?: string[] },
+  asOwner?: { authorId: string; text: string; fromVoice?: boolean; attachments?: { name: string; url: string }[]; restored?: boolean; menuIds?: string[]; voiceRestarts?: number },
 ): Promise<void> {
   // Owner 2026-10-19: owner turns (menus, voice, Undo, restored jobs) in a pinned-model channel go to that model.
   if (asOwner && routePinned(msg.channel, asOwner.text)) return;
@@ -1537,8 +1807,10 @@ async function handle(
   // 📨 Queued (src/queued.ts): the message the owner replied to; read here, before a voice swap replaces `msg`.
   const replyRef = asOwner ? undefined : msg.reference?.messageId;
   // Mirrored Herdr tab channels: never typed into the pane (see src/mirror.ts).
-  const mirrored = msg.guildId === GUILD_ID ? mirror.byChannel(parentId ?? msg.channelId) : undefined;
-  const threadId = isThread ? msg.channelId : null;
+  // Owner 2026-10-30: a pane thread in 🧵 jobs (thread-only entry) is the pane's own channel, not a thread under it.
+  const paneRoute = msg.guildId === GUILD_ID ? mirror.resolve(msg.channelId, parentId) : { entry: undefined, threadId: isThread ? msg.channelId : null };
+  const mirrored = paneRoute.entry;
+  const threadId = mirrored ? paneRoute.threadId : isThread ? msg.channelId : null;
   // P12: the owner may reply in a triage thread under #omp-alerts (a post-only channel): the run continues there.
   const triageThread = isThread && msg.guildId === GUILD_ID && triage.isThread(msg.channelId);
   const msgInfo = {
@@ -1690,15 +1962,28 @@ async function handle(
     // Owner 2026-10-15: swap the voice message for its transcript as soon as it is transcribed. The transcript
     // message then carries the ⏳/✅ reactions, ⚙️ Working, Stop/Undo and the answer's reply link.
     // Guild only (bots can't delete DM messages); only when the message is nothing but voice.
-    const header = `🎙️ from **${msg.member?.displayName ?? msg.author.globalName ?? msg.author.username}**: *${spoken.replace(/[*_`]/g, "")}*`;
-    if (voice.length === msg.attachments.size && !msg.content.trim() && msg.inGuild()) {
-      const t = own(await target.send({ content: header, ...QUIET }));
-      await msg.delete().catch((e) => log(`voice source delete: ${(e as Error).message}`));
-      msg = t;
-    } else await msg.reply({ content: header, ...QUIET });
+    // Card voice-long-transcript (2026-10-31): long transcripts go out in <=2000-char parts, and a failed
+    // header post never drops the run: the full transcript always reaches the agent.
+    const parts = voiceHeaderParts(msg.member?.displayName ?? msg.author.globalName ?? msg.author.username, spoken);
     text = text ? `${text}\n${spoken}` : spoken;
+    const swap = voice.length === msg.attachments.size && !msg.content.trim() && msg.inGuild();
+    const src = msg;
+    const posted = await postVoiceHeader(parts, {
+      first: async (c) => (swap ? own(await target.send({ content: c, ...QUIET })) : (await src.reply({ content: c, ...QUIET }), null)),
+      rest: async (c) => void (await target.send({ content: c, ...QUIET })),
+      notice: async (c) => void (await target.send({ content: c, ...NO_PINGS })),
+      log,
+    });
+    if (swap && posted) {
+      await msg.delete().catch((e) => log(`voice source delete: ${(e as Error).message}`));
+      msg = posted;
+    }
   }
   const attachments = asOwner ? (asOwner.attachments ?? []) : [...msg.attachments.values()].filter((a) => !isVoice(a)).map((a) => ({ name: a.name, url: a.url }));
+  // Owner 2026-10-31 (card reply-answers-menu): a reply (typed or voice) to an open question menu = "✏️ Other" with that text.
+  if (!asOwner && replyRef && text && (await answerByReply(msg, target, replyRef, text, authorId))) return;
+  // Owner 2026-10-31 (card voice-answer-closes-menu): a voice turn or typed text without a reply may still answer an open menu.
+  if (text && ((!asOwner && !replyRef) || asOwner?.fromVoice) && (await answerByMatch(msg, target, text, authorId, Boolean(asOwner?.fromVoice || voice.length), parentId, asOwner?.fromVoice === true))) return;
   // FIRSTMATE router (src/router.ts): a new owner message in the FIRSTMATE channel may go to a domain stack thread.
   if (mirrored && !threadId && mirrored.channelId === FIRSTMATE_CHANNEL_ID && (await routeFirstmate(msg, text, attachments, asOwner, replyRef, parentId))) return;
   // A stack thread under FIRSTMATE: the stack's own OMP session and work folder (never the pane's session).
@@ -1738,7 +2023,7 @@ async function handle(
   // bot message is not scanned: its "Still waiting" links and item tokens name cards the owner did not answer.
   // A job restored after a restart was marked when it first arrived. markQueued never throws.
   // Ask answers (menuIds) carry bot-written question text, so only the owner's own words are scanned.
-  if (!asOwner?.restored) await markQueued(responseRefs(asOwner ? [msg.id, ...(asOwner.menuIds ?? [])] : [msg.id, replyRef], asOwner?.menuIds ? [] : [text]), { log });
+  if (!asOwner?.restored) await markQueued(responseRefs(asOwner ? [msg.id, ...(asOwner.menuIds ?? [])] : [msg.id, replyRef], asOwner?.menuIds ? [] : [text]), { log, expand: true });
   const preview = jobPreview(text);
   let startedAt: number | undefined;
   const { id, position } = queue.enqueue({
@@ -1749,6 +2034,10 @@ async function handle(
     ...(stack ? { group: "stack" } : {}),
     onStart: () => {
       queuedMsgs.delete(id);
+      if (asOwner?.fromVoice) {
+        runningVoice.set(id, { id, channelId: msg.channelId, messageId: msg.id, authorId: asOwner.authorId, text, fromVoice: true, attachments, enqueuedAt: Date.now(), running: true, restarts: asOwner.voiceRestarts ?? 0 });
+        saveQueue();
+      }
       // Owner 2026-10-15: ⏳ = waiting in the queue, ⚙️ = being worked on now.
       void statusReact.set(msg, WORKING);
       // Owner 2026-10-15: turn this job's ⏳ Queued. note into Working… in place, so the order stays
@@ -1822,7 +2111,7 @@ async function handle(
         void statusReact.set(msg, null);
         undoJobs.set(String(id), { msg, startedAt: startedAt ?? Date.now(), text });
         const row = stoppedRow(id);
-        answer = (await msg.reply({ content: "🛑 Stopped. To steer, just type or dictate a correction. To go back to before this message, tap 🔙 Undo. To clear this out, tap 🗑️ Remove.", components: [row], ...QUIET }).catch(() => null)) ?? undefined;
+        answer = (await msg.reply({ content: "🛑 Stopped. To steer, just type or dictate a correction. To go on, tap ▶️ Resume. To go back to before this message, tap 🔙 Undo. To clear this out, tap 🗑️ Remove.", components: [row], ...QUIET }).catch(() => null)) ?? undefined;
         void editBoard(target.id, `\n🛑 **Stopped:** ${maskedLabelText(preview)}`);
         return;
       }
@@ -1831,30 +2120,29 @@ async function handle(
       log(`job ${id} done key=${key} ok=${res?.ok ?? false} code=${res?.code ?? "n/a"} timedOut=${res?.timedOut ?? false} ms=${res?.durationMs ?? 0}`);
       void statusReact.set(msg, res?.ok ? "✅" : "❌");
       if (res?.ok) {
-        // Owner 2026-10-15: wait for the speech (fast on the GPU), then send ONE message with text + audio.
-        // If speech takes over 45 s or fails, the text goes out alone (the audio follows as a 🔊 reply if it arrives).
+        // Owner 2026-10-31: speech is made on demand (🔊 button) to keep the GPU free; voice-call answers are still spoken at once.
         const spokenSource = prepareOutbound(extractAsk(res.stdout).text).messages.filter((m) => !m.paste).map((m) => m.content).join("\n");
-        const audio = synthesize(spokenSource).catch(() => null);
-        const ready = await Promise.race([audio, new Promise<"late">((r) => setTimeout(() => r("late"), 45_000))]);
-        // Same call for the late-audio path (audio undefined): the link then ends the text, right above the 🔊 reply.
-        answer = await sendText(target, res.stdout, undefined, msg, asOwner?.fromVoice === true, typeof ready === "string" && ready !== "late" ? ready : undefined, audioName(text), [], startedAt, fmRun, undefined, res.model ?? models.defaultModel());
+        const voice = asOwner?.fromVoice === true;
+        const audio = voice ? synthesize(spokenSource).catch(() => null) : Promise.resolve(null);
+        const ready = voice ? await Promise.race([audio, new Promise<"late">((r) => setTimeout(() => r("late"), 45_000))]) : null;
+        answer = await sendText(target, res.stdout, undefined, msg, voice, typeof ready === "string" && ready !== "late" ? ready : undefined, audioName(text), [], startedAt, fmRun, undefined, modelWithThinking(res.model ?? models.defaultModel(), lastThinking(res.sessionFile)));
+        if (!voice && answer && speakable(spokenSource)) void addSpeakButton(answer, spokenSource, audioName(text));
         if (planRun && isPlanAnswer(res.stdout)) await target.send({ content: "📝 Plan ready.", components: [sessionCmds.planRow()], ...QUIET }).catch(() => {});
         answer = (await postEarlierExtras(target, res, msg).catch((e) => void log(`earlier extras: ${(e as Error).message}`))) ?? answer;
         const file = await audio;
-        if (!file && asOwner?.fromVoice) void voicechat.stopHold();
+        if (!file && voice) void voicechat.stopHold();
         if (file) {
           if (ready === "late") {
             log("tts late: posting audio separately");
             const ref = { reply: { messageReference: msg.id, failIfNotExists: false } };
             await target.send({ content: "🔊", files: [new AttachmentBuilder(file, { name: audioName(text) })], ...ref, ...QUIET }).catch((e) => log(`tts post: ${(e as Error).message}`));
           }
-          // Same speakable text, played in the voice channel while the owner is in it.
           // Phone-call rule (owner 2026-10-13): only answers to what was SAID in the call are spoken.
-          if (asOwner?.fromVoice) {
-            // Owner 2026-10-13: no length cap in the call (they can stop it any time).
-            await voicechat.speakFile(file).catch((e) => log(`voice say: ${(e as Error).message}`));
-            void transcriptLog(`🤖 **OMP:** ${speakable(spokenSource)}`);
-          }
+          const said = await voicechat.speakFile(file).catch((e) => (log(`voice say: ${(e as Error).message}`), "failed" as const));
+          // Card voicecall-drop: an answer the call could not play gets a visible note under the text answer.
+          if (said === "failed") await target.send({ content: "🔇 I could not say this answer in the voice call (the call dropped or you left). The answer is above as text.", reply: { messageReference: answer?.id ?? msg.id, failIfNotExists: false }, ...QUIET }).catch(() => {});
+          if (said === "missed") await target.send({ content: "🔇 You left the call before this answer was ready. The answer is above as text; I will say it when you rejoin the call within 15 minutes.", reply: { messageReference: answer?.id ?? msg.id, failIfNotExists: false }, ...QUIET }).catch(() => {});
+          void transcriptLog(`🤖 **OMP:** ${speakable(spokenSource)}`);
           rmSync(dirname(file), { recursive: true, force: true });
         }
         return;
@@ -1895,25 +2183,32 @@ async function handle(
       let cause = classifyFailure(errOut, res?.code);
       if (cause.kind === "unknown" && res?.stdout && /Refusal \(/.test(res.stdout)) cause = classifyFailure("Refusal (", res.code); // answer text may quote codes; only a refusal counts
       const detail = err ? (err as Error).message : (res?.stderrTail || res?.stdout || "no output").slice(-800);
-      const auto = shouldAutoRetry(cause, res?.durationMs ?? 0, autoRetried.has(msg.id), res?.toolCalls);
-      log(`job ${id} failure cause=${cause.kind} transient=${cause.transient} autoRetry=${auto}`);
-      retryJobs.set(String(id), { msg, text, attachments });
-      // sendText keeps the reply's dashboard link; the 🔁 Retry button is then added to that same message.
-      answer = await sendText(target, failureText(cause, redact(detail).text, auto ? AUTO_RETRY_DELAY_MS / 1000 : undefined), undefined, undefined, false, undefined, undefined, [], startedAt, fmRun);
-      if (answer) await answer.edit({ components: [SessionCommands.retryRow(id)] }).catch((e) => log(`retry button ${id}: ${(e as Error).message}`));
-      else await target.send({ content: "🔁 Run it again?", components: [SessionCommands.retryRow(id)], ...QUIET }).catch(() => {});
-      if (auto) {
+      const autoMs = autoRetryDelay(cause, res?.durationMs ?? 0, autoRetried.count(msg.id), res?.toolCalls);
+      const attempt = autoRetried.count(msg.id) + 1;
+      log(`job ${id} failure cause=${cause.kind} transient=${cause.transient} autoRetryMs=${autoMs ?? 0} attempt=${attempt}`);
+      // A rate-limited run that already used tools resumes with "continue" so finished steps are not run again.
+      const retryText = autoMs && cause.kind === "rate-limit" && (res?.toolCalls ?? 1) > 0
+        ? "Continue from where you stopped. The last run hit a provider rate limit. Do not repeat steps that already finished (commits, posts, card edits, messages)."
+        : text;
+      retryJobs.set(String(id), { msg, text: retryText, attachments });
+      // sendText keeps the reply's dashboard link; the 🔁 Force retry (+ ⏳ Cooling down) row is added to that message.
+      const coolingUntil = autoMs ? new Date(Date.now() + autoMs) : undefined;
+      answer = await sendText(target, failureText(cause, redact(detail).text, autoMs, attempt), undefined, undefined, false, undefined, undefined, [], startedAt, fmRun);
+      if (answer) await answer.edit({ components: [SessionCommands.retryRow(id, coolingUntil)] }).catch((e) => log(`retry button ${id}: ${(e as Error).message}`));
+      else await target.send({ content: "🔁 Run it again?", components: [SessionCommands.retryRow(id, coolingUntil)], ...QUIET }).catch(() => {});
+      if (autoMs) {
         autoRetried.add(msg.id);
         const failMsg = answer;
         setTimeout(() => {
           const job = retryJobs.get(String(id));
-          if (!job) return; // the owner tapped 🔁 Retry first
+          if (!job) return; // the owner tapped 🔁 Force retry first
           retryJobs.delete(String(id));
-          void failMsg?.edit({ content: failMsg.content.replace(/🔁 Retrying once by itself in \d+ s\./, "🔁 Retried once automatically (see below)."), components: [] }).catch(() => {});
+          void failMsg?.edit({ content: failMsg.content.replace(/⏳ Cooling down: retrying by itself in [^.]*\. Tap 🔁 Force retry to run it now\./, `🔁 Retried automatically after the cool-down (attempt ${attempt}, see below).`), components: [] }).catch(() => {});
           void handle(job.msg, { authorId: OWNER_ID, text: job.text, attachments: job.attachments, restored: true }).catch((e) => log(`auto-retry ${id}: ${(e as Error).message}`));
-        }, AUTO_RETRY_DELAY_MS);
+        }, autoMs);
       }
       } finally {
+        if (runningVoice.delete(id)) saveQueue();
         // Owner 2026-10-15: when the queue is done, the board moves below the last answer.
         void boardToBottom(target.id);
       }
@@ -2104,7 +2399,14 @@ async function restoreQueue(): Promise<void> {
         saveQueue();
         continue;
       }
-      await handle(msg, { authorId: j.authorId, text: j.text, fromVoice: j.fromVoice, attachments: j.attachments ?? [], restored: true });
+      const decision = voiceRestoreDecision(j);
+      if (decision === "drop") {
+        log(`queue: voice turn ${j.id} not run again (already re-run after a restart)`);
+        await msg.reply({ content: "⚠️ This voice-call question was cut off by a bot restart twice, so it was not run again. Please ask it again.", ...QUIET }).catch(() => {});
+        saveQueue();
+        continue;
+      }
+      await handle(msg, { authorId: j.authorId, text: j.text, fromVoice: j.fromVoice, attachments: j.attachments ?? [], restored: true, voiceRestarts: decision });
       log(`queue: saved job ${j.id} queued again`);
     } catch (e) {
       toRestore = toRestore.filter((x) => x !== j);
@@ -2133,16 +2435,24 @@ client.once(Events.ClientReady, (c) => {
   log(`mirror: ${mirror.entries.filter((e) => !e.archived).length} channels; messages never type into panes (quick-reply buttons do, guarded)`);
   const post = async (channelId: string, text: string) => {
     const ch = await mirror.channel(channelId);
-    if (ch) await sendText(ch, text);
+    if (!ch) return;
+    const last = await sendText(ch, text);
+    // Card tts-on-demand: terminal replies get the 🔊 button too (owner: "under every response"); the header line is not spoken.
+    const spoken = mirrorSpokenSource(text);
+    if (last && speakable(spoken)) void addSpeakButton(last, spoken, audioName(spoken));
   };
   // Owner 2026-10-15: one silent status message per pane turn, edited in place (privacy filter applied).
   // Orca #4 (owner 2026-10-19): it carries a "📜 Last 40 lines" button (edits add it to older messages too).
+  // Owner 2026-10-28: and a ❌ Stop button (Esc into the pane, src/panestop.ts), so every terminal job can be stopped.
   const status = async (channelId: string, text: string, msgId?: string): Promise<string | undefined> => {
     const ch = await mirror.channel(channelId);
     if (!ch) return msgId;
     const content = prepareOutbound(text).messages[0]?.content.slice(0, 2000) ?? "";
     const scroll = new ButtonBuilder().setCustomId(`${SB_PREFIX}${channelId}`).setLabel(`Last ${SCROLLBACK_LINES} lines`).setEmoji("📜").setStyle(ButtonStyle.Secondary);
-    const components = [new ActionRowBuilder<ButtonBuilder>().addComponents(scroll)];
+    const pane = mirror.byChannel(channelId);
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(scroll);
+    if (pane && !pane.archived) row.addComponents(new ButtonBuilder().setCustomId(paneStopId(pane)).setLabel("Stop").setEmoji("❌").setStyle(ButtonStyle.Danger));
+    const components = [row];
     if (msgId && "messages" in ch) {
       const old = await ch.messages.fetch(msgId).catch(() => null);
       if (old) {
@@ -2159,7 +2469,17 @@ client.once(Events.ClientReady, (c) => {
   setInterval(() => void limitWatch.tick().catch((e) => log(`limitwatch: ${(e as Error).message}`)), LIMIT_TICK_MS);
   setInterval(() => void approvals.tick().catch((e) => log(`approvals error: ${(e as Error).message}`)), 2_000);
   // P1: a drain ends by itself when the restart waiter stops renewing it; then start the waiting jobs.
-  setInterval(() => queue.kick(), 5_000);
+  setInterval(() => {
+    queue.kick();
+    // Card omp-pause-button: a pause or resume from outside (CLI, after a reboot) redraws the boards once.
+    const paused = readMaintPause() !== null;
+    if (paused !== lastMaintPaused) {
+      lastMaintPaused = paused;
+      log(`maintenance pause ${paused ? "on: queued jobs wait" : "off: queue runs"}`);
+      masterQueue?.schedule(0, true);
+      for (const ch of queueBoards.keys()) keepBoardLast(ch, 0);
+    }
+  }, 5_000);
   // Owner 2026-10-23 (Discord UX item 3): expired menus become "⌛ Expired · 🔁 Ask again".
   setTimeout(() => void editExpiredMenus().catch((e) => log(`expired menus: ${(e as Error).message}`)), 60_000);
   setInterval(() => void editExpiredMenus().catch((e) => log(`expired menus: ${(e as Error).message}`)), 10 * 60_000);
@@ -2293,10 +2613,11 @@ const needsMenuSource: MenuSource = {
   },
 };
 /** 🔔-needs-you board (owner 2026-10-22, card needs-you-channel): kept as the channel's last message. */
-const needsYou = NEEDS_YOU_CHANNEL_ID
+// Owner 2026-10-27: #needs-you removed. Its 🔔 ping lines post in FIRSTMATE; the items live in the master queue.
+const needsYou = FIRSTMATE_CHANNEL_ID
   ? new NeedsYouBoard({
       getChannel: async () => {
-        const ch = await client.channels.fetch(NEEDS_YOU_CHANNEL_ID).catch(() => null);
+        const ch = await client.channels.fetch(FIRSTMATE_CHANNEL_ID).catch(() => null);
         // discord.js TextChannel satisfies the BoardChannel subset; the structural types differ in overloads.
         return ch?.isSendable() && "messages" in ch ? (ch as unknown as BoardChannel) : null;
       },
@@ -2305,10 +2626,9 @@ const needsYou = NEEDS_YOU_CHANNEL_ID
       stateFile: join(STATE_DIR, "needs-you-state.json"),
       dash: DASHBOARD_BASE_URL,
       log,
-      ...needsMenuSource,
       ownerId: OWNER_ID,
-      notice: () => pauseLine(readPause()),
       paused: () => !!readPause(),
+      alertsOnly: true,
     })
   : null;
 /**
@@ -2373,8 +2693,12 @@ const masterQueue = FIRSTMATE_CHANNEL_ID
           ...st.queued.map((j) => ({ ...masterJobView(j.id, j.label, j.preview), running: false, since: j.since })),
         ];
       },
-      mayBeBelow: (m) => isBoardText(m.content),
-      notice: () => pauseLine(readPause()),
+      mayBeBelow: (m) => isBoardText(m.content) || isAlert(m.content), // 🔔 needs-you pings may sit below (owner 2026-10-27)
+      notice: () => [maintLine(readMaintPause()), pauseLine(readPause())].filter(Boolean).join("\n"),
+      components: () => {
+        const b = maintButton(readMaintPause() !== null);
+        return [new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId(b.customId).setLabel(b.label).setEmoji(b.emoji).setStyle(ButtonStyle.Secondary)).toJSON()];
+      },
       itemsFile: process.env.OMP_FM_ITEMS ?? join(FM_DIR, "items.json"),
       receiptsDir: join(FM_DIR, "receipts"),
       stateFile: join(STATE_DIR, "master-queue.json"),
@@ -2443,7 +2767,7 @@ async function routeFirstmate(
   msg: Message,
   text: string,
   attachments: { name: string; url: string }[],
-  asOwner: { authorId: string; fromVoice?: boolean; restored?: boolean; menuIds?: string[] } | undefined,
+  asOwner: { authorId: string; fromVoice?: boolean; restored?: boolean; menuIds?: string[]; voiceRestarts?: number } | undefined,
   replyRef: string | undefined,
   parentId: string | null,
 ): Promise<boolean> {
@@ -2469,6 +2793,19 @@ async function routeFirstmate(
     return false;
   }
   const body = forcedStack(text, stackRouter.cfg.stacks)?.rest || text;
+  // Owner 2026-10-30 (card discord-stack-route-existing): a follow-up to an open job of this stack goes to that job's channel.
+  const jm = await matchOpenJob(s.name, body);
+  if (jm.kind !== "none") log(`router: ${s.name} job match ${jm.kind} ${jm.job.id} (${jm.by})`);
+  if (jm.kind === "match" && (await forwardToJob(msg, s, jm.job, jm.by, body, attachments, asOwner, replyRef))) return true;
+  if (jm.kind === "unsure" && (await askJobRoute(msg, s, d, jm.job, body, attachments, asOwner, replyRef))) return true;
+  return forwardToStack(msg, s, d, body, attachments, asOwner, replyRef);
+}
+
+type OwnerTurn = { authorId: string; fromVoice?: boolean; restored?: boolean; menuIds?: string[]; voiceRestarts?: number } | undefined;
+
+/** The old path: the message copy goes to the stack thread and runs there as a new side job. */
+async function forwardToStack(msg: Message, s: StackDef, d: RouteDecision, body: string, attachments: { name: string; url: string }[], asOwner: OwnerTurn, replyRef: string | undefined): Promise<boolean> {
+  if (msg.channel.type !== ChannelType.GuildText) return false;
   let copy: Message;
   try {
     copy = own(await stackRouter.forward(msg, msg.channel, s, d, body));
@@ -2477,10 +2814,85 @@ async function routeFirstmate(
     return false;
   }
   void msg.react("🧭").catch(() => {});
-  await markQueued(responseRefs(asOwner ? [msg.id, ...(asOwner.menuIds ?? [])] : [msg.id, replyRef], asOwner?.menuIds ? [] : [text]), { log });
-  void handle(copy, { authorId: asOwner?.authorId ?? msg.author.id, text: body, fromVoice: asOwner?.fromVoice, attachments, restored: true }).catch((e) => log(`router: stack ${s.name} handle: ${(e as Error).message}`));
+  await markQueued(responseRefs(asOwner ? [msg.id, ...(asOwner.menuIds ?? [])] : [msg.id, replyRef], asOwner?.menuIds ? [] : [body]), { log, expand: true });
+  void handle(copy, { authorId: asOwner?.authorId ?? msg.author.id, text: body, fromVoice: asOwner?.fromVoice, attachments, restored: true, voiceRestarts: asOwner?.voiceRestarts }).catch((e) => log(`router: stack ${s.name} handle: ${(e as Error).message}`));
   lastOwnerChannelId = msg.channelId; // spoken turns keep going to FIRSTMATE (the router), not the stack thread
   return true;
+}
+
+/** Open jobs of a stack: cards with a mapped pane channel (src/jobmatch.ts). Never throws. */
+async function matchOpenJob(stack: string, text: string): Promise<JobMatch> {
+  try {
+    const jobs = openJobs(readCards(ITEMS_FILE) ?? [], stack, (t) => mirror.byJob(t)?.channelId);
+    const st = stackRouter.stack(stack);
+    return await matchJob(text, jobs, jobJudge, 0.8, 4000, [stack, ...(st?.keywords ?? [])]);
+  } catch (e) {
+    log(`router: job match failed: ${(e as Error).message}`);
+    return { kind: "none", by: "error" };
+  }
+}
+const jobJudge = jevJobJudge({
+  keyFn: async () => {
+    const p = Bun.spawn([OMP_BIN, "token", "openrouter"], { stdout: "pipe", stderr: "ignore" });
+    const out = (await new Response(p.stdout).text()).trim();
+    if ((await p.exited) !== 0 || !out) throw new Error("no openrouter credential");
+    return out;
+  },
+});
+
+/** Post the message in the job's channel and run it there (same path as typing in that channel). */
+async function forwardToJob(msg: Message, s: StackDef, job: OpenJob, by: string, body: string, attachments: { name: string; url: string }[], asOwner: OwnerTurn, replyRef: string | undefined): Promise<boolean> {
+  const ch = await client.channels.fetch(job.channelId).catch(() => null);
+  if (!ch?.isSendable()) return false;
+  let copy: Message;
+  try {
+    copy = own(await ch.send({ content: `📨 **From FIRSTMATE** · [source](<${msg.url}>)\n${(body.length > 1800 ? `${body.slice(0, 1800)}…` : body) || "(attachment)"}`, ...QUIET }));
+  } catch (e) {
+    log(`router: forward to job ${job.id} failed: ${(e as Error).message}`);
+    return false;
+  }
+  const note = await msg.reply({ content: `→ ${s.emoji} ${s.name} · existing job \`${job.id}\` (${by}): ${channelMention(job.channelId)}`, ...QUIET }).catch(() => null);
+  if (msg.channel.type === ChannelType.GuildText) {
+    const t = await stackRouter.thread(msg.channel, s).catch(() => null);
+    await t?.send({ content: `📨 [Follow-up](<${msg.url}>) → existing job \`${job.id}\`: ${channelMention(job.channelId)}`, ...QUIET }).catch(() => {});
+  }
+  stackRouter.remember([msg.id, note?.id, copy.id], s.name);
+  void msg.react("🧭").catch(() => {});
+  await markQueued(responseRefs(asOwner ? [msg.id, ...(asOwner.menuIds ?? [])] : [msg.id, replyRef], asOwner?.menuIds ? [] : [body]), { log, expand: true });
+  void handle(copy, { authorId: asOwner?.authorId ?? msg.author.id, text: body, fromVoice: asOwner?.fromVoice, attachments, restored: true, voiceRestarts: asOwner?.voiceRestarts }).catch((e) => log(`router: job ${job.id} handle: ${(e as Error).message}`));
+  lastOwnerChannelId = msg.channelId;
+  return true;
+}
+
+type PendingJobRoute = { msg: Message; s: StackDef; d: RouteDecision; job: OpenJob; body: string; attachments: { name: string; url: string }[]; asOwner: OwnerTurn; replyRef: string | undefined; at: number };
+const pendingJobRoutes = new Map<string, PendingJobRoute>();
+
+/** Unsure: one menu under the owner's message (existing job / new job). */
+async function askJobRoute(msg: Message, s: StackDef, d: RouteDecision, job: OpenJob, body: string, attachments: { name: string; url: string }[], asOwner: OwnerTurn, replyRef: string | undefined): Promise<boolean> {
+  for (const [k, v] of pendingJobRoutes) if (Date.now() - v.at > 24 * 3600_000) pendingJobRoutes.delete(k);
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`${JOBROUTE_PREFIX}${msg.id}:job`).setLabel(`Existing job: ${job.title}`.slice(0, 80)).setEmoji("📨").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`${JOBROUTE_PREFIX}${msg.id}:new`).setLabel("New job").setEmoji("🆕").setStyle(ButtonStyle.Secondary),
+  );
+  const sent = await msg.reply({ content: `${s.emoji} ${s.name}: is this a follow-up to \`${job.id}\` (${channelMention(job.channelId)}) or a new job?`, components: [row], ...NO_PINGS }).catch(() => null);
+  if (!sent) return false;
+  pendingJobRoutes.set(msg.id, { msg, s, d, job, body, attachments, asOwner, replyRef, at: Date.now() });
+  return true;
+}
+
+async function handleJobRouteButton(i: ButtonInteraction): Promise<void> {
+  if (!jobRouteClickAllowed(i.user.id, OWNER_ID, i.message.author.id, client.user?.id)) {
+    await i.reply({ content: "Only the owner can pick where this message goes.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const [id, pick] = i.customId.slice(JOBROUTE_PREFIX.length).split(":");
+  const p = pendingJobRoutes.get(id ?? "");
+  if (!p) return void (await i.reply({ content: "This menu expired (bot restart). Send the message again.", flags: MessageFlags.Ephemeral }));
+  pendingJobRoutes.delete(id!);
+  const toJob = pick === "job";
+  await i.update({ content: `${i.message.content}\n\n✅ ${toJob ? `existing job \`${p.job.id}\`` : "new job"}`.slice(0, 2000), components: [] });
+  const ok = toJob && (await forwardToJob(p.msg, p.s, p.job, "owner pick", p.body, p.attachments, p.asOwner, p.replyRef));
+  if (!ok) await forwardToStack(p.msg, p.s, p.d, p.body, p.attachments, p.asOwner, p.replyRef);
 }
 client.once(Events.ClientReady, () => {
   if (masterQueue) {
@@ -2550,12 +2962,31 @@ function alertsCommand(action: string, reason: string): string {
  * Needs-you lists: the ask set is marked answered (boards hide it) and its linked cards move to partial
  * "📨 answered HH:MM; working" (markQueued), even when the work is not done.
  */
-function noteMenuAnswer(messageIds: (string | undefined)[], via: AnswerVia): void {
-  const ids = asks.markAnswered(messageIds, via);
+const answerLogged = new Set<string>();
+async function editCopyMenus(c: { channelId: string; messageIds?: Record<string, string> }): Promise<void> {
+  const ch = await client.channels.fetch(c.channelId).catch(() => null);
+  if (!ch || !("messages" in ch)) return;
+  for (const id of Object.values(c.messageIds ?? {})) {
+    const m = await ch.messages.fetch(id).catch(() => null);
+    if (m) await m.edit({ content: `${m.content}\n\n✅ Answered in the other copy of this question.`.slice(0, 2000), components: [] }).catch((e: Error) => log(`ask copy edit: ${e.message}`));
+  }
+}
+function noteMenuAnswer(messageIds: (string | undefined)[], via: AnswerVia, text?: string): void {
+  const marked = asks.markAnswered(messageIds, via, Date.now(), text);
+  // One answer per set (card voice-answer-closes-menu): the bot's own turn for the same answer is not logged again.
+  const ids = marked.filter((id) => !answerLogged.has(id));
   if (!ids.length) return;
+  for (const id of ids) answerLogged.add(id);
   log(`ask: owner answered (${via}) ${ids.join(", ")}`);
-  const menuIds = ids.flatMap((id) => Object.values(asks.openSets().find((s) => s.setId === id)?.messageIds ?? asks.closedSet(id)?.messageIds ?? {}));
-  void markQueued(responseRefs(menuIds, []), { log });
+  // Copies of the same ask in other channels close with it.
+  const copies = ids.flatMap((id) => asks.closeCopies(id));
+  for (const c of copies) {
+    answerLogged.add(c.setId);
+    log(`ask ${c.setId}: closed as a copy of ${ids.join(", ")}`);
+    void editCopyMenus(c);
+  }
+  const menuIds = [...ids, ...copies.map((c) => c.setId)].flatMap((id) => Object.values(asks.openSets().find((s) => s.setId === id)?.messageIds ?? asks.closedSet(id)?.messageIds ?? {}));
+  void markQueued(responseRefs(menuIds, []), { log, expand: true });
   needsYou?.schedule(1_000);
 }
 async function noteOwnerAnswer(msg: Message, asOwner: { restored?: boolean; menuIds?: string[] } | undefined): Promise<void> {
@@ -2567,10 +2998,16 @@ async function noteOwnerAnswer(msg: Message, asOwner: { restored?: boolean; menu
     }
     const replyRef = msg.reference?.messageId;
     if (!replyRef) return; // typed text without a reply names no menu (one channel holds menus of many topics)
+    // Card voice-answer-closes-menu: a clarification, a question back, or a deferral is not an answer; the menu stays
+    // open. A voice memo has no text yet: its transcript goes through answerByReply/answerByMatch later.
+    if (!msg.content.trim() || leavesOpen(msg.content)) {
+      log(`ask: reply leaves the menu open (${msg.content.trim() ? "asks back or defers" : "no text yet"})`);
+      return;
+    }
     // One hop up too: a reply in a stack thread to the copy/answer that itself points at the menu.
     const ref = await msg.fetchReference().catch(() => null);
     const stack = stackRouter.stackByThread(msg.channel.isThread() ? msg.channelId : null);
-    noteMenuAnswer([replyRef, ref?.reference?.messageId], stack ? "stack-thread" : "reply");
+    noteMenuAnswer([replyRef, ref?.reference?.messageId], stack ? "stack-thread" : "reply", msg.content);
   } catch (e) {
     log(`ask: answer mark failed: ${(e as Error).message}`);
   }
@@ -2613,14 +3050,14 @@ async function ownerDoneReaction(r: MessageReaction | PartialMessageReaction, us
   if (doneFollowUps.add(msg.id)) log(`react-done: owner ✅ on ${msg.id}; follow-up queued`);
 }
 client.on(Events.MessageReactionAdd, (r, user) => {
-  if (needsYou && r.message.channelId === NEEDS_YOU_CHANNEL_ID) needsYou.onReaction(user.id);
+  if (needsYou && r.message.channelId === FIRSTMATE_CHANNEL_ID) needsYou.onReaction(user.id);
   void ownerDoneReaction(r, user.id, true).catch((e) => log(`react-done: ${(e as Error).message}`));
 });
 client.on(Events.MessageReactionRemove, (r, user) => {
   void ownerDoneReaction(r, user.id, false).catch((e) => log(`react-done: ${(e as Error).message}`));
 });
 client.on(Events.MessageCreate, (msg) => {
-  if (needsYou && msg.channelId === NEEDS_YOU_CHANNEL_ID) needsYou.onMessage(msg);
+  if (needsYou && msg.channelId === FIRSTMATE_CHANNEL_ID) needsYou.onMessage(msg);
   if (masterQueue && msg.channelId === FIRSTMATE_CHANNEL_ID) masterQueue.onMessage(msg);
   // 🧠-local-omp channels: never reach Claude. Owner → one local-model OMP turn; everyone else is ignored.
   // Threads under a local-omp channel never reach the mirror or Claude: they are ignored.
@@ -2640,7 +3077,12 @@ client.on(Events.MessageCreate, (msg) => {
   }
   if (!(msg.author.id === client.user?.id && (isBoardText(msg.content) || isMasterBoard(msg.content)))) keepBoardLast(msg.channelId);
   if (msg.author.id === OWNER_ID && !queueBoards.has(msg.channelId)) void clearStaleBoards(msg);
-  handle(msg).catch((e) => log(`handler error: ${(e as Error).message}`));
+  handle(msg).catch((e) => {
+    log(`handler error: ${(e as Error).message}`);
+    // Card voice-long-transcript: an owner message never fails silently.
+    if (msg.author.id === OWNER_ID)
+      void msg.reply({ content: `⚠️ I hit an error with this message and did not start a run: ${(e as Error).message.slice(0, 300)}. Please send it again.`, ...NO_PINGS }).catch(() => {});
+  });
 });
 /** Owner joins "🎧 OMP Voice" = voice mode on; owner leaves = off. Nobody else can turn it on. */
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
@@ -2693,7 +3135,8 @@ function sessionCtxFor(channel: Interaction["channel"], channelId: string): Sess
   if (!channel) return "I can't see this channel.";
   const isThread = channel.isThread();
   const parentId = isThread ? channel.parentId : null;
-  const threadId = isThread ? channelId : null;
+  const paneRoute = mirror.resolve(channelId, parentId);
+  const threadId = paneRoute.entry ? paneRoute.threadId : isThread ? channelId : null;
   const model = models.resolveOverride(modelOverrides, channelId, parentId);
   const ctx = (key: string, cwd: string): SessionCtx => {
     const k = qwenSessionKey(key, model);
@@ -2701,7 +3144,7 @@ function sessionCtxFor(channel: Interaction["channel"], channelId: string): Sess
   };
   const sk = stackRouter.stackByThread(threadId);
   if (sk) return ctx(stackSessionKey(sk.name), sk.cwd);
-  const m = mirror.byChannel(parentId ?? channelId);
+  const m = paneRoute.entry;
   if (m) {
     // Mirrored Herdr channels: turns may continue the pane's own session file, and FIRSTMATE must never be
     // compacted/cleared/branched from here. Only read-only views work (WRITE_ACTIONS are refused).
@@ -2807,6 +3250,8 @@ const STAT_COMMANDS: (ApplicationCommandDataResolvable & { name: string })[] = [
       { name: "updates", description: "Pending repo and AUR updates (list only)" },
       { name: "second", description: "Is the peer machine reachable, uptime and battery" },
       { name: "automations", description: "All timers (main + remote host): next/last run, result; Run now / Pause / Resume" },
+      { name: "pause", description: "Pause all agent work: the queue starts nothing new; fm-spawn and sweeps wait", options: [{ type: ApplicationCommandOptionType.String as const, name: "reason", description: "Why (shown on the boards)", required: false, max_length: 200 }] },
+      { name: "resume-work", description: "Resume agent work after /pause and continue the saved sessions" },
     ];
   })(),
   { name: "models", description: "Show or switch the model used in this channel" },
@@ -2825,6 +3270,8 @@ const STAT_COMMANDS: (ApplicationCommandDataResolvable & { name: string })[] = [
       { type: ApplicationCommandOptionType.String, name: "reason", description: "Shown on the boards (optional)", required: false },
     ],
   },
+  { name: "voice-change", description: "Pick the voice that reads answers aloud (hear samples first)" },
+  { name: "voice-status", description: "Show the text-to-speech voice and whether the speech server answers" },
   { name: "help", description: "List the bot's slash commands" },
 ];
 /** /help text: every registered command with its description and options. */
@@ -2891,6 +3338,43 @@ client.once(Events.ClientReady, (c) => {
     .then((set) => log(`slash commands registered: ${[...set.values()].map((x) => `/${x.name}`).join(" ")}`))
     .catch((e) => log(`slash commands: ${(e as Error).message}`));
 });
+/** Card omp-pause-button: last seen maintenance pause state (the 5 s timer redraws the boards when it changes). */
+let lastMaintPaused = readMaintPause() !== null;
+/**
+ * ⏸️ Pause = `omp-maintenance pause <reason>`; ▶️ Resume = `omp-maintenance resume` (continues the saved sessions,
+ * then removes the flag). Resume can wait for sessions, so it runs detached; the 5 s timer sees the flag go away.
+ */
+async function maintAction(i: ChatInputCommandInteraction | ButtonInteraction, action: "pause" | "resume", reason: string): Promise<void> {
+  await i.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+  const was = readMaintPause();
+  if (action === "pause" && was) return void (await i.editReply(`⏸️ Already paused: ${was.reason}.`).catch(() => {}));
+  if (action === "resume" && !was) return void (await i.editReply("▶️ Work is not paused.").catch(() => {}));
+  if (action === "pause") {
+    const why = reason.trim() || `paused from Discord by ${i.user.username}`;
+    const { promise, resolve } = Promise.withResolvers<string>();
+    execFile(MAINT_BIN, ["pause", why], { timeout: 60_000 }, (e, _o, se) => resolve(e ? `${e.message} ${String(se).slice(-300)}` : ""));
+    const err = await promise;
+    log(`maintenance pause from Discord: ${why}${err ? ` (error: ${err})` : ""}`);
+    if (readMaintPause()) {
+      const n = pauseNotice(why);
+      const b = new ButtonBuilder().setCustomId(n.button.customId).setLabel(n.button.label).setEmoji(n.button.emoji).setStyle(ButtonStyle.Success);
+      await i.editReply({ content: n.content, components: [new ActionRowBuilder<ButtonBuilder>().addComponents(b)] }).catch(() => {});
+    } else await i.editReply(`❌ Pause failed: ${err.slice(0, 500)}`).catch(() => {});
+  } else {
+    // A fixed transient unit: a second tap cannot start a second resume (duplicate continue prompts), and a bot
+    // restart does not kill it (review 2026-10-30).
+    const { promise, resolve } = Promise.withResolvers<string>();
+    execFile("systemd-run", ["--user", "--unit=omp-maintenance-resume-now", "--collect", MAINT_BIN, "resume"], { timeout: 30_000 }, (e, _o, se) => resolve(e ? String(se || e.message) : ""));
+    const err = await promise;
+    if (err) {
+      log(`maintenance resume: ${err}`);
+      return void (await i.editReply(/already (loaded|exists)|already active/i.test(err) ? "▶️ Resume is already running." : `❌ Resume failed: ${err.slice(0, 500)}`).catch(() => {}));
+    }
+    log("maintenance resume from Discord");
+    await i.editReply("▶️ Resuming: saved sessions get a continue prompt, then the queue starts again (the board updates when the pause ends).").catch(() => {});
+  }
+  masterQueue?.schedule(0, true);
+}
 async function handleStatCommand(i: ChatInputCommandInteraction): Promise<void> {
   if (i.user.id !== OWNER_ID) return void (await i.reply({ content: "These commands are for the owner only.", flags: MessageFlags.Ephemeral }));
   if (!commandEnabled(i.commandName)) return void (await i.reply({ content: `/${i.commandName} is turned off (config.json optionalCommands).`, flags: MessageFlags.Ephemeral }));
@@ -2901,7 +3385,11 @@ async function handleStatCommand(i: ChatInputCommandInteraction): Promise<void> 
     return void (await i.reply({ content: `🔄 Restart **${svc}**?`, components: [new ActionRowBuilder<ButtonBuilder>().addComponents(yes)], flags: MessageFlags.Ephemeral }));
   }
   if (i.commandName === "automations") return void (await automations.handleCommand(i, AUTOMATIONS));
+  if (i.commandName === "pause") return void (await maintAction(i, "pause", i.options.getString("reason") ?? ""));
+  if (i.commandName === "resume-work") return void (await maintAction(i, "resume", ""));
   if (i.commandName === "models" || i.commandName === "model") return void (await i.reply({ ...modelsMenu(i.channelId), flags: MessageFlags.Ephemeral }));
+  if (i.commandName === "voice-change") return void (await i.reply({ ...voicepick.pickerMenu(voicepick.readVoice(STATE_DIR)), flags: MessageFlags.Ephemeral }));
+  if (i.commandName === "voice-status") return void (await i.reply({ content: await voiceStatus(), flags: MessageFlags.Ephemeral }));
   if (i.commandName === "blinds") {
     await i.deferReply();
     const target = (i.options.getString("blind") ?? "all").trim() || "all";
@@ -2935,6 +3423,45 @@ async function handleStatCommand(i: ChatInputCommandInteraction): Promise<void> 
     log(`/${i.commandName} error: ${(e as Error).message}`);
   }
   await i.editReply({ content: text, allowedMentions: { parse: [] } });
+}
+/** /voice-status: saved voice, speech server socket and unit state, cached samples. */
+async function voiceStatus(): Promise<string> {
+  const sock = join(process.env.XDG_RUNTIME_DIR ?? "/tmp", "omp-tts.sock");
+  const serverUp = await new Promise<boolean>((res) => {
+    const c = netConnect(sock);
+    c.setTimeout(2000, () => (c.destroy(), res(false)));
+    c.on("connect", () => (c.destroy(), res(true)));
+    c.on("error", () => res(false));
+  });
+  const service = spawnSync("systemctl", ["--user", "is-active", "omp-tts.service"], { encoding: "utf8", timeout: 5000 }).stdout.trim() || "unknown";
+  const cached = voicepick.ALL_VOICES.filter((v) => voicepick.cachedPreview(STATE_DIR, v)).length;
+  return voicepick.statusText({ voice: voicepick.readVoice(STATE_DIR), serverUp, service, cached });
+}
+/** /voice-change menus: "use" saves the voice and removes the menu; "hear" posts a cached sample clip. */
+async function handleVoicePick(i: StringSelectMenuInteraction): Promise<void> {
+  if (i.user.id !== OWNER_ID) return void (await i.reply({ content: "Only the owner can change the voice.", flags: MessageFlags.Ephemeral }));
+  const v = i.values[0] ?? "";
+  if (!voicepick.isVoice(v)) return void (await i.reply({ content: "❌ Unknown voice.", flags: MessageFlags.Ephemeral }));
+  if (i.customId.startsWith(voicepick.SET_PREFIX)) {
+    voicepick.writeVoice(STATE_DIR, v);
+    log(`/voice-change: ${v}`);
+    return void (await i.update({ content: `✅ Voice set to **${voicepick.voiceLabel(v)}** (\`${v}\`). New spoken answers use it.`, components: [] }));
+  }
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  let file = voicepick.cachedPreview(STATE_DIR, v);
+  if (!file) {
+    const out = voicepick.previewPath(STATE_DIR, v);
+    mkdirSync(dirname(out), { recursive: true });
+    // Write to a temp name and rename on success: a cut-off or concurrent clip never lands in the cache (review).
+    const tmp = `${out}.${process.pid}.${Date.now()}.tmp.ogg`;
+    const made = await synthesize(voicepick.PREVIEW_TEXT, { voice: v, out: tmp, raw: true });
+    if (made) {
+      renameSync(tmp, out);
+      file = out;
+    } else rmSync(tmp, { force: true });
+  }
+  if (!file) return void (await i.editReply("❌ The speech server did not answer. Check `/voice-status`."));
+  await i.editReply({ content: `🔊 **${voicepick.voiceLabel(v)}** (\`${v}\`)`, files: [new AttachmentBuilder(file, { name: `${v}.ogg` })] });
 }
 const RSVC_PREFIX = "rsvc:";
 /** Orca #6 (owner 2026-10-19): /automations buttons and menus; every action goes to automations-actions.jsonl. */
@@ -3025,6 +3552,10 @@ client.on(Events.InteractionCreate, (i) => {
     sessionCmds.handle(i).catch((e) => log(`session command error: ${(e as Error).message}`));
     return;
   }
+  if (i.isStringSelectMenu() && (i.customId.startsWith(voicepick.SET_PREFIX) || i.customId.startsWith(voicepick.HEAR_PREFIX))) {
+    handleVoicePick(i).catch((e) => log(`voice pick error: ${(e as Error).message}`));
+    return;
+  }
   if (i.isStringSelectMenu() && i.customId.startsWith(models.PROVIDER_PREFIX)) {
     if (i.user.id !== OWNER_ID) return;
     const ch = i.customId.slice(models.PROVIDER_PREFIX.length);
@@ -3050,6 +3581,11 @@ client.on(Events.InteractionCreate, (i) => {
   }
   if ((i.isButton() || i.isStringSelectMenu()) && i.customId.startsWith(automations.PREFIX)) {
     automations.handleInteraction(i, AUTOMATIONS).catch((e) => log(`automations error: ${(e as Error).message}`));
+    return;
+  }
+  if (i.isButton() && i.customId.startsWith(MAINT_PREFIX)) {
+    if (i.user.id !== OWNER_ID) return void i.reply({ content: "Only the owner can pause or resume work.", flags: MessageFlags.Ephemeral }).catch(() => {});
+    maintAction(i, i.customId.slice(MAINT_PREFIX.length) === "resume" ? "resume" : "pause", "").catch((e) => log(`maintenance button: ${(e as Error).message}`));
     return;
   }
   if (i.isButton() && i.customId.startsWith(RSVC_PREFIX)) {
@@ -3080,8 +3616,16 @@ client.on(Events.InteractionCreate, (i) => {
     })().catch((e) => log(`blinds-button error: ${(e as Error).message}`));
     return;
   }
+  if (i.isButton() && i.customId.startsWith(RESUME_PREFIX)) {
+    handleResumeButton(i).catch((e) => log(`resume-button error: ${(e as Error).message}`));
+    return;
+  }
   if (i.isButton() && i.customId.startsWith(UNDO_PREFIX)) {
     handleUndoButton(i).catch((e) => log(`undo-button error: ${(e as Error).message}`));
+    return;
+  }
+  if (i.isButton() && i.customId.startsWith(JOBROUTE_PREFIX)) {
+    handleJobRouteButton(i).catch((e) => log(`jobroute-button error: ${(e as Error).message}`));
     return;
   }
   if (i.isButton() && [DUMP_PREFIX, DUMP_OK_PREFIX, DUMP_NO_PREFIX].some((p) => i.customId.startsWith(p))) {
@@ -3116,6 +3660,10 @@ client.on(Events.InteractionCreate, (i) => {
     handleScrollback(i).catch((e) => log(`scrollback error: ${(e as Error).message}`));
     return;
   }
+  if (i.isButton() && i.customId.startsWith(PANE_STOP_PREFIX)) {
+    handlePaneStop(i).catch((e) => log(`pane-stop error: ${(e as Error).message}`));
+    return;
+  }
   if (i.isModalSubmit() && i.customId.startsWith("askmodal:")) {
     handleAskModal(i).catch((e) => log(`ask-modal error: ${(e as Error).message}`));
     return;
@@ -3138,6 +3686,10 @@ client.on(Events.InteractionCreate, (i) => {
   }
   if (i.isButton() && i.customId.startsWith(APPROVE_PREFIX)) {
     handleApproveButton(i).catch((e) => log(`approve-button error: ${(e as Error).message}`));
+    return;
+  }
+  if (i.isButton() && i.customId.startsWith(SPEAK_PREFIX)) {
+    handleSpeakButton(i).catch((e) => log(`speak-button error: ${(e as Error).message}`));
     return;
   }
   if (!i.isButton() || i.customId !== SEND_BUTTON_ID) return;
@@ -3262,10 +3814,33 @@ const server = startHttp({
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(`Open the secret form (${mins} min)`).setEmoji("🔐").setURL(url));
     // Owner 2026-10-23: the value never goes through Discord; this message holds only the one-time link.
     const m = own(await ch.send({ content: `🔐 **Secret needed: ${d.name}.** Tap the button and paste it there (tailnet only, works once). It is saved on the main host as a 0600 file; do not paste it in Discord.`, components: [row], ...NO_PINGS }));
+    ownerNtfy(`secret:${d.id}`, "authentication", `Secret needed: ${d.name}`, m.url, { log });
     log(`secret-drop: link for "${d.name}" → ${d.dest} (expires in ${mins} min)`);
     return { id: d.id, url, expiresAt: d.expiresAt, message: m.url };
   },
   secretDropStatus: (id) => secretDrops.status(id),
+  // Owner 2026-10-28 (card stack-catalog): never a terminal job without a Stop control. fm-spawn calls this when the
+  // pane got no mirrored channel in time (category full, rate limit): post in the stack thread + alert FIRSTMATE.
+  stackJob: async (o) => {
+    if (!client.isReady()) throw new Error("gateway not ready");
+    const s = stackRouter.stack(o.stack);
+    if (!s) return { error: `unknown stack ${o.stack} (add it with scripts/stack-add.ts)` };
+    const parent = FIRSTMATE_CHANNEL_ID ? await client.channels.fetch(FIRSTMATE_CHANNEL_ID).catch(() => null) : null;
+    if (!parent || parent.type !== ChannelType.GuildText) return { error: "FIRSTMATE channel not available" };
+    const t = await stackRouter.thread(parent, s);
+    const components = o.pane ? [new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId(paneStopId({ machine: o.machine, paneId: o.pane })).setLabel("Stop").setEmoji("❌").setStyle(ButtonStyle.Danger))] : [];
+    const content = prepareOutbound(o.text).messages[0]?.content.slice(0, 2000) ?? "";
+    const m = own(await t.send({ content, components, ...QUIET }));
+    // The alert is not silent: the owner must learn that this job has no channel of its own.
+    const alert = `⚠️ ${o.alert || `A terminal job${o.pane ? ` (pane \`${o.pane}\`)` : ""} has no Discord channel.`} Posted in the ${s.emoji} ${s.name} stack: ${m.url}`;
+    // The thread post already happened: an alert failure must not make fm-spawn retry (and post the job again).
+    const a = await parent.send({ content: prepareOutbound(alert).messages[0]?.content.slice(0, 2000) ?? alert, components, ...NO_PINGS }).then(own, (e: Error) => {
+      log(`stack-job: FIRSTMATE alert failed: ${e.message}`);
+      return null;
+    });
+    log(`stack-job: ${o.stack} pane ${o.pane ?? "-"} -> thread ${t.id} (${m.id}); FIRSTMATE alert ${a?.id ?? "FAILED"}`);
+    return { url: m.url, thread: t.id, ...(a ? { alert: a.url } : {}) };
+  },
   closeAsks: (setIds, reason) => {
     const done = asks.close(setIds, reason === "asked-again" ? "asked-again" : "closed");
     if (done.length) log(`asks closed by request (${reason}): ${done.join(", ")}`);
@@ -3302,6 +3877,7 @@ function postResult(sink: SendSink): PostResult {
     url: first.url,
     messages: sink.messages.map((m) => ({ id: m.id, url: m.url })),
     attachments: sink.messages.flatMap((m) => [...m.attachments.values()].map((a) => ({ name: a.name, url: a.url }))),
+    ...(sink.already?.length ? { alreadyAnswered: sink.already } : {}),
     ...(sink.asks.length ? { asks: sink.asks.map((a) => ({ setId: a.setId, questions: a.questions.map((q, qi) => ({ id: q.id, question: q.question, url: a.menus[qi]?.url ?? "" })) })) } : {}),
   };
 }

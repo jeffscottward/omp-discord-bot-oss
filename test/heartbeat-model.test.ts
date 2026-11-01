@@ -25,7 +25,8 @@ test("continued session: model read from before the run's start offset", () => {
 });
 test("Working text names the model", () => {
   const s = formatHeartbeat({ ...base, model: "anthropic/claude-opus-5-5", thinking: "low (auto)" });
-  expect(s).toContain("🤖 Model: `anthropic/claude-opus-5-5` · thinking low (auto)");
+  expect(s).toContain("🤖 Model: `anthropic/claude-opus-5-5`\n🧠 Reasoning: low (auto)");
+  expect(s).not.toContain("· thinking");
   expect(s).not.toContain("is thinking or writing"); // owner 2026-10-19: line removed
   expect(formatHeartbeat(base)).not.toContain("🧠");
 });

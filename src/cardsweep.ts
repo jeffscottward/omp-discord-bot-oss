@@ -3,16 +3,16 @@
 // 1. Discord question cards: a bot menu message (custom_id `ask:<set>:…`) whose set is no longer open in the
 //    bot's asks.json is closed (buttons removed, one closing line) when it is older than the ask TTL or a
 //    newer menu in the same channel asks the same question. Open sets are never touched (the bot owns them).
-// 2. Dashboard cards: an unfinished, non-finance card whose q/src links a channel that is archived or gone,
+// 2. Dashboard cards: an unfinished card (any area; owner 2026-10-31: finance cards flow like all others; time gates
+//    are skipped) whose q/src links a channel that is archived or gone,
 //    or whose q menu was closed in step 1, is set to partial "🧹 … needs check" once; the in-progress sweep
 //    (firstmate-sweep) then finishes, restarts or asks about it. Nothing is deleted.
 
 export interface MenuMsg { id: string; ts: number; setId: string; question: string }
-export interface Card { id: string; s?: string; t?: string; area?: string; n?: string; q?: string; src?: string }
+export interface Card { id: string; s?: string; t?: string; area?: string; n?: string; q?: string; src?: string; until?: string }
 export type ChannelState = "live" | "archived" | "gone";
 
 export const CLOSED_LINE = "⌛ Closed by the card sweep (already answered, asked again later, or expired).";
-const SKIP_WORDS = /\b(account|order|trade|finance)\b/i; // same finance guard as fm-autoclear
 const SWEEP_STATES: Record<string, true> = { open: true, waiting: true, partial: true, blocked: true };
 
 /** The question of a posted menu message (same parsing as ask.ts recoverAnswer), lowercased for comparison. */
@@ -49,11 +49,12 @@ export function discordLink(url: string | undefined): { channel: string; message
   return m?.[1] ? { channel: m[1], message: m[2] } : null;
 }
 
-/** Cards to flag, with the reason. Finance cards and finished/parked/running cards are never touched. */
-export function staleCards(cards: Card[], channelState: (id: string) => ChannelState, closedMenus: Set<string>): { id: string; reason: string }[] {
+/** Cards to flag, with the reason. Time gates and finished/parked/running cards are never touched. */
+/** `held`: the owner hold list (firstmate/hold.json): cards the owner reviews himself are never changed. */
+export function staleCards(cards: Card[], channelState: (id: string) => ChannelState, closedMenus: Set<string>, held: Set<string> = new Set()): { id: string; reason: string }[] {
   const out: { id: string; reason: string }[] = [];
   for (const c of cards) {
-    if (!SWEEP_STATES[c.s ?? ""] || c.area === "finance" || SKIP_WORDS.test(c.t ?? "")) continue;
+    if (!SWEEP_STATES[c.s ?? ""] || c.until || c.id.startsWith("gate-") || held.has(c.id)) continue; // time gates clear themselves
     if (c.n?.startsWith("🧹")) continue; // already flagged once
     const q = discordLink(c.q);
     const src = discordLink(c.src);

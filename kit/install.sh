@@ -121,6 +121,7 @@ for f in "$KIT"/bin/*; do
   link "$f" "$BIN_DIR/$(basename "$f")"
 done
 [ -x "$OMP_BOT_REPO/scripts/fm-spawn" ] && link "$OMP_BOT_REPO/scripts/fm-spawn" "$BIN_DIR/fm-spawn"
+[ -x "$OMP_BOT_REPO/scripts/fm-audit" ] && link "$OMP_BOT_REPO/scripts/fm-audit" "$BIN_DIR/fm-audit"
 
 # ---------- 2. dashboard files ----------
 say "== dashboard"

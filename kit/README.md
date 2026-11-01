@@ -57,6 +57,7 @@ Main keys: `REPORTS_WEB_DIR`, `FM_DIR` (must be `$REPORTS_WEB_DIR/firstmate`), `
 | `bin/fm-notify` | Default alert sender (new): posts `--kind/--summary/--action` to `FM_ALERTS_CHANNEL` through the bot's `/post`. Set `OMP_NOTIFY` to use another sender. | – | new (replaces the owner's `omp-notify` for other users) |
 | `bin/longjob` | Wrapper for the bot's `gate/longjob.ts` (status every 5 min in the long-running-jobs channel). | – | `~/.local/bin/longjob` |
 | `bin/md2pdf` | Markdown → phone-friendly PDF (bunx marked + headless Chrome). | – | `~/.local/bin/md2pdf` |
+| `scripts/fm-audit` (repo) | Dashboard auditor (owner 2026-10-31): finds stuck cards every minute (blockers done, running without a job, needs check, answered but idle, blocker unclear) and fixes them: lists them in `audit.json` `flow` for `firstmate-sweep` (and starts the sweep, at most every 20 min), or posts ONE ask menu in FIRSTMATE for unclear blockers. `--report`, `--dry-run`, `--test`. `install.sh` links it. | a step of the owner's `fm-tick.timer` (1 min); run it after `fm-autoclear` | `~/.local/bin/fm-audit` → repo |
 | `scripts/fm-spawn` (repo) | Starts a side session for a card in a new Herdr tab. Not duplicated here; `install.sh` links it. | – | `~/.local/bin/fm-spawn` → repo (already the live copy) |
 | `dashboard/web/` | The FIRSTMATE dashboard (index.html, app.js, manifest, icons). Reads `items.json`, `running.json`, `reports.json`, `changes.json`, `limits.json`. | served by `omp-reports-web` | `~/Documents/reports/web/firstmate/` |
 | `dashboard/build-index.py` | Writes `reports.json` (every report under `REPORTS_WEB_DIR`) and `changes.json`. | `firstmate-index.timer` (1 min) + `firstmate-index.path` (items.json changed) | same folder |
@@ -78,7 +79,7 @@ Data written at run time (never in the repo): `FM_DIR/{items,running,reports,cha
 |---|---|
 | `firstmate-dbsync.{service,timer,path}`, `firstmate-trailbase.service`, `firstmate-front-preview.service` | Dashboard v4 (Vike + TrailBase) from a separate, experimental repo; the v3 dashboard in this kit does not need it. |
 | `darkfactory-*`, `omp-procedura-*`, `ex-remote-*`, `github-discord-feed`, `omp-postboot.service` | Owner-only services. |
-| Finance pieces (market watch, status monitors, peer finance host) | Owner-only. The peer-host view in `build-running.py` is generic (`FM_PEER_*`); the owner's values live only in his own kit.env. |
+| Finance pieces (example watch, status monitors, peer finance host) | Owner-only. The peer-host view in `build-running.py` is generic (`FM_PEER_*`); the owner's values live only in his own kit.env. |
 | `omp-lofi-radio.service`, `omp-discord-bot.service`, `omp-tts.service`, `omp-whisper.service`, `channel-cleanup.*` | Already in the repo (`scripts/omp-lofi-radio.service`, `systemd/`); installed by `scripts/bootstrap.sh`. |
 | `omp-notify` (owner's ntfy/Discord alert sender) | Owner-specific; `bin/fm-notify` replaces it. Point `OMP_NOTIFY` at your own sender if you have one. |
 | `state-semantics-by-e2e.cjs` | Depends on the owner's live cards. |

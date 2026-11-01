@@ -3,6 +3,12 @@
 Owner rule 2026-10-18: nothing sits in In progress without moving. Clear or advance each idle card without asking.
 Input: `idle.json` in the FIRSTMATE folder (`$FM_DIR`, the folder of this file) → `items` (cards that are `partial`, have no job, have no unfinished blocker, and did not change for more than 2 h). Handle only those cards. Read each card with `fm get <id>`; never load items.json whole.
 
+Auditor cards (owner 2026-10-31, card dashboard-autoflow): the prompt also names cards from `audit.json` → `flow` (written every minute by `fm-audit`, a step of fm-tick.timer). Each has `kind` and `why`. Handle them the same way, first by kind:
+- `unblocked`: every blocker is done. Start the work now (step 3), unless the card note names a later date or an owner decision that is still open (then step 4 or 5).
+- `needs-check` / `no-job` / `daemon-job`: the job ended, or the card was "running" without a real job. Step 1 (check the real state), then step 2 (done) or step 3 (start a new side session from the card's task file; reuse `tasks/<id>-task.md` when it exists).
+- `answered`: the owner answered the card's question, but no job took the answer. Read the answer (the card's `queuedFrom`/note or the FIRSTMATE message), then step 2 or 3.
+Planned cards in `flow` are cards whose blockers are done; they are not a plan for a later date.
+
 ## For each idle card
 1. Check the real state: status/summary files (`l`, `task`), repos (`git log`, `gh pr`), KB folders, `systemctl --user` units, running.json.
 2. Finished → `fm set <id> done "<evidence: commit/PR/file/unit>"`.
@@ -13,8 +19,8 @@ Input: `idle.json` in the FIRSTMATE folder (`$FM_DIR`, the folder of this file) 
 
 ## Hard limits
 - At most 4 new side sessions per sweep. Respect Claude plan limits; no Codex/OpenAI models.
-- Never change finance code, orders, gates or live configs. Finance cards are not in idle.json; do not touch them.
-- Side-session task files must forbid `git push`, `gh pr create/merge/close`, deploys, service restarts and deletions unless the card already records the owner's approval for that exact action. `omp-approve` does not work in Herdr panes.
+- Hard limit (owner 2026-10-31): all cards flow the same way, finance cards included. Automatic flow never changes finance code, payments, gates or live configs, and never starts, stops, restarts or reconfigures live finance units or timers. Those steps stay owner decisions: ask with one ask menu. Cards on the owner hold list (`hold.json` next to items.json) are not in your input; never change them.
+- Git, PR, merge and deploy steps need no owner question (standing owner approval 2026-10-31): side sessions push, open PRs, merge and deploy on their own judgment when CI is green on the exact commit; never `--no-verify`, never force-push shared branches, never delete on GitHub. Service restarts only through the repo's restart-when-idle script. Deletions and live finance changes still need a recorded owner approval. `omp-approve` does not work in Herdr panes.
 - Never focus tabs or type into panes you did not create. Never close other tabs.
 
 ## Finish (deadline 45 min from start; the launcher closes this tab at the deadline)

@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly Discord cleanup (replaces omp-archive-purge.timer and omp-stopped-cleanup.timer)
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

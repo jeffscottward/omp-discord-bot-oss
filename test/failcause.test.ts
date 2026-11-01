@@ -8,7 +8,7 @@ describe("classifyFailure (UX item 7)", () => {
     ["402 Insufficient USD or Diem balance to complete request. Visit https://venice.ai/settings/api to add credits.", "credit", false],
     ["The socket connection was closed unexpectedly before the response completed", "provider", true],
     ["Deadline exceeded", "provider", true],
-    ["529 overloaded_error", "provider", true],
+    ["529 overloaded_error", "rate-limit", true],
     ["Error: ENOSPC: no space left on device, write", "disk-full", false],
     ["SQLITE_BUSY: database is locked", "session-busy", true],
     ["You have hit your usage limit. Your limit resets at 5pm", "usage-limit", false],
@@ -60,13 +60,24 @@ describe("auto retry", () => {
 
 describe("failureText", () => {
   test("cause first, short output in a code block, no raw fence break", () => {
-    const t = failureText(classifyFailure("socket hang up", 1), "x".repeat(1000) + "```", 20);
+    const t = failureText(classifyFailure("socket hang up", 1), "x".repeat(1000) + "```", 20_000);
     expect(t.startsWith("❌ **Run failed.** 🌐")).toBe(true);
-    expect(t).toContain("Retrying once by itself in 20 s");
+    expect(t).toContain("Cooling down: retrying by itself in 20 s");
     expect(t.split("```").length).toBe(3);
     expect(t.length).toBeLessThan(1000);
   });
   test("manual retry hint when no auto retry", () => {
-    expect(failureText(classifyFailure("ENOSPC", 1), "")).toContain("Tap 🔁 Retry");
+    expect(failureText(classifyFailure("ENOSPC", 1), "")).toContain("Tap 🔁 Force retry");
   });
+});
+
+import { autoRetryDelay, RATE_RETRY_DELAYS_MS, RetryLedger as Ledger2, classifyFailure as cf2 } from "../src/failcause.ts";
+import { test as t2, expect as e2 } from "bun:test";
+t2("rate errors retry after a growing cool-down, also after tool calls", () => {
+  const c = cf2("Error: 429 Too Many Requests", 1);
+  e2(c.kind).toBe("rate-limit");
+  e2(autoRetryDelay(c, 600_000, 0, 5)).toBe(RATE_RETRY_DELAYS_MS[0]);
+  e2(autoRetryDelay(c, 0, 2, 0)).toBe(RATE_RETRY_DELAYS_MS[2]);
+  e2(autoRetryDelay(c, 0, RATE_RETRY_DELAYS_MS.length, 0)).toBeUndefined();
+  const l = new Ledger2(); l.add("m"); l.add("m"); e2(l.count("m")).toBe(2);
 });

@@ -26,3 +26,20 @@ test("model carries over to the next turn", () => {
   expect(renderProgress("t", p!)).toContain("🤖 Model: `anthropic/claude-opus-5-5`");
   expect(renderProgress("t", p!).split("\n").at(-1)).toBe("🛠️ **Last tool:** none yet");
 });
+test("thinking level from thinking_level_change shows after the model (card reply-thinking-level)", () => {
+  const raw = L({ type: "message", timestamp: ts(1), message: { role: "user", content: [{ type: "text", text: "go" }] } })
+    + L({ type: "thinking_level_change", timestamp: ts(2), thinkingLevel: "low", configured: "auto" })
+    + L({ type: "message", timestamp: ts(3), message: { role: "assistant", provider: "anthropic", model: "claude-opus-5-5", stopReason: "toolUse", content: [{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "x" } }] } });
+  const evs = sessionEvents(Buffer.from(raw)).events;
+  expect(evs).toContainEqual({ kind: "thinking", ts: Date.parse(ts(2)), level: "low (auto)" });
+  let p: Progress | undefined;
+  for (const ev of evs) p = applyEvent(p, ev).p;
+  expect(renderProgress("t", p!)).toContain("🤖 Model: `anthropic/claude-opus-5-5`\n🧠 Reasoning: low (auto)");
+  const fixed = sessionEvents(Buffer.from(L({ type: "thinking_level_change", thinkingLevel: "high" }))).events[0];
+  expect(fixed).toMatchObject({ kind: "thinking", level: "high" });
+  p = applyEvent(p, fixed!).p;
+  expect(renderProgress("t", p!)).toContain("\n🧠 Reasoning: high");
+  expect(renderProgress("t", p!)).not.toContain("🧩");
+  p = applyEvent({ ...p!, state: "done" }, { kind: "turn", ts: 9 }).p;
+  expect(p!.thinking).toBe("high");
+});

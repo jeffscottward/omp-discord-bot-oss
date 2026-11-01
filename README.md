@@ -55,21 +55,34 @@ patterns, plus the exact values of secrets found in local `.env` files).
   parallel up to `maxParallelStacks`; one stack runs one job at a time.
 - Add a stack without a code change:
   `bun scripts/stack-add.ts --name 3d --emoji 🧊 --title "3D models" --keywords "blender,stl"`.
-  It updates `router.stacks` in config.json (backup first) and schedules a restart-when-idle. The thread is
-  created when the first message is routed to it.
+  It writes the stack catalog `~/.config/omp-discord/stacks.json` (`src/stackcatalog.ts`, backup first). The
+  router and fm-spawn both read it; the bot re-reads it within 10 s, with no restart. fm-spawn adds an unknown
+  `--stack` name or a new card area as a new stack. The thread is created when the first message is routed to it.
+- A follow-up that clearly belongs to an open job of the stack goes to that job's channel (`src/jobmatch.ts`:
+  card id, shared words, then the judge; finance text never reaches the judge). A keyword tie never picks the first
+  stack: it goes to the fallback stack.
+- A job whose pane gets no channel within 2 min is posted in its stack thread with a ❌ **Stop** button (Esc into
+  that pane, `src/panestop.ts`).
 
 ### 📋 Master queue
 One live board at the bottom of the FIRSTMATE channel lists every job: bot runs in any channel and tracker cards
-that have a `job` field. Sections, in order:
+that have a `job` field. Each new board is its own silent post; the old board is deleted (no edits), and a change of
+only a time stamp does not repost it within 10 min. Sections, in order:
 - ✍️ **Needs you**, ⚙️ **Running**, ⏳ **Queued**: every row is shown (no "+N more"); a long board continues in
   extra messages.
 - 🏁 **Finished, last 12 h**: one count line (with the failed/stopped count) and a dashboard link.
 - 🤖 **Bots and scheduled jobs**: one count line (running, scheduled, down) and a dashboard link.
 
+⏸️ **Pause all** / ▶️ **Resume all** (buttons, or `/pause [reason]` and `/resume-work`) stop the queue from
+starting new work; fm-spawn and the sweeps wait too (`src/maintpause.ts`). A **Stopped** reply and the pause notice
+carry a ▶️ **Resume** button that continues the same session (`src/resumebtn.ts`). Finance cards show their subject,
+or only the card id when the title carries amounts, sizes or account data.
+
 ### ✍️ Needs-you board
-A post-only channel whose last message is a live board of every tracker card and open menu that waits on the
-owner. An item appears only when it is an open, unanswered menu or Approve button, or a card with concrete owner
-steps. An answer removes it at once. Optional one-line alerts announce new items.
+Needs-you items live in the master queue (there is no separate channel). An item appears only when it is an open,
+unanswered menu or Approve button, or a card with concrete owner steps. An answer removes it at once. 🔔 pings
+post in FIRSTMATE. Each new ask menu, Approve button and secret-drop form also sends ONE phone push through
+`omp-notify` (ntfy), with the question and its Discord link (`src/ownerntfy.ts`; deduplicated, never for tests).
 
 ### Ask menus
 - A run asks the owner questions by ending its answer with a fenced ```` ```ask ```` JSON block. The bot turns
@@ -79,6 +92,13 @@ steps. An answer removes it at once. Optional one-line alerts announce new items
 - The loopback `/post` endpoint refuses a plain numbered list that asks the owner to choose, and an ask block that
   cannot become a menu. The sender gets the reason, so questions always arrive with buttons.
 - When the owner is in the voice channel, questions are asked one at a time in plain text instead.
+- A Discord reply (text or voice) to an open menu answers that question as ✏️ Other. A voice turn or a plain
+  message that clearly answers an open menu closes it (judge match; when unsure, the menu stays open). Copies of one
+  ask close together.
+- A reply that asks back ("what do you mean?") or puts the question off ("remind me later", "I have to test it
+  again") leaves the menu open (`src/reask.ts`).
+- Never re-ask (`src/reask.ts`): a question whose menu is still open, or that the owner answered in the last 7 days
+  in any channel (same topic and options), is not posted again. The bot sends the earlier answer back instead.
 
 ### /models (two tiers)
 `/models` sets the model per channel: pick a provider first, then a model of that provider. Providers are shown
@@ -105,29 +125,40 @@ the source context.
 ### Mirror channels
 Each OMP pane in Herdr (local and optional peer machines) gets its own channel, synced every 60 s. Channel names
 are short (the tab part only) with a topic emoji in front, and channels in each category are sorted by emoji
-group, then by name. New final replies are posted from the pane's session file, with a live progress message per
-turn. Gone panes are archived. The mirror never types into a pane, except the guarded "Send to FIRSTMATE"
-button (only when the pane is idle and its input box is empty).
+group, then by name. Local pane channels go to one category per stack (`src/stackcats.ts`); when a category is
+full, the mirror makes the next one ("🖥️ Main 2", …) with the same permissions. When Discord blocks channel creates,
+the pane gets a thread in the alerts channel instead, and moves to a channel later. Rate errors retry by
+themselves after a cool-down. New final replies are posted from the pane's session file, with a live progress
+message per turn; the status line shows the model and its thinking level. Gone panes are archived. The mirror
+never types into a pane, except the guarded "Send to FIRSTMATE" button (only when the pane is idle and its input
+box is empty) and the ❌ Stop button.
 
 ### 🎧 Voice
 The owner joining the configured voice channel turns voice mode on. Answers are spoken (Kokoro TTS); the owner's
 speech is transcribed locally (faster-whisper) and handled like a typed message. Only the owner's audio is used.
-Voice messages in text channels are transcribed the same way.
+Voice messages in text channels are transcribed the same way. Long transcripts are split, never dropped.
+- Text answers get an on-demand 🔊 button (also on mirrored pane replies); the audio is attached to the same
+  message (`src/speakedit.ts`). Answers are not spoken by default outside voice calls.
+- `/voice-change` picks the voice from samples; `/voice-status` shows the current voice (`src/voicepick.ts`).
+- A spoken answer survives a call drop or a bot restart. While a long turn runs, hold music plays (at most 10 min)
+  and a short spoken progress line comes every 45 s; answers missed while away are said on the next join.
 
 ### ⏰ Reminders
-`/remind <text>`, for example "in 2 hours call mom" or "tomorrow 9am pay rent". The time is parsed locally
+`/remind <text>`, for example "in 2 hours check the build" or "tomorrow 9am pay rent". The time is parsed locally
 (chrono-node, no model call); a date without a time means 09:00.
 
 ### 🔄 Restart-when-idle gate
 Restart with `scripts/restart-when-idle.sh` (detached, for example through `systemd-run --user --collect`), never
-from inside a run. It first runs the gate (`bash -n`, typecheck, `bun test`) and refuses on failure. Then it waits
-until no job runs and the owner is not in a voice call. After 10 min it drains: new jobs stay queued (saved, run
-after the restart) while running jobs finish. After 2 h of a busy bot it gives up and posts one notice.
+from inside a run. It first runs the gate (`bash -n`, typecheck, `bun test`) and refuses on failure. The commit
+must also have a green CI pipeline (`scripts/ci-green.sh`, GitLab; set `OMP_RESTART_CI` to another check), and the
+restart loads only the commit the gate checked: a dirty checkout or a moved HEAD stops it. Then it waits until no
+job runs and the owner is not in a voice call. After 10 min it drains: new jobs stay queued (saved, run after the
+restart) while running jobs finish. After 2 h of a busy bot it gives up and posts one notice.
 
 ### Loopback API
 Other local services post through `127.0.0.1:47821` (`/post`, `/messages`, `/asks`, `/health`, `/drain`,
-`/secret-drop`, `/incident`). Requests must use the loopback host, carry no browser `Origin` and be JSON. Details:
-docs/REFERENCE.md.
+`/secret-drop`, `/incident`, `/stack-job`). Requests must use the loopback host, carry no browser `Origin` and be
+JSON. Details: docs/REFERENCE.md.
 
 ## Run
 

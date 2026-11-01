@@ -156,13 +156,16 @@ function expandHome(p: string): string {
   return isAbsolute(p) ? p : join(home, p);
 }
 
-/** Merge a partial config (config.json `router`) over the defaults. Stacks given by name replace or add. */
 /** config.json `router` (every key optional). */
 export type RouterConfigInput = Partial<Omit<RouterConfig, "stacks">> & { stacks?: Partial<StackDef>[] };
 
-export function routerConfig(raw?: RouterConfigInput): RouterConfig {
+/**
+ * Merge legacy config.json `router.stacks` and then the stack catalog (src/stackcatalog.ts, owner 2026-10-28) over
+ * the defaults; the catalog wins. An entry with a known name replaces fields; a new name adds a stack.
+ */
+export function mergeStacks(entries: Partial<StackDef>[]): StackDef[] {
   const stacks = DEFAULT_STACKS.map((s) => ({ ...s }));
-  for (const r0 of raw?.stacks ?? []) {
+  for (const r0 of entries) {
     if (!r0?.name) continue;
     // A null field (e.g. "areas": null in config.json) keeps the default instead of breaking routing.
     const r = Object.fromEntries(Object.entries(r0).filter(([, v]) => v !== null && v !== undefined)) as Partial<StackDef>;
@@ -170,7 +173,11 @@ export function routerConfig(raw?: RouterConfigInput): RouterConfig {
     if (i >= 0) stacks[i] = { ...stacks[i]!, ...r } as StackDef;
     else stacks.push({ emoji: "🧩", title: r.name, description: r.name, cwd: "~/Github", keywords: [], areas: [], channelIds: [], ...r } as StackDef);
   }
-  const c: RouterConfig = { ...DEFAULT_ROUTER, ...raw, stacks: stacks.map((s) => ({ ...s, cwd: expandHome(s.cwd) })) };
+  return stacks.map((s) => ({ ...s, cwd: expandHome(s.cwd) }));
+}
+
+export function routerConfig(raw?: RouterConfigInput, catalog: Partial<StackDef>[] = []): RouterConfig {
+  const c: RouterConfig = { ...DEFAULT_ROUTER, ...raw, stacks: mergeStacks([...(raw?.stacks ?? []), ...catalog]) };
   if (!c.stacks.some((s) => s.name === c.fallback)) c.fallback = GENERAL;
   c.maxParallelStacks = Math.max(1, Math.floor(c.maxParallelStacks || 1));
   return c;
@@ -269,15 +276,23 @@ export const FINANCIAL_RE = new RegExp(
   "i",
 );
 
+/** Card subject for Discord (owner 2026-10-30: no "Finance card" prefix). Titles with money, sizes or account data show the card id. */
+export function safeSubject(t: string | undefined, id: string): string {
+  const s = (t ?? "").trim();
+  return s && !FINANCIAL_RE.test(s) && !/\bacct\b|\baccount\b/i.test(s) ? s : id;
+}
+
 /** Rules, then the judge for ambiguous messages, then the fallback stack. Never throws. */
 export async function routeMessage(text: string, ctx: RouteContext, cfg: RouterConfig, judge?: Judge): Promise<RouteDecision> {
   const r = ruleRoute(text, ctx, cfg);
   if (r.decision) return r.decision;
   const tie = r.candidates.length ? ` (keyword tie: ${r.candidates.join(", ")})` : "";
   // Any finance keyword (top or runner-up) also keeps the message local (positions and orders are financial details).
-  const tradingHit = keywordScores(text, cfg.stacks).some((x) => x.stack === "finance");
-  if (FINANCIAL_RE.test(text) || tradingHit) {
-    const local = tradingHit ? "finance" : (r.candidates[0] ?? cfg.fallback);
+  // An undecided message (tie or weak lead, conf <= 0.50) never takes the first keyword stack: it goes to the
+  // fallback stack (card router-keyword-tie, 2026-10-31).
+  const financeHit = keywordScores(text, cfg.stacks).some((x) => x.stack === "finance");
+  if (FINANCIAL_RE.test(text) || financeHit) {
+    const local = cfg.fallback;
     return { stack: local, by: local === cfg.fallback ? "fallback" : "keyword", confidence: 0.5, detail: `financial details stay local, no judge${tie}` };
   }
   // Short follow-ups ("ok", "yes do it", "2") answer FIRSTMATE's last reply: no judge (it is confident even without context).
@@ -515,7 +530,7 @@ export function stackPreamble(s: StackDef, d: RouteDecision, sourceUrl: string):
     `[FIRSTMATE router] You are the ${s.emoji} ${s.title} stack (sub-orchestrator "${s.name}") under FIRSTMATE.`,
     `The router sent you this owner message from the FIRSTMATE channel (${d.by}: ${d.detail}). Source: ${sourceUrl}`,
     "Work only on this domain; related work stays in this stack. Report up to FIRSTMATE: keep the FIRSTMATE tracker current (fm find/fm set; set `fm field <id> stack " + s.name + "` on cards you create or work), and end with a short result.",
-    "If the message belongs to another domain, say so in one line and name the stack (the owner can resend it with `stack:<name>`).",
+    "If the message belongs to another domain, never drop it (owner 2026-10-30): hand it off yourself. Create a card (fm add <id> running <area> <title> --src <owner message link>), write a task file, start it with `fm-spawn --label <tab> --cwd <folder> --task <file> --card <id> --stack <right stack>`, and reply in one line with the stack and card id.",
     "",
   ].join("\n");
 }

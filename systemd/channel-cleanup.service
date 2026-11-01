@@ -8,3 +8,10 @@ WorkingDirectory=%h/Github/tools/omp-discord-bot
 Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
 Environment=CLEANUP_THRESHOLD_H=24
 ExecStart=/usr/bin/flock -n %t/channel-cleanup.lock %h/.local/share/mise/shims/bun scripts/channel-cleanup.ts --apply
+# Owner 2026-10-30 (card infra-bot-consolidation): after the cleanup, run the read-only unit audit
+# (spent/disabled/idle/duplicate units; posts to #omp-alerts only when the findings change). ExecStopPost runs even when the
+# cleanup fails or its lock is held; "-": the audit's own failure never fails the unit.
+ExecStopPost=-%h/Github/tools/self-healing-harness/bin/unit-audit
+# Owner 2026-10-30 (card infra-bot-consolidation, M4): the daily audio prune (was omp-audio-prune.timer) runs here too,
+# through tick-runner (own 60 s timeout; alerts after 3 failed days in a row). "-": it never fails the cleanup unit.
+ExecStopPost=-/usr/bin/env TICK_UNIT=channel-cleanup.service %h/Github/tools/self-healing-harness/bin/tick-runner daily-cleanup %h/Github/tools/omp-discord-bot/systemd/daily-cleanup.steps

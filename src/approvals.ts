@@ -3,6 +3,7 @@
 // gate/approve.ts (AGENTS.md: created with OMP_AUTO_START=0 and --no-focus, plain shell verified
 // with `herdr pane process-info`, never captured), then posts the receipt. `!deny <id>` cancels
 // (approvals have no expiry). Results are also handed to the next prompt of the same session.
+import { ownerNtfy } from "./ownerntfy.ts";
 import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -163,6 +164,7 @@ export class Approvals {
       Object.assign(posted, tab);
       writePosted(this.dir, posted);
       if (!tab.tabId) await this.deps.send(ch, `⚠️ Could not open the approval tab for \`${e.id}\` (${tab.error}). It stays pending until it expires or \`!deny ${e.id}\`.`);
+      if (!this.deps.queueDir) ownerNtfy(`approval:${e.id}`, "approval", `Approve ${e.id}: ${requestText(e).split("\n").find((l) => l.trim()) ?? ""}`, undefined, { log: this.deps.log });
       this.deps.log(`approval ${e.id}: posted; tab ${tab.tabId ?? "none"}`);
     } finally {
       this.inflight.delete(e.id);
