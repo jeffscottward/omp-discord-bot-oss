@@ -65,7 +65,9 @@ Adopt live terminal jobs (owner 2026-10-24 addendum: terminal jobs that so far h
 Close finished tabs safely (card tabclose-safe, owner 2026-10-31):
   fm-spawn --close-finished [--dry-run] [--workspace WS]
     Closes a tab only when ALL are true: every pane is idle/done (no spinner); no card outside done/backlog has
-    job = one of its panes, the tab id or its label; its own fm-spawn card (spawned.jsonl), if any, is done.
+    job = one of its panes, the tab id or its label; its own fm-spawn card (spawned.jsonl), if any, is done or has a
+    done/failed receipt, or Herdr marks the tab done (the cap refusal's "[done]" test). A tab without an fm-spawn card
+    closes only when Herdr marks it done. When fm-spawn hits the tab cap it runs this once, then checks the cap again.
     Focused and FIRSTMATE tabs are kept. Restore leftovers: several tabs with one label where only one tab's pane
     is a live card job -> the others close (same idle rule). Prints every tab with close/keep and the reason.
 
@@ -992,7 +994,7 @@ def requeue_front(args, rc):
     log(f"queue: DROPPED {args.label} ({args.queue_id}) after {attempts} failed starts (last exit {rc})")
     if args.card:
         run([FM, "set", args.card, "partial", f"📥 fm-spawn queue: the queued start failed {attempts} times (last exit {rc}; "
-             f"log {LOG}); left the queue; needs check"], check=False)
+             f"log {LOG}); left the queue; needs check", "--from", "planned,partial"], check=False)  # sma-fm-set-cas: skip a moved card
 
 
 STARTED = []  # set once the tab exists: a later failure must not start a second tab
@@ -1344,6 +1346,19 @@ def spawn(args):
     all_panes = panes()
     ws = pick_workspace(all_panes, args.workspace)
     refusal = tab_cap(ws)
+    if refusal and not args.dry_run:
+        # Cap hit: close finished tabs once (same rule as --close-finished), then check again (card fmspawn-close-finished).
+        log(f"tab cap hit in {ws}; running --close-finished once")
+        print(f"fm-spawn: workspace {ws} is over {MAX_TABS} tabs; closing finished tabs once", file=sys.stderr)
+        sys.stdout.flush()
+        _o = sys.stdout
+        sys.stdout = sys.stderr
+        try:
+            close_finished(argparse.Namespace(dry_run=False, workspace=ws))
+        finally:
+            sys.stdout = _o
+        refusal = tab_cap(ws)
+        all_panes = panes()  # closed tabs' panes must not count as live work in plan()
     if refusal:
         log(f"REFUSED {args.label}: workspace {ws} over {MAX_TABS} tabs")
         print(refusal, file=sys.stderr)
@@ -1944,7 +1959,12 @@ def plan_close(tabs, all_panes, items, spawn_cards):
         if lab in KEEP_LABELS:
             out.append((t, False, "FIRSTMATE tab"))
             continue
-        busy = [p.get("pane_id") for p in ps if not pane_idle(p)]
+        tab_done = t.get("agent_status") == "done"  # the cap refusal's "[done]" test (fm-tabwatch looks_finished)
+        # A done tab may hold non-agent panes (plain Terminal, status unknown); only a working/blocked status or a
+        # spinner makes them busy (same test as fm-tabwatch, card fmspawn-close-finished 2026-11-03).
+        busy = [p.get("pane_id") for p in ps
+                if not (pane_idle(p) or (tab_done and p.get("agent_status") not in ("working", "blocked")
+                                         and not SPINNER.search(p.get("terminal_title") or "")))]
         if busy or not ps:
             out.append((t, False, f"pane(s) not idle/done: {', '.join(busy) or 'no pane info'}"))
             continue
@@ -1955,16 +1975,26 @@ def plan_close(tabs, all_panes, items, spawn_cards):
         own = spawn_cards.get(tid)
         if own:
             st = _norm((by_id.get(own) or {}).get("s"))
-            if st != "done":
-                out.append((t, False, f"own card {own} is {st or 'missing'}"))
+            rec = _receipt(own).get("result") in ("done", "failed")
+            if st != "done" and not rec and not tab_done:
+                out.append((t, False, f"own card {own} is {st or 'missing'}, no receipt, Herdr does not mark the tab done"))
                 continue
-        if not own and lab not in dup_keeper and t.get("agent_status") != "done":
+            if st in ("running", "waiting", "open", "planned") and not rec:
+                # A Herdr "done" status does not end a live job (e.g. a finance watch between checks).
+                out.append((t, False, f"own card {own} is {st} (live job; no done/failed receipt)"))
+                continue
+        if not own and lab not in dup_keeper and not tab_done:
             out.append((t, False, "no fm-spawn card and Herdr does not mark the tab done (may be an owner tab)"))
             continue
         if lab in dup_keeper:
             out.append((t, True, f"restore duplicate of '{t.get('label')}'; job lives in {dup_keeper[lab]}"))
         else:
-            out.append((t, True, "all panes idle, no live card job" + (f", own card {own} done" if own else "")))
+            why = "all panes idle, no live card job"
+            if own:
+                why += f", own card {own} " + ("done" if _norm((by_id.get(own) or {}).get("s")) == "done"
+                                              else "receipted" if _receipt(own).get("result") in ("done", "failed")
+                                              else "not done but Herdr marks the tab done")
+            out.append((t, True, why))
     return out
 
 

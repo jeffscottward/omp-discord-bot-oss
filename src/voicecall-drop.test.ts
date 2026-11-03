@@ -130,17 +130,17 @@ test("answer while on hold stops the progress lines", async () => {
 
 // The real 10-31 failure: the bot restarted while a voice turn ran. The turn is saved, loaded and run again once.
 test("running voice turn survives one restart, a second restart drops it", async () => {
-  const { loadQueueState, saveQueueState, voiceRestoreDecision } = await import("./queuestate.ts");
+  const { loadQueueState, restorePlan, saveQueueState } = await import("./queuestate.ts");
   const dir = mkdtempSync(join(tmpdir(), "vc-state-"));
   const turn = { id: 7, channelId: "11", messageId: "22", authorId: "3", text: "are you there", fromVoice: true, enqueuedAt: 1, running: true, restarts: 0 };
   saveQueueState(dir, { nextId: 8, jobs: [turn] });
   const first = loadQueueState(dir).jobs[0]!;
   expect(first.fromVoice).toBe(true);
-  const n = voiceRestoreDecision(first);
-  expect(n).toBe(1); // run again after the first restart
-  saveQueueState(dir, { nextId: 9, jobs: [{ ...first, restarts: n as number }] }); // re-run saved as running again
-  expect(voiceRestoreDecision(loadQueueState(dir).jobs[0]!)).toBe("drop"); // second restart: no loop
-  expect(voiceRestoreDecision({ running: false })).toBe(0); // waiting jobs are always restored
+  const p = restorePlan(first);
+  expect(p).toMatchObject({ action: "queue", restarts: 1 }); // run again after the first restart
+  saveQueueState(dir, { nextId: 9, jobs: [{ ...first, restarts: 1 }] }); // re-run saved as running again
+  expect(restorePlan(loadQueueState(dir).jobs[0]!).action).toBe("drop"); // second restart: no loop
+  expect(restorePlan({ running: false })).toEqual({ action: "queue", restarts: 0 }); // waiting jobs are always restored
 });
 
 // Owner retest 10-31 21:27Z: 3 min of hold music, no progress line. Same path as main.ts onVoiceTranscript.

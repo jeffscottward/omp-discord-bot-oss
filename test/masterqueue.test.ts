@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NeedsYouBoard, type BoardChannel, type BoardMsg } from "../src/needsyou.ts";
-import { botRows, cardRows, cutWords, firstSentence, herdrPlace, jobPlace, needsRows, parseHerdrPanes, parseHerdrTabs, isMasterBoard, renderMasterPages, KEEP_FINISHED_MS, MasterQueueBoard, renderMaster, rowLine, type FmCard, type LiveJob, type Receipt } from "../src/masterqueue.ts";
+import { botRows, cardRows, cutWords, whyLink, firstSentence, herdrPlace, jobPlace, needsRows, parseHerdrPanes, parseHerdrTabs, isMasterBoard, renderMasterPages, KEEP_FINISHED_MS, MasterQueueBoard, renderMaster, rowLine, type FmCard, type LiveJob, type Receipt } from "../src/masterqueue.ts";
 import { JobQueue } from "../src/queue.ts";
 
 const DASH = "https://dash.example/reports/firstmate/";
@@ -73,8 +73,8 @@ describe("rows", () => {
     expect(text).toContain("🏁 **Finished, last 12 h:** 1 →");
   });
 
-  test("blocked reason (card mq-blocked-reason-full): first sentence, ≤ 100 chars cut at a word, plus a why link to the receipt", () => {
-    const long = "Local fix ready in worktree webapp-research-wt-dep63 (vinext 1.3 drops next/router from optimizer include; doctor pins synced and the lockfile matches). Commit is blocked because biome fails.";
+  test("blocked reason (card mq-blocked-reason-full): first sentence, ≤ 100 chars cut at a word, plus a why link to the receipt in the dashboard", () => {
+    const long = "Local fix ready in worktree webapp-wt-dep63 (vinext 1.3 drops next/router from optimizer include; doctor pins synced and the lockfile matches). Commit is blocked because biome fails.";
     const cards: FmCard[] = [
       { id: "s1", t: "Short reason", s: "partial" },
       { id: "l1", t: "Long reason", s: "partial" },
@@ -84,18 +84,18 @@ describe("rows", () => {
       ["l1", { card: "l1", result: "blocked", tsMs: NOW - 600_000, summary: long }],
     ]);
     const by = Object.fromEntries(cardRows(cards, receipts, NOW, DASH).map((r) => [r.key, r]));
-    expect(by["card:s1"]).toMatchObject({ state: "blocked", where: "⛔ Fix pushed (ca2e1f41)", why: `${DASH}receipts/s1.json` });
+    expect(by["card:s1"]).toMatchObject({ state: "blocked", where: "⛔ Fix pushed (ca2e1f41)", why: `${DASH}?item=s1&why=1&receipt=s1.json` });
     const line = rowLine(by["card:l1"]!, NOW);
-    const detail = line.split("\n")[1]!;
+    const detail = line.split("\n").at(-1)!;
     // The reason is cut at a word (no half word before "…") and the full text is one tap away.
-    expect(detail).toContain("⛔ Local fix ready in worktree webapp-research-wt-dep63 (vinext 1.3 drops next/router from…");
-    expect(detail).toEndWith(` · [why](<${DASH}receipts/l1.json>)`);
+    expect(detail).toContain("⛔ Local fix ready in worktree webapp-wt-dep63 (vinext 1.3 drops next/router from optimizer…");
+    expect(detail).toEndWith(` · [why](<${DASH}?item=l1&why=1&receipt=l1.json>)`);
     expect(detail).not.toContain("Commit is blocked");
     // No dashboard URL: no why link, the row still renders.
     expect(cardRows(cards, receipts, NOW, "").find((r) => r.key === "card:s1")?.why).toBeUndefined();
     // The why link opens the file the reason came from (its name may differ from the card id).
     const odd = cardRows([{ id: "a b", t: "x", s: "partial" }], new Map([["a b", { card: "a b", result: "blocked", tsMs: NOW - 1, summary: "y", file: "old name.json" }]]), NOW, DASH)[0];
-    expect(odd?.why).toBe(`${DASH}receipts/old%20name.json`);
+    expect(odd?.why).toBe(`${DASH}?item=a%20b&why=1&receipt=old%20name.json`);
     expect(firstSentence("vinext 1.3 drops next/router. Then more.")).toBe("vinext 1.3 drops next/router");
     expect(cutWords("aaa bbb ccc", 8)).toBe("aaa bbb…");
     expect(cutWords("short", 100)).toBe("short");
@@ -117,7 +117,7 @@ describe("rows", () => {
       ["dep3", { card: "dep3", result: "blocked", tsMs: NOW - 600_000, summary: "blocked." }],
     ]);
     const by = Object.fromEntries(cardRows(cards, receipts, NOW, DASH).map((r) => [r.key, r]));
-    expect(by["card:dep"]).toMatchObject({ state: "blocked", where: "⛔ waits for Webapp CI: deploys/live line first… (running)", why: `${DASH}receipts/dep.json` });
+    expect(by["card:dep"]).toMatchObject({ state: "blocked", where: "⛔ waits for Webapp CI: deploys/live line first… (running)", why: `${DASH}?item=dep&why=1&receipt=dep.json` });
     // Only open blockers are named (a title ref to a done card is cleared); a name that is not a card is never done.
     expect(by["card:dep2"]?.where).toBe("⛔ waits for Webapp CI: deploys/live line first… (running), gone-card (not a card)");
     expect(by["card:dep3"]?.where).toBe("⛔ waits for Reverse blocker (running)");
@@ -134,20 +134,20 @@ describe("rows", () => {
     ];
     const receipts = new Map<string, Receipt>([["dep", { card: "dep", result: "blocked", tsMs: NOW - 600_000, summary: "Section only in commit 19d9c33." }]]);
     const rows = cardRows(cards, receipts, NOW, DASH);
-    expect(rows).toEqual([expect.objectContaining({ key: "card:dep", state: "check", where: "🔧 blocker done; needs a check", why: `${DASH}receipts/dep.json` })]);
+    expect(rows).toEqual([expect.objectContaining({ key: "card:dep", state: "check", where: "🔧 blocker done; needs a check", why: `${DASH}?item=dep&why=1&receipt=dep.json` })]);
     // A blocked receipt without blockers keeps its ⛔ reason (no blockers is not "blocker done").
     const plain = cardRows([{ id: "p", t: "p", s: "partial" }], new Map([["p", { card: "p", result: "blocked", tsMs: NOW - 1, summary: "waiting on CI." }]]), NOW, DASH)[0];
     expect(plain).toMatchObject({ state: "blocked", where: "⛔ waiting on CI" });
     const text = renderMasterPages(rows, NOW, DASH).join("\n");
     expect(text).toContain("🔧 **Blocker done, needs a check** (1)");
     expect(text).not.toContain("⛔ **Blocked**");
-    expect(text).toContain(`🔧 blocker done; needs a check · [why](<${DASH}receipts/dep.json>)`);
+    expect(text).toContain(`🔧 blocker done; needs a check · [why](<${DASH}?item=dep&why=1&receipt=dep.json>)`);
     // Not counted as finished.
     expect(text).toContain("🏁 **Finished, last 12 h:** 0");
   });
 
   test("bot jobs: live first, finished kept 24 h, a live id wins over its saved finish", () => {
-    const live: LiveJob[] = [{ id: 7, title: "fix the bot", channelId: "c1", link: MSG, running: true, since: NOW - 120_000 }];
+    const live: LiveJob[] = [{ id: 7, title: "fix the bot", channelId: "c1", link: MSG, state: "running", since: NOW - 120_000 }];
     const rows = botRows(live, [
       { id: 5, title: "done job", channelId: "c2", state: "done", at: NOW - 3600_000 },
       { id: 6, title: "expired", channelId: "c2", state: "failed", at: NOW - KEEP_FINISHED_MS },
@@ -166,7 +166,7 @@ describe("rows", () => {
     ], NOW, DASH);
     expect(isMasterBoard(text)).toBe(true);
     expect(text).toContain("⚙️ **Running** (1)");
-    expect(text).toContain(`⚙️ [Running one](<${MSG}>) · 5m\n\u2003\u2003↳ <#c1>`);
+    expect(text).toContain(`⚙️ [Running one](<${MSG}>) · 5m\n\u2003\u2003↳ 🧭 finance stack\n\u2003\u2003\u2003\u2003↳ <#c1>`);
     expect(text).toContain("1. ⏳ Waiting one · ⏳ 1m\n\u2003\u2003↳ <#c2>");
     expect(text).toContain("🏁 **Finished, last 12 h:** 2 (⚠️ 1 failed or stopped)");
     expect(text).not.toContain("Done one");
@@ -179,6 +179,8 @@ describe("rows", () => {
     for (let i = 0; i < 80; i++) expect(all).toContain(`Job number ${i} with`);
     expect(all).not.toContain("more on the dashboard");
     expect(all).not.toContain("(continued)"); // owner 2026-11-03
+    // Owner 2026-11-03: no blank gap where a page starts (mark inside the first line, no spacer line first).
+    for (const p of pages.slice(1)) { const first = p.split("\n")[0]!; expect(first.replace(/[\u200b\u2063\s]/g, "").length).toBeGreaterThan(0); }
     expect(renderMaster([], NOW, DASH)).toContain("No jobs queued, running or finished");
   });
 });
@@ -219,7 +221,7 @@ describe("MasterQueueBoard", () => {
     writeFileSync(items, JSON.stringify({ items: [{ id: "side", t: "Side session job", s: "running", job: "wB:p9", cts: NOW - 60_000 }] }));
     const f = fakeChannel("bot");
     f.post("📋 **Master queue** old", "bot");
-    let live: LiveJob[] = [{ id: 1, title: "owner task", channelId: "c1", link: MSG, running: true, since: NOW - 60_000 }];
+    let live: LiveJob[] = [{ id: 1, title: "owner task", channelId: "c1", link: MSG, state: "running", since: NOW - 60_000 }];
     const opts = {
       getChannel: async () => f.ch,
       botId: () => "bot",
@@ -274,7 +276,7 @@ describe("MasterQueueBoard", () => {
     const b = new MasterQueueBoard({
       getChannel: async () => f.ch,
       botId: () => "bot",
-      jobs: () => [{ id: 1, title: "owner task", channelId: "c1", link: MSG, running: true, since: NOW - 60_000 }],
+      jobs: () => [{ id: 1, title: "owner task", channelId: "c1", link: MSG, state: "running", since: NOW - 60_000 }],
       mayBeBelow: () => false,
       itemsFile: items,
       receiptsDir: join(dir, "receipts"),
@@ -329,9 +331,9 @@ describe("plain-English job place (owner 2026-10-23)", () => {
     expect(jobPlace("wB:pMC")).toBe("💻 terminal tab (Herdr not reachable)");
     expect(jobPlace("wB:pMC", { job: () => ({ channelId: "42", tab: "X" }) })).toBe("<#42>");
     expect(jobPlace("wB:pMC", { job: () => ({ tab: "Build" }) })).toBe("💻 Build");
-    expect(jobPlace(["kb-ig-daily-retry.timer", "wB:p1"])).toBe("background service kb-ig-daily-retry");
+    expect(jobPlace(["ex-daily-retry.timer", "wB:p1"])).toBe("background service ex-daily-retry");
     expect(jobPlace([])).toBe("💻 no job recorded");
-    expect(jobPlace("kb-ig-daily-retry.timer")).toBe("background service kb-ig-daily-retry");
+    expect(jobPlace("ex-daily-retry.timer")).toBe("background service ex-daily-retry");
     const rows = cardRows([{ id: "c1", t: "Fix", job: "wB:pMC", s: "running", stack: "infra" }], new Map(), NOW, DASH, { job: () => ({ channelId: "7" }), stackChannel: () => "9" });
     const line = rowLine(rows[0]!, NOW);
     expect(line).not.toContain("wB:pMC");
@@ -426,14 +428,16 @@ test("job in its own stack thread: thread shown once (owner 2026-10-24)", async 
   expect(l).not.toContain("stack:");
 });
 
-test("needs-you cards on top of the master queue (owner 2026-10-24)", async () => {
+test("needs-you cards at the bottom of the master queue (owner 2026-11-03, card mq-needs-bottom)", async () => {
   const { needsRows, renderMaster } = await import("../src/masterqueue.ts");
   const rows = needsRows([{ id: "w1", t: "Approve deploy", s: "waiting", action: "Do the step", q: "https://discord.com/channels/1/2/3" }, { id: "o1", t: "Pick layout", s: "open", action: "Do the step" }, { id: "x", t: "Other", s: "running" }], NOW, DASH);
   expect(rows.map((r) => r.key)).toEqual(["need:w1", "need:o1"]);
   const t = renderMaster(rows, NOW, DASH);
   expect(t).toContain("✍️ **Needs you** (2)");
   expect(t).toContain("🏃 Approve deploy · 0m\n👉 1. Do the step\n🔗 [Open](<https://discord.com/channels/1/2/3>)");
-  expect(t.indexOf("Needs you")).toBeLessThan(t.indexOf("Finished"));
+  expect(t.indexOf("Needs you")).toBeGreaterThan(t.indexOf("Finished"));
+  expect(t.indexOf("Needs you")).toBeGreaterThan(t.indexOf("Bots and scheduled jobs"));
+  expect(t.indexOf("Needs you")).toBeLessThan(t.lastIndexOf("Dashboard: running jobs"));
 });
 
 describe("master queue ✍️ Needs you = 🔔 Needs-you board (owner 2026-10-24, card mq-needs-menus)", () => {
@@ -542,3 +546,48 @@ test("needs-you alerts-only mode: no board in FIRSTMATE, one ping per new card (
   expect(fm.list[0]!.content.startsWith("🔔")).toBe(true);
 });
 
+
+test("mq-top-link: dashboard link near the top and at the bottom, no context line", () => {
+  const now = Date.now();
+  const rows = [{ key: "a", title: "job", where: "x", state: "running" as const, at: now - 60_000 }];
+  for (const text of [renderMaster(rows, now, "https://d"), renderMaster([], now, "https://d")]) {
+    const ls = text.split("\n");
+    expect(ls.slice(0, 4).some((l) => l.includes("Dashboard: running jobs"))).toBe(true);
+    expect(ls.slice(-3).some((l) => l.includes("Dashboard: running jobs"))).toBe(true);
+    expect(text).not.toContain("context:");
+  }
+});
+
+test("multi-page board: ✍️ Needs you ends up on the last page (card mq-needs-bottom)", async () => {
+  const { needsRows, renderMasterPages } = await import("../src/masterqueue.ts");
+  const need = needsRows([{ id: "w1", t: "Approve deploy", s: "waiting", action: "Do the step", q: "https://discord.com/channels/1/2/3" }], NOW, DASH);
+  const running = Array.from({ length: 40 }, (_, i) => ({ key: `job:${i}`, title: `Running job number ${i} with a long title to fill the page`, where: "💬 x", state: "running", at: NOW - i * 1000 }));
+  const pages = renderMasterPages([...running, ...need] as never, NOW, DASH, 1900);
+  expect(pages.length).toBeGreaterThan(1);
+  expect(pages.at(-1)).toContain("✍️ **Needs you** (1)");
+  for (const p of pages.slice(0, -1)) expect(p).not.toContain("Needs you");
+});
+
+test("why link (card why-link-dashboard): opens the dashboard 🧾 Why panel, never the raw receipt JSON", () => {
+  const dash = "https://my-host.example-tailnet.ts.net/reports/firstmate/";
+  const u = new URL(whyLink(dash, "a&b c", "old name.json"));
+  // Same dashboard page as the card links, with the deep-link params the dashboard reads (deeplink-contract.md C13).
+  expect(u.origin + u.pathname).toBe(dash);
+  expect(u.searchParams.get("item")).toBe("a&b c");
+  expect(u.searchParams.get("why")).toBe("1");
+  // The receipt file name is kept (it may differ from the card id).
+  expect(u.searchParams.get("receipt")).toBe("old name.json");
+  expect(u.pathname).not.toContain("receipts/");
+  // Safe inside Discord's [why](<url>) markdown: no space or angle bracket.
+  expect(whyLink(dash, "x>y", "x y.json")).not.toMatch(/[\s<>]/);
+});
+
+describe("stack-coverage: every row shows its stack", () => {
+  test("a stack without a live thread shows its name; a linked stack shows the link", () => {
+    const base = { key: "card:x", title: "Gamma Forge", where: "<#99>", state: "running" as const, at: NOW };
+    expect(rowLine({ ...base, stack: "webapp" }, NOW)).toContain("↳ 🧭 webapp stack\n");
+    expect(rowLine({ ...base, stack: "webapp" }, NOW)).toContain("↳ <#99>");
+    expect(rowLine({ ...base, stack: "webapp", stackChannel: "77" }, NOW)).toContain("↳ <#77>\n");
+    expect(rowLine({ ...base, stack: "webapp", stackChannel: "99" }, NOW)).not.toContain("🧭");
+  });
+});

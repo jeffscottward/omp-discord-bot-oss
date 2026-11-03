@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { baselineLine, baselines, newBaselines } from "./compactbase.ts";
+import { BaselineWatch, baselineLine, baselines } from "./compactbase.ts";
 
 const use = (input: number, cacheRead: number, cacheWrite: number) => JSON.stringify({ type: "message", message: { role: "assistant", model: "claude-opus-5-5", usage: { input, output: 300, cacheRead, cacheWrite } } });
 const comp = (id: string, before: number) => JSON.stringify({ type: "compaction", id, timestamp: "2026-11-03T09:56:11.950Z", summary: "s", tokensBefore: before });
@@ -22,13 +22,23 @@ test("baseline line for each compaction", () => {
   expect(baselineLine(b[4]!)).toBe("🧠 FIRSTMATE compacted: baseline 78k (8% of 1M) — fixed 27k + summary 51k; before compaction 847k");
 });
 
-test("posts a new compaction once; first run seeds without posting", () => {
-  const st = join(mkdtempSync(join(tmpdir(), "cb-")), "s.json");
-  const four = fixture.split("\n").slice(0, 20).join("\n");
-  expect(newBaselines(four, st)).toEqual([]);
-  const fresh = newBaselines(fixture, st);
-  expect(fresh.map((b) => baselineLine(b))).toEqual(["🧠 FIRSTMATE compacted: baseline 78k (8% of 1M) — fixed 27k + summary 51k; before compaction 847k"]);
-  expect(newBaselines(fixture, st)).toEqual([]);
+test("tail watch: seeds, posts a new compaction once, retries until done", () => {
+  const d = mkdtempSync(join(tmpdir(), "cb-"));
+  const st = join(d, "s.json");
+  const f = join(d, "f.jsonl");
+  const lines = fixture.split("\n");
+  writeFileSync(f, lines.slice(0, 22).join("\n") + "\n"); // 4 done + the 5th compaction without its call
+  expect(new BaselineWatch(st).poll(f)).toEqual([]);
+  appendFileSync(f, lines.slice(22).join("\n"));
+  const w = new BaselineWatch(st); // restart keeps the offset and seen ids
+  const a = w.poll(f);
+  expect(a.map((b) => baselineLine(b))).toEqual(["🧠 FIRSTMATE compacted: baseline 78k (8% of 1M) — fixed 27k + summary 51k; before compaction 847k"]);
+  expect(w.poll(f).length).toBe(1); // not posted yet: still offered
+  expect(new BaselineWatch(st).poll(f).length).toBe(1); // and after a restart
+  w.done(a[0]!.id);
+  expect(w.poll(f)).toEqual([]);
+  appendFileSync(f, lines.slice(0, 3).join("\n") + "\n"); // same id again later: not posted twice
+  expect(new BaselineWatch(st).poll(f)).toEqual([]);
 });
 
 test("compaction without a following call waits", () => {

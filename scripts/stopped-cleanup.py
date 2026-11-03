@@ -100,7 +100,7 @@ def main():
                 try:
                     page = api(f"/channels/{c['id']}/messages?limit=100" + (f"&before={before}" if before else ""))
                 except urllib.error.HTTPError as e:
-                    if e.code == 403: break  # no read access: not a channel the bot posts in
+                    if e.code in (403, 404): break  # 403: no read access; 404: channel/thread deleted during this run (e.g. by archive-purge)
                     raise
                 if not page: break
                 msgs += page

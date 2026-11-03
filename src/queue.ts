@@ -1,3 +1,5 @@
+import { endEvent, jobTransition, type FinalJobState, type JobState } from "./jobstate.ts";
+
 export interface Job<R> {
   id: number;
   /** Session key (thread id / dm key). Jobs with the same key never run concurrently. */
@@ -9,9 +11,12 @@ export interface Job<R> {
   group?: string;
   run: () => Promise<R>;
   onStart?: () => void | Promise<void>;
-  onDone: (result: R | undefined, error?: unknown) => void | Promise<void>;
+  /** `state`: done, failed or stopped (src/jobstate.ts), the same value onSettled reports. */
+  onDone: (result: R | undefined, error: unknown, state: FinalJobState) => void | Promise<void>;
   enqueuedAt: number;
   startedAt?: number;
+  /** Card sma-bot-lost-turns: the job's lifecycle state, moved only by jobTransition. */
+  state: JobState;
 }
 
 export interface JobView {
@@ -20,6 +25,7 @@ export interface JobView {
   label: string;
   preview?: string;
   since: number;
+  state: JobState;
 }
 
 /**
@@ -39,7 +45,7 @@ export class JobQueue<R> {
   /** Called after the waiting list changes (enqueue, cancel, start), e.g. to save it to disk. */
   onChange?: () => void;
   /** Called when a started job's run ended (before onDone), e.g. for the 📋 Master queue's finished rows. */
-  onSettled?: (job: JobView, result: R | undefined, error: unknown) => void;
+  onSettled?: (job: JobView & { state: FinalJobState }, result: R | undefined, error: unknown) => void;
   private readonly now: () => number;
   /** Max running jobs per group (jobs without a group, or with an unlisted group, only count against `max`). */
   groupLimits: Record<string, number>;
@@ -89,8 +95,8 @@ export class JobQueue<R> {
     this.pump();
   }
 
-  enqueue(spec: Omit<Job<R>, "id" | "enqueuedAt">): { id: number; position: number } {
-    const job: Job<R> = { ...spec, id: this.nextId++, enqueuedAt: this.now() };
+  enqueue(spec: Omit<Job<R>, "id" | "enqueuedAt" | "state">): { id: number; position: number } {
+    const job: Job<R> = { ...spec, id: this.nextId++, enqueuedAt: this.now(), state: "queued" };
     this.pending.push(job);
     this.pump();
     this.onChange?.();
@@ -102,7 +108,7 @@ export class JobQueue<R> {
   cancel(id: number): boolean {
     const i = this.pending.findIndex((j) => j.id === id);
     if (i === -1) return false;
-    this.pending.splice(i, 1);
+    this.pending.splice(i, 1); // the job is "stopped" (jobTransition cancel); StackRouter.sync reports it
     this.onChange?.();
     return true;
   }
@@ -111,8 +117,8 @@ export class JobQueue<R> {
     return {
       max: this.max,
       finishing: this.finishing,
-      running: [...this.running.values()].map((j) => ({ id: j.id, key: j.key, label: j.label, preview: j.preview, since: j.startedAt! })),
-      queued: this.pending.map((j) => ({ id: j.id, key: j.key, label: j.label, preview: j.preview, since: j.enqueuedAt })),
+      running: [...this.running.values()].map((j) => ({ id: j.id, key: j.key, label: j.label, preview: j.preview, since: j.startedAt!, state: j.state })),
+      queued: this.pending.map((j) => ({ id: j.id, key: j.key, label: j.label, preview: j.preview, since: j.enqueuedAt, state: j.state })),
     };
   }
 
@@ -135,6 +141,7 @@ export class JobQueue<R> {
 
   private start(job: Job<R>): void {
     job.startedAt = this.now();
+    job.state = jobTransition(job.state, { type: "start" });
     this.running.set(job.id, job);
     void (async () => {
       let result: R | undefined;
@@ -149,15 +156,17 @@ export class JobQueue<R> {
         error = e;
       }
       this.running.delete(job.id);
+      job.state = jobTransition(job.state, endEvent(result, error));
+      const final = job.state as FinalJobState;
       try {
-        this.onSettled?.({ id: job.id, key: job.key, label: job.label, preview: job.preview, since: job.startedAt! }, result, error);
+        this.onSettled?.({ id: job.id, key: job.key, label: job.label, preview: job.preview, since: job.startedAt!, state: final }, result, error);
       } catch (e) {
         console.error(`job ${job.id} onSettled failed: ${(e as Error).message}`);
       }
       this.pump();
       this.finishing++;
       try {
-        await job.onDone(result, error);
+        await job.onDone(result, error, final);
       } catch (e) {
         console.error(`job ${job.id} onDone failed: ${(e as Error).message}`);
       } finally {

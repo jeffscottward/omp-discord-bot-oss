@@ -32,6 +32,14 @@ An existing file that differs from the kit copy (for example your own edited uni
 tells you. `--force` replaces it and saves the old file as `<name>.bak-kit-<time>`. With a scratch home
 (`HOME=/tmp/x kit/install.sh`), the installer never calls `systemctl`.
 
+Source of truth (card sma-fm-set-cas, 2026-11-03): `kit/bin` is the only copy of `fm`, `fm-autoclear`, `fm-prwatch`
+and `fm-tabwatch`. On the main host, `~/.local/bin/<name>` is a symlink to `kit/bin/<name>` in the main checkout, so a
+merged change is live after `git pull`. Do not edit the files in `~/.local/bin`; edit `kit/bin` and merge.
+
+Compare-and-set: automated writers call `fm set <id> <state> [note] --from <state they read>[,...]`. fm checks the
+card state under the tracker lock and exits 3 ("card moved", nothing written) when the card left that state; the
+writer then skips the card until its next run. Manual `fm set` without `--from` has no check.
+
 ## Settings (`kit.env`)
 
 Every key, its default and its meaning are in [`kit.env.example`](kit.env.example). Format: `KEY=VALUE` lines;

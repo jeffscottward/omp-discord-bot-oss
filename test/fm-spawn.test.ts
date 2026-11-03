@@ -1281,6 +1281,56 @@ describe("fm-spawn --close-finished (card tabclose-safe)", () => {
     expect(r.out).not.toContain("DRY would close");
   });
 
+  test("a tab the refusal marks [done] closes even with a backlog own card and a Terminal pane; owner tabs stay", () => {
+    setup([{ tab_id: "wT:t1", label: "📈 DS tables vx", agent_status: "done" },
+           { tab_id: "wT:t2", label: "💬 webapp assistant stop", agent_status: "done" },
+           { tab_id: "wT:t3", label: "FIRSTMATE", agent_status: "done" },
+           { tab_id: "wT:t4", label: "owner notes", agent_status: "idle" }],
+      [P("wT:p1", "wT:t1"), P("wT:p1b", "wT:t1", "unknown", { terminal_title: "bash" }), P("wT:p2", "wT:t2", "done"),
+       P("wT:p3", "wT:t3"), P("wT:p4", "wT:t4")],
+      [{ id: "ds", s: "backlog" }], [{ tab: "wT:t1", card: "ds" }]);
+    const r = run();
+    expect(line(r.out, "wT:t1")).toStartWith("closed");
+    expect(line(r.out, "wT:t2")).toStartWith("closed");
+    expect(calls()).toContain("tab close wT:t1");
+    expect(calls()).toContain("tab close wT:t2");
+    expect(calls()).not.toContain("tab close wT:t3");
+    expect(calls()).not.toContain("tab close wT:t4");
+  });
+
+  test("own card with a done receipt closes; a working Terminal pane still keeps a done tab", () => {
+    sh(["mkdir", "-p", join(dir, "receipts")]);
+    writeFileSync(join(dir, "receipts", "r1.json"), JSON.stringify({ result: "done" }));
+    setup([{ tab_id: "wT:t1", label: "x" }, { tab_id: "wT:t2", label: "y", agent_status: "done" }],
+      [P("wT:p1", "wT:t1"), P("wT:p2", "wT:t2", "working")], [{ id: "r1", s: "partial" }], [{ tab: "wT:t1", card: "r1" }]);
+    const r = sh(["env", `FM_SPAWN_RECEIPTS=${join(dir, "receipts")}`, "python3", SCRIPT, "--close-finished", "--workspace", "wT", "--dry-run"]);
+    expect(line(r.out, "wT:t1")).toStartWith("DRY would close");
+    expect(line(r.out, "wT:t2")).toContain("keep");
+  });
+
+  test("Herdr done + own card running/waiting keeps the tab", () => {
+    setup([{ tab_id: "wT:t1", label: "💹 IWM hold", agent_status: "done" }, { tab_id: "wT:t2", label: "w", agent_status: "done" }],
+      [P("wT:p1", "wT:t1", "done"), P("wT:p2", "wT:t2", "done")],
+      [{ id: "iwm", s: "running" }, { id: "w", s: "waiting" }], [{ tab: "wT:t1", card: "iwm" }, { tab: "wT:t2", card: "w" }]);
+    const r = run();
+    expect(line(r.out, "wT:t1")).toContain("live job");
+    expect(line(r.out, "wT:t2")).toContain("live job");
+    expect(calls()).not.toContain("tab close");
+  });
+
+  test("cap hit: closes finished tabs once before the cap is checked again", () => {
+    setPanes([repo]);
+    const tabs = Array.from({ length: 31 }, (_, i) => ({ tab_id: `wT:t${i}`, label: `L${i}`, agent_status: i === 5 ? "done" : "idle" }));
+    writeFileSync(join(dir, "tabs.json"), JSON.stringify(tabs));
+    const pl = JSON.parse(readFileSync(join(dir, "panes.json"), "utf8"));
+    pl.push({ pane_id: "wT:p5", tab_id: "wT:t5", workspace_id: "wT", agent_status: "done", terminal_title: "π > x" });
+    writeFileSync(join(dir, "panes.json"), JSON.stringify(pl));
+    writeFileSync(join(dir, "items.json"), JSON.stringify({ items: [] }));
+    const r = spawn();
+    expect(r.err).toContain("closing finished tabs once");
+    expect(calls()).toContain("tab close wT:t5");
+  });
+
   test("refusal message suggests --close-finished", () => {
     setPanes([repo]);
     writeFileSync(join(dir, "tabs.json"), JSON.stringify(Array.from({ length: 31 }, (_, i) => ({ tab_id: `wT:t${i}` }))));

@@ -25,7 +25,7 @@ export const TABLES_DEADLINE_MS = 45_000;
 /** Rows drawn in the PNG; the HTML page always has every row. */
 export const PNG_MAX_ROWS = 60;
 /** Same pattern as the account-number rule in src/redact.ts. Text with account numbers gets no web page. */
-const ACCOUNT_RE = /\b(?:DU|DF|U|F)\d{7,8}\b/;
+export const ACCOUNT_RE = /\b(?:DU|DF|U|F)\d{7,8}\b/;
 
 export type Align = "left" | "center" | "right" | "";
 
@@ -235,16 +235,29 @@ export const PNG_GRID_MAX_W = 430;
 /** CSS width of the card layout (an iPhone is about 390 CSS px wide). */
 export const PNG_CARD_W = 390;
 /** Card layout: up to this many rows; the page has the rest. */
-export const PNG_MAX_CARDS = 25;
+export const PNG_MAX_CARDS = 30;
+/** Owner 2026-11-03 (card card-images-3): at most this many cards per image, so Discord shows a swipeable set. */
+export const CARDS_PER_IMAGE = 3;
+/** Chrome processes at once when a card table renders as several images. */
+export const CHUNK_PARALLEL = 4;
+
+/** Split rows into groups of at most `n`, keeping order (7 rows -> 3, 3, 1). */
+export function chunkRows<T>(rows: T[], n = CARDS_PER_IMAGE): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < rows.length; i += n) out.push(rows.slice(i, i + n));
+  return out;
+}
 
 /**
  * PNG source (owner 2026-10-21: the 1708 px wide PNG was unreadable on the phone).
  * "grid" = the normal table (narrow tables only); "cards" = one card per row at phone width,
  * first cell as the card title and "Header: value" lines for the other cells.
  */
-export function pngHtml(t: Table, mode: "grid" | "cards" = "grid"): string {
+export function pngHtml(t: Table, mode: "grid" | "cards" = "grid", label = "", moreRows?: number): string {
   const max = mode === "cards" ? PNG_MAX_CARDS : PNG_MAX_ROWS;
-  const more = t.rows.length > max ? `<p class="more">+${t.rows.length - max} more rows on the web page</p>` : "";
+  const extra = moreRows ?? Math.max(0, t.rows.length - max);
+  const more = extra > 0 ? `<p class="more">+${extra} more rows on the web page</p>` : "";
+  const lab = label ? `<p class="lab">${esc(label)}</p>` : "";
   const body =
     mode === "cards"
       ? t.rows
@@ -273,7 +286,8 @@ tbody tr:nth-child(even) td{background:#26272b}
 code{font-family:"DejaVu Sans Mono",monospace;font-size:13px;background:#383a40;padding:0 4px;border-radius:3px}
 a{color:#00a8fc;text-decoration:none}
 .more{margin:8px 0 0;color:#949ba4;font-size:13px}
-</style></head><body><div id="w">${body}${more}</div>
+.lab{margin:0 0 8px;color:#949ba4;font-size:13px;font-weight:700}
+</style></head><body><div id="w">${lab}${body}${more}</div>
 <script>const r=document.getElementById("w").getBoundingClientRect();document.title=JSON.stringify({w:Math.ceil(r.width),h:Math.ceil(r.height)})</script>
 </body></html>`;
 }
@@ -327,7 +341,7 @@ export function chromeTmpDir(tmp: string): string | null {
   return Buffer.byteLength(tmp) + CHROME_SOCKET_TAIL <= 107 ? tmp : null;
 }
 
-async function chrome(args: string[], tmp: string, timeoutMs = 20_000): Promise<{ code: number; out: string }> {
+export async function chrome(args: string[], tmp: string, timeoutMs = 20_000): Promise<{ code: number; out: string }> {
   // setsid: Chrome leads its own process group, so a timeout kills its child processes too.
   // Children can inherit stdout; without the group kill and the race below, the read could never end.
   // TMPDIR = the render folder: Chrome's own temp files (.com.google.Chrome.*, *_url_fetcher_*) are removed with it.
@@ -362,7 +376,7 @@ async function measure(tmp: string, src: string, prof: string, width: number): P
  * Render the table PNG. Tables that fit a phone: the grid at scale 3. Wide tables (> PNG_GRID_MAX_W CSS px):
  * stacked cards at phone width (PNG_CARD_W) and scale 3, so Discord on a phone shows readable text.
  */
-export async function renderPng(t: Table, pngPath: string): Promise<void> {
+export async function renderPng(t: Table, pngPath: string): Promise<string[] | void> {
   const tmp = mkdtempSync(join(tmpdir(), "omp-table-"));
   try {
     const src = join(tmp, "t.html");
@@ -371,17 +385,42 @@ export async function renderPng(t: Table, pngPath: string): Promise<void> {
     let size = await measure(tmp, src, prof, 1100);
     let scale = 3;
     if (size.w > PNG_GRID_MAX_W && t.header.length > 1) {
+      // Card layout: one image per CARDS_PER_IMAGE cards, labelled "1/N" (owner 2026-11-03).
+      const shown = t.rows.slice(0, PNG_MAX_CARDS);
+      const groups = chunkRows(shown);
+      if (groups.length > 1) {
+        // Chunks render in parallel (own Chrome profile each, max CHUNK_PARALLEL) so a long table stays inside the deadline.
+        const paths = groups.map((_, i) => pngPath.replace(/\.png$/, "") + `-${i + 1}.png`);
+        let next = 0;
+        const worker = async () => {
+          for (let i = next++; i < groups.length; i = next++) {
+            const dir = join(tmp, `c${i}`);
+            mkdirSync(dir);
+            const csrc = join(dir, "t.html");
+            const last = i === groups.length - 1;
+            writeFileSync(csrc, pngHtml({ ...t, rows: groups[i]! }, "cards", `${i + 1}/${groups.length}`, last ? t.rows.length - shown.length : 0));
+            const cprof = `--user-data-dir=${join(dir, "chrome")}`;
+            await shoot(dir, csrc, cprof, await measure(dir, csrc, cprof, PNG_CARD_W + 40), paths[i]!);
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(CHUNK_PARALLEL, groups.length) }, worker));
+        return paths;
+      }
       writeFileSync(src, pngHtml(t, "cards"));
       size = await measure(tmp, src, prof, PNG_CARD_W + 40);
       scale = 3;
     }
-    const w = Math.min(Math.max(size.w, 200), 2400);
-    const h = Math.min(Math.max(size.h, 40), 12_000);
-    const s = await chrome([prof, `--force-device-scale-factor=${scale}`, `--window-size=${w},${h}`, `--screenshot=${pngPath}`, `file://${src}`], tmp);
-    if (s.code !== 0 || !existsSync(pngPath) || statSync(pngPath).size < 100) throw new Error(`chrome screenshot failed (exit ${s.code})`);
+    await shoot(tmp, src, prof, size, pngPath, scale);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+async function shoot(tmp: string, src: string, prof: string, size: { w: number; h: number }, pngPath: string, scale = 3): Promise<void> {
+  const w = Math.min(Math.max(size.w, 200), 2400);
+  const h = Math.min(Math.max(size.h, 40), 12_000);
+  const s = await chrome([prof, `--force-device-scale-factor=${scale}`, `--window-size=${w},${h}`, `--screenshot=${pngPath}`, `file://${src}`], tmp);
+  if (s.code !== 0 || !existsSync(pngPath) || statSync(pngPath).size < 100) throw new Error(`chrome screenshot failed (exit ${s.code})`);
 }
 
 /** Delete table folders older than maxAge. Errors are ignored (cleanup must not block a post). */
@@ -401,8 +440,8 @@ export function pruneTables(dir = TABLES_DIR, maxAgeMs = TABLE_MAX_AGE_MS, now =
 
 export interface RenderedTables {
   text: string;
-  /** PNGs in the order of their `📊 Table` lines in `text`. */
-  files: { path: string; name: string }[];
+  /** PNGs in the order of their `📊 Table` lines in `text`. `parts`: a card table split into several images (all ride with the line). */
+  files: { path: string; name: string; parts?: { path: string; name: string }[] }[];
   /** Temp folders (image-only tables, outside the served dir); delete after sending. */
   tmpDirs?: string[];
 }
@@ -412,9 +451,12 @@ export interface RenderOptions {
   baseUrl?: string;
   now?: Date;
   log?: (s: string) => void;
-  render?: (t: Table, pngPath: string) => Promise<void>;
+  /** Returns the written PNG paths when a table became several images; void = one image at pngPath. */
+  render?: (t: Table, pngPath: string) => Promise<string[] | void>;
   /** Finance channel (owner 2026-10-21): PNG only, never a web page. */
   imageOnly?: boolean;
+  /** The full answer (before chart blocks were replaced) has account data: PNG only. */
+  accountData?: boolean;
   /** Total time for all tables (default TABLES_DEADLINE_MS). Tables not done by then stay as text. */
   deadlineMs?: number;
 }
@@ -444,7 +486,7 @@ export async function renderTables(text: string, opts: RenderOptions = {}): Prom
   const log = opts.log ?? (() => {});
   const render = opts.render ?? renderPng;
   // Finance rule: text with account numbers gets images only, never a web page.
-  const page = !opts.imageOnly && !ACCOUNT_RE.test(text);
+  const page = !opts.imageOnly && !opts.accountData && !ACCOUNT_RE.test(text);
   const why = opts.imageOnly ? "finance channel" : "the text has account data";
   try { pruneTables(dir, TABLE_MAX_AGE_MS, now.getTime()); } catch {}
   const end = Date.now() + (opts.deadlineMs ?? TABLES_DEADLINE_MS);
@@ -465,8 +507,9 @@ export async function renderTables(text: string, opts: RenderOptions = {}): Prom
       if (left <= 0) throw new Error("render deadline passed");
       const late = Promise.withResolvers<never>();
       const timer = setTimeout(() => late.reject(new Error(`render deadline passed (${opts.deadlineMs ?? TABLES_DEADLINE_MS} ms)`)), left);
+      let paths: string[] | void;
       try {
-        await Promise.race([render(t, png), late.promise]);
+        paths = await Promise.race([render(t, png), late.promise]);
       } finally {
         clearTimeout(timer);
       }
@@ -475,7 +518,11 @@ export async function renderTables(text: string, opts: RenderOptions = {}): Prom
         writeFileSync(join(folder, "index.html"), pageHtml(t, now));
         repl.push(`${TABLE_LINE_PREFIX}: [full table, ${rows} ↗](<${base}/${id}/>)`);
       } else repl.push(`${TABLE_LINE_PREFIX}: image attached, ${rows} (no web page: ${why})`);
-      files.push({ path: png, name: tables.length > 1 ? `table-${k + 1}.png` : "table.png" });
+      const stem = tables.length > 1 ? `table-${k + 1}` : "table";
+      if (paths && paths.length > 1) {
+        const parts = paths.map((p, i) => ({ path: p, name: `${stem}-${i + 1}of${paths.length}.png` }));
+        files.push({ path: parts[0]!.path, name: parts[0]!.name, parts });
+      } else files.push({ path: paths?.[0] ?? png, name: `${stem}.png` });
     } catch (e) {
       log(`table render failed (table ${k + 1}, kept as text): ${(e as Error).message}`);
       try { rmSync(folder, { recursive: true, force: true }); } catch {}

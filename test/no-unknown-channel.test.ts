@@ -28,8 +28,8 @@ test("Master queue with a dead stack thread and dead job channel: no unknown men
   const now = Date.now();
   const res = { stackChannel: (s: string) => (s === "finance" ? DEAD : LIVE), areaStack: (a: string) => a, job: () => ({ channelId: DEAD, tab: "dataload" }) };
   const rows = [
-    ...cardRows([{ id: "example-data-source", area: "finance", s: "partial", job: "wB:pV1", cts: now }, { id: "x1", t: "card", stack: "general", s: "running", job: "wB:pV2", cts: now }], new Map(), now, "https://d/", res),
-    ...botRows([{ id: 5, title: "card", channelId: DEAD, running: true, since: now, stack: "finance" }], [], now, res),
+    ...cardRows([{ id: "webapp-chart-source", area: "finance", s: "partial", job: "wB:pV1", cts: now }, { id: "x1", t: "card", stack: "webapp", s: "running", job: "wB:pV2", cts: now }], new Map(), now, "https://d/", res),
+    ...botRows([{ id: 5, title: "card", channelId: DEAD, state: "running", since: now, stack: "finance" }], [], now, res),
   ];
   const text = renderMasterPages(rows, now, "https://d/").join("\n") + rows.map((r) => rowLine(r, now)).join("\n");
   expect(text).not.toContain(`<#${DEAD}>`);

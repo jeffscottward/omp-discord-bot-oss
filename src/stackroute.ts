@@ -6,12 +6,14 @@
  * stack its own thread keeps parallel stack runs apart without changing that lifecycle code.
  */
 import { channelMention } from "./mention.ts";
+import type { FinalJobState, JobState } from "./jobstate.ts";
 import { ChannelType, MessageFlags, ThreadAutoArchiveDuration, type Message, type TextChannel, type ThreadChannel } from "discord.js";
 import { join } from "node:path";
 import { readCards } from "./masterqueue.ts";
 import {
   cardAreasFor,
   GENERAL,
+  keywordScores,
   mergeStacks,
   loadRouterState,
   routeMessage,
@@ -108,6 +110,22 @@ export class StackRouter {
   stackByChannel(channelId: string, parentId: string | null): StackDef | undefined {
     return this.cfg.stacks.find((s) => s.channelIds.includes(channelId) || (parentId !== null && s.channelIds.includes(parentId)));
   }
+  /**
+   * Owner 2026-11-03 (card stack-coverage): every job has a stack. Mapped channel first, then the best keyword
+   * match on the channel name and message text, else the general FIRSTMATE stack. Never undefined while a
+   * general stack exists.
+   */
+  stackForJob(channelId: string, parentId: string | null, channelName = "", text = ""): StackDef | undefined {
+    const mapped = this.stackByChannel(channelId, parentId);
+    if (mapped) return mapped;
+    // A clear winner only (no tie): a tie or no hit goes to the general stack (review finding, card stack-coverage).
+    const clear = (t: string) => {
+      const sc = keywordScores(t, this.cfg.stacks);
+      return sc[0] && sc[0].score > (sc[1]?.score ?? 0) ? sc[0].stack : undefined;
+    };
+    const name = clear(channelName.replace(/[-_]+/g, " ")) ?? clear(text.slice(0, 2000));
+    return (name && this.cfg.stacks.find((s) => s.name === name)) || this.cfg.stacks.find((s) => s.name === GENERAL);
+  }
   /** First routed stack among these message ids (a reply's target, a menu's source message). */
   inherited(ids: (string | null | undefined)[]): string | undefined {
     for (const id of ids) if (id && this.st.msgs[id]) return this.st.msgs[id]!.stack;
@@ -201,7 +219,7 @@ export class StackRouter {
     const c = this.jobCopy.get(id);
     if (c) void this.noteState(c, "running");
   }
-  /** After each queue change: start running jobs; queued jobs that left without starting were cancelled. */
+  /** After each queue change: start running jobs; queued jobs that left without starting were cancelled ("stopped"). */
   sync(running: number[], queued: number[]): void {
     for (const id of running) this.started(id);
     const waiting = new Set(queued);
@@ -209,7 +227,7 @@ export class StackRouter {
       for (const j of s.queued) {
         const id = Number(j.id);
         if (waiting.has(id) || running.includes(id)) continue;
-        this.ended(id, undefined);
+        this.ended(id, "stopped"); // jobTransition("queued", cancel)
       }
   }
   /** Stack threads seen this process (to archive them when the stack is empty). */
@@ -233,19 +251,19 @@ export class StackRouter {
     }, this.archiveGraceMs));
   }
 
-  /** `ok` undefined: cancelled or stopped. */
-  ended(id: number, ok: boolean | undefined): void {
+  /** The job reached a final state (src/jobstate.ts): the queue's onSettled state, or "stopped" for a cancelled waiting job. */
+  ended(id: number, state: FinalJobState): void {
     const job = this.tracker.get(String(id));
     if (!job) return;
-    this.tracker.finish(String(id), ok);
+    this.tracker.finish(String(id), state);
     this.closeIfEmpty(job.stack);
     const c = this.jobCopy.get(id);
     this.jobCopy.delete(id);
-    if (c) void this.noteState(c, ok === undefined ? "cancelled" : ok ? "done" : "failed");
+    if (c) void this.noteState(c, state);
   }
 
   /** Edit the FIRSTMATE note as the job moves; the job's tracker state follows. */
-  async noteState(copyId: string, state: "running" | "done" | "failed" | "cancelled"): Promise<void> {
+  async noteState(copyId: string, state: JobState): Promise<void> {
     const r = this.routed.get(copyId);
     const s = r ? this.stack(r.decision.stack) : undefined;
     if (state !== "running") this.routed.delete(copyId);

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { boardCtxLines, ctxLine, ctxOfFile, ctxSuffix, parseModels } from "./ctxmeter.ts";
+import { ctxLine, ctxOfFile, ctxSuffix, parseModels } from "./ctxmeter.ts";
 
 const line = (u: object, model = "claude-opus-5-5") => JSON.stringify({ type: "message", message: { role: "assistant", model, usage: u } });
 const win = (m: string) => (m === "claude-opus-5-5" ? 1_000_000 : undefined);
@@ -20,14 +20,6 @@ test("percent from the last assistant usage of a fixture session", () => {
   expect(ctxSuffix(undefined)).toBe("");
 });
 
-test("board lines: FIRSTMATE plus recent stacks", () => {
-  const root = mkdtempSync(join(tmpdir(), "ctxr-"));
-  for (const [k, n] of [["firstmate", 900_000], ["stack-ai", 410_000]] as const) {
-    mkdirSync(join(root, k));
-    writeFileSync(join(root, k, "a.jsonl"), line({ input: n, cacheRead: 0, cacheWrite: 0 }) + "\n");
-  }
-  expect(boardCtxLines(root, Date.now(), win)).toBe("🔴 FIRSTMATE context: 90% (900k / 1M) · compacts at 85%\n🧵 Stacks context: ai 41%");
-});
 
 test("omp models table", () => {
   const m = parseModels("│ model │ context │ max-out │\n│ claude-opus-5-5            │      1M │    128K │\n│ x │ 200K │ 8K │");

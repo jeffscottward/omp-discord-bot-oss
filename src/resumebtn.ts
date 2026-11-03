@@ -20,5 +20,5 @@ export function resumeDecision<J>(jobs: Map<string, J>, customId: string, userId
 
 /** The pause notice text plus its ▶️ Resume button (same id as the master-board button, so the same maintAction path runs). */
 export function pauseNotice(why: string): { content: string; button: { customId: string; label: string; emoji: string } } {
-  return { content: `⏸️ Paused: ${why}. New jobs wait; running jobs finish. Tap ▶️ Resume or use /resume-work.`, button: maintButton(true) };
+  return { content: `⏸️ Paused: ${why}. Running jobs get Esc and their cards are set paused; new jobs wait. A count follows in FIRSTMATE. Tap ▶️ Resume or use /resume-work.`, button: maintButton(true) };
 }

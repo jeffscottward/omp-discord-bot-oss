@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fm-tabwatch: close finished fm-spawn tabs; alert on tab and sign-in pile-ups (card auth-loop-guard, owner 2026-10-19).
+"""fm-tabwatch: close finished fm-spawn tabs; alert on tab and sign-in pile-ups (card auth-loop-guard, owner 2026-10-19, main host).
 Run every 2 min by fm-tabwatch.timer. Usage: fm-tabwatch [--dry-run] [--list-closable [--json]] [--test]
 
 T1 close a finished tab. Only tabs that fm-spawn made (~/.local/state/fm-spawn/spawned.jsonl, older ones from the
@@ -14,19 +14,19 @@ T1 close a finished tab. Only tabs that fm-spawn made (~/.local/state/fm-spawn/s
    - every other pane is the idle "Terminal" layout pane (.bashrc): its foreground process is its own shell.
    Then `herdr tab close <tab>`, and the card note gets "🧹 tab closed (<label>, HH:MM)" (fm, FM_AUTO).
    Never closes the owner's own tabs, a tab with a sign-in pane or any other extra pane, a tab of a live card, or a
-   tab of a finance card or time gate (fm-autoclear's finance() rule).
-A1 alert once in the alerts channel (OMP_NOTIFY sender, default fm-notify) when a Herdr workspace has more than 25 tabs; re-armed at <= 22.
+   tab of a time gate (owner 2026-10-31: finance cards are treated like all others; FM_SKIP_AREAS is opt-in).
+A1 alert once in #omp-alerts (omp-notify sender) when a Herdr workspace has more than 25 tabs; re-armed at <= 22.
 A2 alert once when more than 3 sign-in panes were opened within 15 min: auth-pane "opened" events plus panes
    this watcher sees running a `login` command or labeled 🔐/sign-in/login; re-armed when the count is <= 3.
 --list-closable: tabs T1 would close now, plus tabs that only look finished (Herdr status done, not focused;
    not FIRSTMATE): those need a human or FIRSTMATE check. fm-spawn uses --list-closable --json when it refuses.
-Log: $FM_DIR/tabwatch.log (settings: ~/.config/omp-discord/kit.env). State: ~/.local/state/fm-tabwatch/state.json.
+Log: ~/Documents/reports/web/firstmate/tabwatch.log. State: ~/.local/state/fm-tabwatch/state.json.
 Env (tests): FM_TABWATCH_HERDR, FM_TABWATCH_FM, FM_TABWATCH_NOTIFY_CMD (JSON argv), FM_TABWATCH_HERE (firstmate dir),
 FM_TABWATCH_SPAWN_STATE, FM_TABWATCH_AUTH_STATE, FM_TABWATCH_STATE, FM_TABWATCH_QUIET_S.
 """
-import json, os, re, subprocess, sys, tempfile, time
+import shutil, json, os, re, subprocess, sys, tempfile, time
 
-
+# Kit settings (card sma-fm-set-cas, 2026-11-03): one source in git (kit/bin); ~/.local/bin links here.
 def _kit_env():
     """Read the kit settings file (KEY=VALUE lines; the shell kit scripts read the same file).
     File: $OMP_KIT_ENV, else ~/.config/omp-discord/kit.env. A variable that is already set in the environment wins."""
@@ -54,29 +54,16 @@ def _kit_env():
 
 
 _kit_env()
-
-
-def _herdr_bin():
-    """Herdr CLI: $HERDR_BIN, else ~/.local/bin/herdr, else herdr on PATH."""
-    import shutil
-    own = os.path.expanduser("~/.local/bin/herdr")
-    return os.environ.get("HERDR_BIN") or (own if os.access(own, os.X_OK) else (shutil.which("herdr") or "herdr"))
-
-
-def _notify_cmd():
-    """Alert sender argv (same arguments as fm-notify: --kind, --summary, --action): $OMP_NOTIFY (a command line),
-    else fm-notify next to this script (posts to $FM_ALERTS_CHANNEL through the bot's loopback /post)."""
-    import shlex
-    if os.environ.get("OMP_NOTIFY"):
-        return shlex.split(os.environ["OMP_NOTIFY"])
-    return [os.path.join(os.path.dirname(os.path.realpath(__file__)), "fm-notify")]
+_FM_DIR = os.environ.get("FM_DIR") or os.path.join(os.environ.get("REPORTS_WEB_DIR") or os.path.expanduser("~/Documents/reports/web"), "firstmate")
+_FM_BIN = os.environ.get("FM_BIN") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "fm")
 
 HOME = os.path.expanduser("~")
-HERDR = os.environ.get("FM_TABWATCH_HERDR") or _herdr_bin()
-FM = os.environ.get("FM_TABWATCH_FM") or os.environ.get("FM_BIN") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "fm")
-NOTIFY_CMD = json.loads(os.environ["FM_TABWATCH_NOTIFY_CMD"]) if os.environ.get("FM_TABWATCH_NOTIFY_CMD") else _notify_cmd()
-_WEB = os.environ.get("REPORTS_WEB_DIR") or os.path.join(HOME, ".local/share/omp-discord/reports-web")
-HERE = os.environ.get("FM_TABWATCH_HERE") or os.environ.get("FM_DIR") or os.path.join(_WEB, "firstmate")
+HERDR = os.environ.get("FM_TABWATCH_HERDR") or os.environ.get("HERDR_BIN") or os.path.join(HOME, ".local/bin/herdr")
+FM = os.environ.get("FM_TABWATCH_FM") or _FM_BIN
+NOTIFY_CMD = json.loads(os.environ["FM_TABWATCH_NOTIFY_CMD"]) if os.environ.get("FM_TABWATCH_NOTIFY_CMD") else \
+    ([os.environ["OMP_NOTIFY"]] if os.environ.get("OMP_NOTIFY") else [os.path.join(HOME, ".local/bin/omp-notify")] if os.access(os.path.join(HOME, ".local/bin/omp-notify"), os.X_OK)
+     else ["node", os.path.join(HOME, ".local/share/omp-notify/notify.mjs")])
+HERE = os.environ.get("FM_TABWATCH_HERE") or _FM_DIR
 SPAWN_STATE = os.environ.get("FM_TABWATCH_SPAWN_STATE") or os.path.join(HOME, ".local/state/fm-spawn")
 AUTH_STATE = os.environ.get("FM_TABWATCH_AUTH_STATE") or os.path.join(HOME, ".local/state/auth-pane")
 STATE = os.environ.get("FM_TABWATCH_STATE") or os.path.join(HOME, ".local/state/fm-tabwatch")
@@ -87,9 +74,7 @@ QUIET_S = int(os.environ.get("FM_TABWATCH_QUIET_S") or 180)
 TABS_ALERT, TABS_REARM = 25, 22
 SIGNIN_ALERT, SIGNIN_WINDOW_S = 3, 15 * 60
 LIVE = {"running", "waiting", "open", "blocked"}
-# Same rule as fm-autoclear: cards in these areas / with these title words, and time gates, are never touched.
-SKIP_AREAS = {x.strip().lower() for x in (os.environ.get("FM_SKIP_AREAS") or "").split(",") if x.strip()}  # owner 2026-10-31: no area is exempt by default
-SKIP_WORDS = re.compile(r"\b(" + os.environ["FM_SKIP_WORDS"] + r")\b", re.I) if os.environ.get("FM_SKIP_WORDS") else re.compile(r"(?!x)x")  # opt-in; default matches nothing
+SKIP_AREAS = {x.strip().lower() for x in (os.environ.get("FM_SKIP_AREAS") or "").split(",") if x.strip()}  # same rule as fm-autoclear (default none)
 SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
 SPINNER = re.compile("[\u2801-\u28ff]")  # OMP's braille spinner in the terminal title while it works
 SIGNIN_LABEL = re.compile(r"🔐|sign[- ]?in|\blog ?in\b", re.I)
@@ -200,10 +185,10 @@ def norm(s):
 
 
 def finance(it):
-    """fm-autoclear's finance() rule: finance cards and time gates are never touched (no tab close, no note)."""
+    """fm-autoclear's skip_card() rule: time gates (and opt-in FM_SKIP_AREAS) are never touched (no tab close, no note)."""
     if it.get("until") or str(it.get("id", "")).startswith("gate-"):
         return True
-    return str(it.get("area", "")).lower() in SKIP_AREAS or bool(SKIP_WORDS.search(it.get("t", "")))
+    return str(it.get("area", "")).lower() in SKIP_AREAS
 
 
 def job_refs(it):
@@ -413,6 +398,74 @@ def alerts(ws, tabs, panes, items, sure, maybe, dry):
 
 # ---------- main ----------
 
+def proc_users(root):
+    """PIDs whose cwd, root or any open file is under root (procfs scan; unreadable PIDs are ignored)."""
+    root = os.path.realpath(root).rstrip("/") + "/"
+    hits = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        links = [f"/proc/{pid}/cwd", f"/proc/{pid}/root"]
+        try:
+            links += [f"/proc/{pid}/fd/{f}" for f in os.listdir(f"/proc/{pid}/fd")]
+        except OSError:
+            pass
+        for l in links:
+            try:
+                t = os.readlink(l)
+            except OSError:
+                continue
+            if (t.rstrip("/") + "/").startswith(root):
+                hits.append(int(pid))
+                break
+    return hits
+
+
+def node_modules_dirs(wt, depth=4):
+    """Real (non-symlink) node_modules dirs of a worktree: root and workspaces, not nested inside other ones."""
+    out = []
+    for cur, dirs, _f in os.walk(wt):
+        if cur[len(wt):].count(os.sep) >= depth:
+            dirs[:] = []
+            continue
+        keep = []
+        for d in dirs:
+            full = os.path.join(cur, d)
+            if d == ".git" or os.path.islink(full):
+                continue
+            if d == "node_modules":
+                out.append(full)
+            else:
+                keep.append(d)
+        dirs[:] = keep
+    return out
+
+
+def cleanup_node_modules(sp, dry):
+    """T2 (owner 2026-10-23, card worktree-disk): after T1 closed a finished tab, delete only node_modules of that
+    job's fm-spawn worktree. Never the main checkout, source or the worktree itself; symlinked (shared)
+    node_modules stay; skipped while any process has its cwd or an open file in the worktree."""
+    wt = sp.get("worktree")
+    if not wt or not os.path.isdir(wt) or not os.path.isfile(os.path.join(wt, ".git")):
+        return  # no worktree, gone, or a main checkout (.git is a dir there)
+    wt = os.path.realpath(wt)
+    if not re.search(r"-wt-[^/]+$", wt):
+        return
+    nms = node_modules_dirs(wt)
+    if not nms:
+        return
+    users = proc_users(wt)
+    if users:
+        log(f"T2 keep node_modules in {wt}: in use by pid {users[:5]}", dry)
+        return
+    for nm in nms:
+        if os.path.islink(nm) or not os.path.realpath(nm).startswith(wt + "/"):
+            continue
+        log(f"T2 delete {nm} (card {sp.get('card')})", dry)
+        if not dry:
+            shutil.rmtree(nm, ignore_errors=True)
+
+
 def close_tab(sp, tab, why, dry):
     log(f"T1 close {tab['tab_id']} ({tab.get('label')}) card {sp.get('card')}: {why}", dry)
     if dry:
@@ -426,13 +479,19 @@ def close_tab(sp, tab, why, dry):
     if not gone:
         log(f"T1 FAILED: tab {tab['tab_id']} still exists 10 s after close", dry)
         return
+    try:
+        cleanup_node_modules(sp, dry)
+    except Exception as e:  # cleanup must never block the card note
+        log(f"T2 cleanup error for {sp.get('worktree')}: {e}", dry)
     card = sp.get("card")
     it = json.loads(subprocess.run([FM, "get", card], capture_output=True, text=True).stdout or "null") if card else None
     if it and "🧹 tab closed" not in (it.get("n") or ""):
         note = f"{(it.get('n') or '').rstrip()} 🧹 tab closed ({tab.get('label')}, {time.strftime('%H:%M')})".strip()
-        r = subprocess.run([FM, "set", card, it["s"], note], capture_output=True, text=True,
+        r = subprocess.run([FM, "set", card, it["s"], note, "--from", it["s"]], capture_output=True, text=True,
                            env={**os.environ, "FM_AUTO": "tabwatch T1: finished tab closed"})
-        if r.returncode != 0:
+        if r.returncode == 3:  # fm set --from: the card moved since the get; nothing written (card sma-fm-set-cas)
+            log(f"T1 note skipped for {card}: card moved", dry)
+        elif r.returncode != 0:
             log(f"T1 note FAILED for {card}: {r.stderr.strip()[:200]}", dry)
 
 
@@ -541,12 +600,8 @@ def selftest():
         check("T1 non-message entries after the final reply are skipped", ct()[0])
         check("T1 no card keeps", not ct(sp={**sp, "card": None})[0])
         check("T1 a done finance card closes like any card (owner 2026-10-31)", ct(items=[{"id": "c1", "s": "done", "area": "finance"}])[0])
-        check("T1 title words never keep a tab by default", ct(items=[{"id": "c1", "s": "done", "t": "Video reel to trade decision"}])[0])
+        check("T1 title words never keep a tab", ct(items=[{"id": "c1", "s": "done", "t": "IG reel to trade decision"}])[0])
         check("T1 a time gate keeps", not ct(items=[{"id": "c1", "s": "done", "until": "2099-01-01T00:00:00Z"}])[0])
-        global SKIP_AREAS
-        SKIP_AREAS = {"finance"}
-        check("T1 an opt-in FM_SKIP_AREAS card keeps", not ct(items=[{"id": "c1", "s": "done", "area": "finance"}])[0])
-        SKIP_AREAS = set()
         # registry: legacy log + jsonl
         global SPAWN_STATE
         SPAWN_STATE = os.path.join(d, "spawn")

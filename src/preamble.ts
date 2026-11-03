@@ -65,6 +65,7 @@ export const TRUSTED_RULES = [
   "- To upload a file with your answer, put a line `📎 attach: <absolute or ~/ path>` in the answer (max 10 MB each, up to 10 files). The bridge removes the line and attaches the file.",
   "- AGENTS.md rules still apply (disruption, Claude-login protection, privacy of secrets in replies).",
   "- To get a token or key from the owner, run `bun ~/Github/tools/omp-discord-bot/scripts/secret-drop.ts --name \"<label>\" --dest ~/.config/<app>/<file>` (posts a one-time tailnet form; the value goes straight to a 0600 file). Never ask the owner to paste a secret into Discord or a terminal pane.",
+  "- When an answer has a workflow or several numbers, add a ```chart block (JSON {\"type\":\"bar|line|pie|donut\",\"title\":\"…\",\"labels\":[…],\"series\":[{\"name\":\"…\",\"values\":[…]}],\"unit\":\"…\"}) or a ```mermaid flowchart block (graph TD; A[Start] --> B{Check} -->|yes| C); the bot renders it as an image. Do not add charts to short answers.",
   "- Never restart the Discord bot (omp-discord-bot) directly from this run: that kills this run mid-turn. Schedule `systemd-run --user --collect ~/Github/tools/omp-discord-bot/scripts/restart-when-idle.sh` and finish your answer; the restart happens after the run ends.",
 ];
 

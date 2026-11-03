@@ -3,7 +3,7 @@ import { ownerNtfy } from "./ownerntfy.ts";
 import { RESUME_PREFIX, resumeDecision, pauseNotice } from "./resumebtn.ts";
 import { spawnSync } from "node:child_process";
 import { channelMention, mentionable, setMentionCheck } from "./mention.ts";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, watchFile } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { connect as netConnect } from "node:net";
 import { homedir } from "node:os";
@@ -64,11 +64,12 @@ import { instanceFor, LocalOmpChat, routeMessage as routeLocalOmp } from "./loca
 import { LABEL as VENICE_LABEL, veniceProfile } from "./venice.ts";
 import { DEFAULT_TOOLS as UNCENSORED_TOOLS, LABEL as UNCENSORED_LABEL, uncensoredProfile } from "./firstmate-uncensored.ts";
 import { DoneFollowUps, followUpText, isDoneEmoji, isOwnerDone, markOwnerDone } from "./reactdone.ts";
-import { ALERT_CHANNELS, BOT_ENV_FILE, CONFIG, CONFIG_FILE, commandEnabled, DASHBOARD_BASE_URL, DEV_CHANNEL_ID, FIRSTMATE_CHANNEL_ID, FIRSTMATE_SESSION, FM_DIR, LOCAL_MODEL_CHANNEL_ID, NEEDS_YOU_CHANNEL_ID, SESSIONS_DIR, STATE_DIR, CHANNELS, GUILD_ID, IDLE_TIMEOUT_MS, MAX_CONCURRENT, OMP_BIN, OWNER_ID, RUN_TIMEOUT_MS, trusted, VOICE_CHANNEL_ID, VOICE_FALLBACK_CHANNEL_ID, VOICE_TRANSCRIPT_CHANNEL_ID, WORKING_EMOJI } from "./config.ts";
+import { ALERT_CHANNELS, BOT_ENV_FILE, CONFIG, CONFIG_FILE, commandEnabled, DASHBOARD_BASE_URL, DEV_CHANNEL_ID, FIRSTMATE_CHANNEL_ID, FIRSTMATE_SESSION, FM_DIR, LOCAL_MODEL_CHANNEL_ID, NEEDS_YOU_CHANNEL_ID, SESSIONS_DIR, STATE_DIR, CHANNELS, GUILD_ID, IDLE_TIMEOUT_MS, MAX_CONCURRENT, OMP_BIN, OWNER_ID, reloadChannels, RUN_TIMEOUT_MS, trusted, VOICE_CHANNEL_ID, VOICE_FALLBACK_CHANNEL_ID, VOICE_TRANSCRIPT_CHANNEL_ID, WORKING_EMOJI } from "./config.ts";
 import { isAlert, NeedsYouBoard, type BoardChannel, type MenuSource } from "./needsyou.ts";
 import { herdrPlace, isMasterBoard, MasterQueueBoard, TITLE_MAX, parseHerdrPanes, parseHerdrTabs, queueBoxAllowed, type HerdrPane, type HerdrTab, type JobPlace, type LiveJob } from "./masterqueue.ts";
 import { cancelQueuedJob } from "./cancel.ts";
 import { clearPause, HELD_FILE, holdAlert, parseDuration, pauseLine, pauseTransition, readPause, restoreHeld, resumeDigest, setPause, takeHeld } from "./alertpause.ts";
+import * as pauseall from "./pauseall.ts";
 import { MAINT_BIN, MAINT_PREFIX, maintButton, maintLine, readMaintPause, showMaintButton } from "./maintpause.ts";
 import { forcedStack, GENERAL, jevJudge, routerConfig, stackPreamble, type RouteDecision, type StackDef } from "./router.ts";
 import { jevJobJudge, JOBROUTE_PREFIX, jobRouteClickAllowed, matchJob, openJobs, type JobMatch, type OpenJob } from "./jobmatch.ts";
@@ -88,18 +89,22 @@ import { hasSession, isolatedTag, modelArgs, sessionDir, onApprovalRequest, qwen
 import { HEARTBEAT_MS, lastActivity } from "./heartbeat.ts";
 import { refreshSecretValues } from "./secrets.ts";
 import { emptyAnswerFallback, emptyAnswerPlan, type OutMsg, prepareCopy, prepareOutbound } from "./outbound.ts";
-import { renderTables, tableLineCount } from "./tablerender.ts";
-import { boardCtxLines, ctxOfFile, ctxSuffix, newestSession, windowOf } from "./ctxmeter.ts";
-import { baselineLine, newBaselines } from "./compactbase.ts";
+import { ACCOUNT_RE, findTables, MAX_TABLES, renderTables, TABLES_DEADLINE_MS, tableLineCount } from "./tablerender.ts";
+import { replayAllowed, takeReplays } from "./replay.ts";
+import { chartLineCount, MAX_CHARTS, orderImages, renderCharts } from "./chartrender.ts";
+import { ctxOfFile, ctxSuffix, newestSession, windowOf } from "./ctxmeter.ts";
+import { BaselineWatch, baselineLine } from "./compactbase.ts";
 import { attachTail, buildTail, isFinanceChannel, lastThinking, modelWithThinking } from "./replytail.ts";
 import { messageProvenance, route, threadName, timeLimitContinue, unrestrictedRoute, watchdogContinue } from "./policy.ts";
 import { ASK_BLOCK_RULE, buildPrompt, setOwnerInVoiceProbe, type PromptInput } from "./preamble.ts";
-import { ARCHIVE_IDS, busyReply, HOSTS, Mirror, oneLine, rejectLongChannelCreate, sh, sideSessionKey, type MirrorEntry, type WaitHandler } from "./mirror.ts";
+import { PaneJobQueue, QUEUED_NOTE } from "./jobqueue.ts";
+import { ARCHIVE_IDS, HOSTS, Mirror, oneLine, rejectLongChannelCreate, sh, sideSessionKey, type MirrorEntry, type WaitHandler } from "./mirror.ts";
 import { choicesFor, closedCard, PaneInjector, QR_MODAL_PREFIX, QR_PREFIX, redactTerminal, SB_PREFIX, SCROLLBACK_LINES, scrollbackMessages, shellQuote, waitCard, MAX_TEXT, type Choice, type InjectTarget, type PaneWait } from "./quickreply.ts";
 import { redactKnownSecrets } from "./secrets.ts";
 import { MAX_CONTINUES, STALL_MS, type WatchAction } from "./stall.ts";
 import { JobQueue, jobPreview } from "./queue.ts";
-import { loadQueueState, saveQueueState, voiceRestoreDecision, type SavedJob } from "./queuestate.ts";
+import { loadQueueState, restorePlan, saveQueueState, SavedQueue, type SavedJob } from "./queuestate.ts";
+import { jobReaction } from "./jobstate.ts";
 import { redact } from "./redact.ts";
 import { noteIsLate, showWorking } from "./working.ts";
 import { rigReport, type StatKind } from "./rigstats.ts";
@@ -134,23 +139,19 @@ function loadToken(): string {
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 
-/** Plan P1: waiting jobs are saved to disk and queued again after a restart (src/queuestate.ts). */
+/**
+ * Plan P1 + card sma-bot-lost-turns: every owner job in the queue (waiting or running) is saved to disk; after a
+ * restart waiting jobs are queued again and running jobs run again once (src/queuestate.ts).
+ */
 const savedAtStart = loadQueueState(STATE_DIR);
 // Card omp-pause-button: while omp-maintenance's paused.json exists no queued job starts (running jobs finish).
 const queue = new JobQueue<RunResult>(MAX_CONCURRENT, { startId: savedAtStart.nextId, paused: () => readMaintPause() !== null });
-/** Waiting jobs that can be rebuilt after a restart, by job id. */
-const savedJobs = new Map<number, SavedJob>();
-/**
- * Card voicecall-drop (2026-10-31): a voice-call turn that is RUNNING is saved too, so a restart in the
- * middle of it (the owner heard "One moment", then the bot restarted) runs the turn again and speaks the answer.
- */
-const runningVoice = new Map<number, SavedJob>();
-/** Saved jobs from before the restart that are not queued again yet (they stay in the file until then). */
-let toRestore: SavedJob[] = savedAtStart.jobs;
+const savedJobs = new SavedQueue(savedAtStart.jobs);
+/** Set on SIGTERM/SIGINT (shutdown): queue.json is frozen and runs that end now post nothing; they run again after the start. */
+let shuttingDown = false;
 function saveQueue(): void {
-  const waiting = new Set(queue.status().queued.map((q) => q.id));
-  for (const id of savedJobs.keys()) if (!waiting.has(id)) savedJobs.delete(id);
-  saveQueueState(STATE_DIR, { nextId: queue.peekNextId(), jobs: [...toRestore, ...runningVoice.values(), ...savedJobs.values()] });
+  const st = queue.status();
+  saveQueueState(STATE_DIR, savedJobs.state(queue.peekNextId(), [...st.running, ...st.queued]));
 }
 /**
  * FIRSTMATE fan-out router (owner 2026-10-23, card fm-router; src/router.ts, src/stackroute.ts): owner messages
@@ -171,6 +172,8 @@ setInterval(() => stackRouter.refresh(), 10_000);
 queue.groupLimits = { stack: stackRouter.cfg.maxParallelStacks };
 /** Stack name per queue job (board rows: `→ stack: <name>`). */
 const jobStacks = new Map<number, string>();
+/** Card stack-coverage: fallback stack (channel name/keywords/general) per job, read by the Master queue only. */
+const jobStacksFallback = new Map<number, string>();
 queue.onChange = () => {
   saveQueue();
   masterQueue?.onQueueChange();
@@ -178,6 +181,7 @@ queue.onChange = () => {
   stackRouter.sync(st.running.map((j) => j.id), st.queued.map((j) => j.id));
   const live = new Set([...st.running, ...st.queued].map((j) => j.id));
   for (const id of jobStacks.keys()) if (!live.has(id) && !stackRouter.tracker.get(String(id))) jobStacks.delete(id);
+  for (const id of jobStacksFallback.keys()) if (!live.has(id)) jobStacksFallback.delete(id);
 };
 stackRouter.tracker.onChange = () => {
   if (FIRSTMATE_CHANNEL_ID && queueBoards.has(FIRSTMATE_CHANNEL_ID)) void editBoard(FIRSTMATE_CHANNEL_ID, "");
@@ -221,6 +225,47 @@ const NO_PINGS = { allowedMentions: { parse: [] as never[], repliedUser: false }
 /** Owner 2026-10-15: only full answers notify. Status/progress posts are Discord silent messages. */
 const QUIET = { ...NO_PINGS, flags: MessageFlags.SuppressNotifications as const };
 const mirror = new Mirror(client);
+// Card discord-queue-for-job: owner messages for a busy job pane wait here until the pane is idle.
+const jobQueue = new PaneJobQueue({
+  file: join(STATE_DIR, "job-queue.json"),
+  herdr: async (args) => {
+    const r = await sh(null, args.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ").replace(/^/, "herdr "), 20_000);
+    return { code: r.code, out: r.out.toString("utf8") };
+  },
+  readTail: (f) => {
+    try {
+      const b = readFileSync(f);
+      return b.subarray(Math.max(0, b.length - 256 * 1024)).toString("utf8");
+    } catch {
+      return null;
+    }
+  },
+  fileSize: (f) => {
+    try {
+      return statSync(f).size;
+    } catch {
+      return 0;
+    }
+  },
+  jobLive: async (channelId) => (await mirror.decide(channelId, null, FIRSTMATE_CHANNEL_ID))?.mode === "busy",
+  editNote: async (channelId, noteId, content) => {
+    const ch = await mirror.channel(channelId);
+    const m = await ch?.messages?.fetch(noteId).catch(() => null);
+    await m?.edit({ content });
+  },
+  latestAfter: async (channelId, afterId) => {
+    const ch = await mirror.channel(channelId);
+    const list = await ch?.messages?.fetch({ after: afterId, limit: 20 }).catch(() => null);
+    const bot = list ? [...list.values()].filter((m) => m.author.id === client.user?.id).sort((a, b) => a.createdTimestamp - b.createdTimestamp) : [];
+    return bot.at(-1)?.url ?? null;
+  },
+  runNormally: async (it) => {
+    const ch = await mirror.channel(it.channelId);
+    const m = await ch?.messages?.fetch(it.messageId).catch(() => null);
+    if (m) await handle(m, { authorId: OWNER_ID, text: it.text, restored: true });
+  },
+  log,
+});
 /**
  * Owner alert pause (src/alertpause.ts): a new #omp-alerts message is held (alerts-held.jsonl) while paused.
  * Returns the pause end when held, else null. Every #omp-alerts sender goes through this.
@@ -243,18 +288,25 @@ mirror.alertFirstmate = FIRSTMATE_CHANNEL_ID
   : null;
 /** Owner 2026-11-03 (card compact-baseline): one line in FIRSTMATE after each auto-compaction (src/compactbase.ts). */
 if (FIRSTMATE_CHANNEL_ID) {
-  let lastSize = -1;
+  const watch = new BaselineWatch(join(STATE_DIR, "compact-baseline.json"));
+  const sending = new Set<string>();
   setInterval(() => {
     const file = newestSession(join(SESSIONS_DIR, FIRSTMATE_SESSION.key));
     if (!file) return;
-    const size = statSync(file, { throwIfNoEntry: false })?.size ?? -1;
-    if (size === lastSize) return;
-    lastSize = size;
     try {
-      for (const b of newBaselines(readFileSync(file, "utf8"), join(STATE_DIR, "compact-baseline.json"))) {
+      for (const b of watch.poll(file)) {
+        if (sending.has(b.id)) continue;
+        sending.add(b.id);
         const line = baselineLine(b, (b.model && windowOf(b.model)) || 1_000_000);
-        log(`compact-baseline: ${b.id} ${line}`);
-        mirror.alertFirstmate?.(line);
+        void privateChannel(FIRSTMATE_CHANNEL_ID)
+          .then(async (ch) => {
+            if (!ch) throw new Error("FIRSTMATE channel not found");
+            await ch.send({ content: line, allowedMentions: { parse: [] } });
+            watch.done(b.id); // mark only after a successful post; a failed post is retried next minute
+            log(`compact-baseline: posted ${b.id} ${line}`);
+          })
+          .catch((e) => log(`compact-baseline: post failed ${b.id}: ${(e as Error).message}`))
+          .finally(() => sending.delete(b.id));
       }
     } catch (e) {
       log(`compact-baseline: ${(e as Error).message}`);
@@ -364,7 +416,15 @@ async function sendText(target: SendableChannels, text: string, links?: LinkButt
   att.files.push(...extraFiles.slice(0, Math.max(0, 10 - att.files.length)));
   // Owner 2026-10-21: tables become a PNG plus a web page (src/tablerender.ts); failures keep the text.
   // Owner 2026-10-21 (menu pick): finance channels get the same PNG + page as other channels; only text with account numbers stays image-only.
-  const tbl = await renderTables([att.text, ...att.notes].filter(Boolean).join("\n\n"), { log });
+  // Owner 2026-11-03 (card discord-charts): ```chart / ```mermaid / ```flow blocks become PNGs; failures keep the text.
+  const joined = [att.text, ...att.notes].filter(Boolean).join("\n\n");
+  const t0 = Date.now();
+  // Discord allows 10 files per message: leave room for tables, attachments and audio.
+  const roomForCharts = Math.max(0, Math.min(MAX_CHARTS, 10 - att.files.length - (audio ? 1 : 0) - Math.min(findTables(joined).length, MAX_TABLES)));
+  const charts = await renderCharts(joined, { log, max: roomForCharts });
+  // Account check on the original text: chart blocks are gone from charts.text. One shared deadline.
+  const tbl0 = await renderTables(charts.text, { log, accountData: ACCOUNT_RE.test(joined), deadlineMs: Math.max(1, TABLES_DEADLINE_MS - (Date.now() - t0)) });
+  const tbl = { ...tbl0, files: orderImages(tbl0.text, tbl0.files, charts.files), tmpDirs: [...(tbl0.tmpDirs ?? []), ...charts.tmpDirs] };
   // Owner 2026-10-21: model + dashboard link form one bullet list after one blank line.
   const tailBlock = buildTail(model, dashLine || undefined);
   let followup: string | undefined;
@@ -382,8 +442,12 @@ async function sendText(target: SendableChannels, text: string, links?: LinkButt
   for (const [i, m] of out.messages.entries()) {
     const files = m.file ? [new AttachmentBuilder(Buffer.from(m.file.data, "utf8"), { name: m.file.name })] : [];
     // Each table PNG rides on the message that holds its 📊 line; leftovers go on the last message.
-    const pngCount = i === out.messages.length - 1 ? tablePngs.length : tableLineCount(m.content);
-    for (const f of tablePngs.splice(0, Math.min(pngCount, 10 - files.length))) files.push(new AttachmentBuilder(f.path, { name: f.name }));
+    const pngCount = i === out.messages.length - 1 ? tablePngs.length : tableLineCount(m.content) + chartLineCount(m.content);
+    // Card tables split into several images (owner 2026-11-03, card card-images-3); >10 images continue in a follow-up message.
+    const imgs: { path: string; name: string }[] = tablePngs.splice(0, pngCount).flatMap((f: { path: string; name: string; parts?: { path: string; name: string }[] }) => (f.parts?.length ? f.parts : [f]));
+    const room = Math.max(0, 10 - files.length);
+    for (const f of imgs.slice(0, room)) files.push(new AttachmentBuilder(f.path, { name: f.name }));
+    const overflowImgs = imgs.slice(room);
     const links = i === out.messages.length - 1 ? tail : [];
     const buttons = links.map((l) => new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(l.label).setURL(l.url));
     if (m.paste) buttons.unshift(new ButtonBuilder().setCustomId(SEND_BUTTON_ID).setStyle(ButtonStyle.Primary).setLabel("Send to FIRSTMATE"));
@@ -405,6 +469,11 @@ async function sendText(target: SendableChannels, text: string, links?: LinkButt
     answerIds.push(sent.id);
     first ??= sent;
     last = sent;
+    for (let j = 0; j < overflowImgs.length; j += 10) {
+      last = own(await target.send({ content: "", files: overflowImgs.slice(j, j + 10).map((f) => new AttachmentBuilder(f.path, { name: f.name })), ...QUIET }));
+      sink?.messages.push(last);
+      answerIds.push(last.id);
+    }
     if (followup) {
       last = own(await target.send({ content: followup, ...QUIET }));
       sink?.messages.push(last);
@@ -1828,7 +1897,7 @@ function own<T extends Message | null | undefined>(m: T): T {
  */
 async function handle(
   msg: Message,
-  asOwner?: { authorId: string; text: string; fromVoice?: boolean; attachments?: { name: string; url: string }[]; restored?: boolean; menuIds?: string[]; voiceRestarts?: number },
+  asOwner?: { authorId: string; text: string; fromVoice?: boolean; attachments?: { name: string; url: string }[]; restored?: boolean; menuIds?: string[]; restarts?: number; replaces?: SavedJob },
 ): Promise<void> {
   // Owner 2026-10-19: owner turns (menus, voice, Undo, restored jobs) in a pinned-model channel go to that model.
   if (asOwner && routePinned(msg.channel, asOwner.text)) return;
@@ -2056,8 +2125,12 @@ async function handle(
   if (mirrored && !stack) {
     const d = await mirror.decide(mirrored.channelId, threadId, FIRSTMATE_CHANNEL_ID).catch(() => null);
     if (d?.mode === "busy") {
-      log(`mirror: refused new run in ${d.cwd}: live job pane ${d.entry.machine}:${d.entry.paneId}`);
-      await target.send({ content: busyReply(d.entry.tab, d.entry.paneId, d.cwd), ...QUIET }).catch(() => {});
+      // Card discord-queue-for-job (owner 2026-11-03): queue for the job pane instead of refusing.
+      log(`mirror: queued for live job pane ${d.entry.machine}:${d.entry.paneId} (${d.cwd})`);
+      const note = await msg.reply({ content: QUEUED_NOTE, ...QUIET }).catch(() => null);
+      const extra = attachments.length ? `\n\nAttachments:\n${attachments.map((a) => `- ${a.name}: ${a.url}`).join("\n")}` : "";
+      jobQueue.add(d.entry.paneId, { messageId: msg.id, channelId: mirrored.channelId, noteId: note?.id ?? null, url: msg.url, text: `${text}${extra}` });
+      void statusReact.set(msg, "📨");
       return;
     }
   }
@@ -2071,9 +2144,14 @@ async function handle(
         return runOmp(sessKey, cwd, prompt, { channelId: target.id, runId: fmRun, model, extraArgs: st.extraArgs, resumeFile: st.resumeFile, fresh: st.fresh }).finally(() => sessionCmds.afterRun(sessKey));
       };
 
-  // A job restored after a restart may already carry our ⏳ from the old process.
-  if (msg.reactions.cache.some((r) => r.me && r.emoji.name === "⏳")) statusReact.assume(msg, "⏳");
-  void statusReact.set(msg, "⏳");
+  // A job restored after a restart may still carry our ⏳ or ⚙️ from the old process: set() then replaces it.
+  const carried = [jobReaction("queued", WORKING)!, jobReaction("running", WORKING)!].filter((e) => {
+    const name = (e.match(/^<a?:(\w+):\d+>$/)?.[1] ?? e).replace(/\uFE0F/g, "");
+    return msg.reactions.cache.some((r) => r.me && r.emoji.name?.replace(/\uFE0F/g, "") === name);
+  });
+  if (carried[0]) statusReact.assume(msg, carried[0]);
+  for (const e of carried.slice(1)) void setReaction(msg, e, false); // one status slot per message: remove a second one
+  void statusReact.set(msg, jobReaction("queued", WORKING));
   // Owner 2026-10-18: mark the cards this response answers as 📨 Queued before the run starts (no double submits).
   // Refs: the menu / replied-to message ids, plus links and `⚓ item:` tokens in the OWNER's text only. The replied-to
   // bot message is not scanned: its "Still waiting" links and item tokens name cards the owner did not answer.
@@ -2090,12 +2168,8 @@ async function handle(
     ...(stack ? { group: "stack" } : {}),
     onStart: () => {
       queuedMsgs.delete(id);
-      if (asOwner?.fromVoice) {
-        runningVoice.set(id, { id, channelId: msg.channelId, messageId: msg.id, authorId: asOwner.authorId, text, fromVoice: true, attachments, enqueuedAt: Date.now(), running: true, restarts: asOwner.voiceRestarts ?? 0 });
-        saveQueue();
-      }
       // Owner 2026-10-15: ⏳ = waiting in the queue, ⚙️ = being worked on now.
-      void statusReact.set(msg, WORKING);
+      void statusReact.set(msg, jobReaction("running", WORKING));
       // Owner 2026-10-15: turn this job's ⏳ Queued. note into Working… in place, so the order stays
       // ✅ done → ⚙️ Working (Stop) → ⏳ waiting (Cancel). No note (started at once): post at the bottom.
       const note = queuedNotes.get(id);
@@ -2110,6 +2184,12 @@ async function handle(
         .then((m) => {
           if (finishedJobs.delete(id)) return void m.delete().catch(() => {});
           workingMsgs.set(id, own(m));
+          // Card sma-bot-lost-turns: a restart deletes this Working… message (its Stop button is for the old job id).
+          const rec = savedJobs.get(id);
+          if (rec && rec.noteId !== m.id) {
+            rec.noteId = m.id;
+            saveQueue();
+          }
           jobLinks.set(id, m.url); // board "Now" links to the Working… message with Stop
           void editBoard(target.id, ""); // refresh now so the Now link points at Working… at once
           let editing = false;
@@ -2144,7 +2224,8 @@ async function handle(
         })
         .catch(() => void editBoard(target.id, "")); // Working… failed: still refresh the board
     },
-    onDone: async (res, err) => {
+    onDone: async (res, err, state) => {
+      if (shuttingDown) return void log(`job ${id} ended during shutdown (${state}); it runs again after the start`);
       let answer: Message | undefined;
       noteApiFallback(res, where);
       try {
@@ -2162,20 +2243,20 @@ async function handle(
       workingMsgs.delete(id);
       jobKeys.delete(id);
       jobLinks.delete(id);
-      if (res?.cancelled) {
+      if (state === "stopped") {
         autoContinues.delete(target.id);
         if (asOwner?.fromVoice) void voicechat.stopHold();
-        void statusReact.set(msg, null);
+        void statusReact.set(msg, jobReaction(state, WORKING));
         undoJobs.set(String(id), { msg, startedAt: startedAt ?? Date.now(), text });
         const row = stoppedRow(id);
         answer = (await msg.reply({ content: "🛑 Stopped. To steer, just type or dictate a correction. To go on, tap ▶️ Resume. To go back to before this message, tap 🔙 Undo. To clear this out, tap 🗑️ Remove.", components: [row], ...QUIET }).catch(() => null)) ?? undefined;
         void editBoard(target.id, `\n🛑 **Stopped:** ${maskedLabelText(preview)}`);
         return;
       }
-      void editBoard(target.id, `\n${res?.ok ? "✅" : "❌"} **Done:** ${maskedLabelText(preview)}`);
+      void editBoard(target.id, `\n${state === "done" ? "✅" : "❌"} **Done:** ${maskedLabelText(preview)}`);
       if (!res?.timedOut) autoContinues.delete(target.id); // the chain ends with any normal finish
       log(`job ${id} done key=${key} ok=${res?.ok ?? false} code=${res?.code ?? "n/a"} timedOut=${res?.timedOut ?? false} ms=${res?.durationMs ?? 0}`);
-      void statusReact.set(msg, res?.ok ? "✅" : "❌");
+      void statusReact.set(msg, jobReaction(state, WORKING));
       if (res?.ok) {
         // Owner 2026-10-31: speech is made on demand (🔊 button) to keep the GPU free; voice-call answers are still spoken at once.
         const spokenSource = prepareOutbound(extractAsk(res.stdout).text).messages.filter((m) => !m.paste).map((m) => m.content).join("\n");
@@ -2183,6 +2264,8 @@ async function handle(
         const audio = voice ? synthesize(spokenSource).catch(() => null) : Promise.resolve(null);
         const ready = voice ? await Promise.race([audio, new Promise<"late">((r) => setTimeout(() => r("late"), 45_000))]) : null;
         answer = await sendText(target, res.stdout, undefined, msg, voice, typeof ready === "string" && ready !== "late" ? ready : undefined, audioName(text), [], startedAt, fmRun, undefined, modelWithThinking(withCtx(res.model ?? models.defaultModel(), res.sessionFile), lastThinking(res.sessionFile)));
+        // Card sma-bot-lost-turns: the answer has posted; a restart while the voice audio still plays must not run it again.
+        if (savedJobs.settle(id)) saveQueue();
         if (!voice && answer && speakable(spokenSource)) void addSpeakButton(answer, spokenSource, audioName(text));
         if (planRun && isPlanAnswer(res.stdout)) await target.send({ content: "📝 Plan ready.", components: [sessionCmds.planRow()], ...QUIET }).catch(() => {});
         answer = (await postEarlierExtras(target, res, msg).catch((e) => void log(`earlier extras: ${(e as Error).message}`))) ?? answer;
@@ -2265,17 +2348,26 @@ async function handle(
         }, autoMs);
       }
       } finally {
-        if (runningVoice.delete(id)) saveQueue();
+        // Card sma-bot-lost-turns: the reply has posted, so a restart from now on never runs this turn again.
+        if (savedJobs.settle(id)) saveQueue();
         // Owner 2026-10-15: when the queue is done, the board moves below the last answer.
         void boardToBottom(target.id);
       }
     },
   });
   jobKeys.set(id, target.id);
+  // Plan P1 + card sma-bot-lost-turns: save every owner job (waiting or already running) so a restart does not lose it.
+  // A restored job replaces its old record in the same step, so the file never holds both or neither.
+  if (asOwner?.replaces) savedJobs.restored(asOwner.replaces);
+  savedJobs.add({ id, channelId: msg.channelId, messageId: msg.id, authorId, text, fromVoice: asOwner?.fromVoice, attachments, enqueuedAt: Date.now(), restarts: asOwner?.restarts });
+  saveQueue();
   jobOwnerLinks.set(id, msg.url);
   if (transientThread) transientThreads.set(id, transientThread);
   // Board tag: the routed stack, FIRSTMATE general, or the stack of a mapped topic channel.
   const tagged = stack ?? (mirrored?.channelId === FIRSTMATE_CHANNEL_ID && !threadId ? stackRouter.stack(GENERAL) : stackRouter.stackByChannel(msg.channelId, parentId));
+  // Card stack-coverage: a job with no routed or mapped stack gets a fallback stack for the Master queue only
+  // (channel boards keep showing only real stacks; review finding 5).
+  if (!tagged) { const fb = stackRouter.stackForJob(msg.channelId, parentId, mirrored?.name ?? (msg.channel as { name?: string }).name ?? "", text); if (fb) jobStacksFallback.set(id, fb.name); }
   if (tagged) jobStacks.set(id, tagged.name);
   // Stack status (FIRSTMATE board 🧭 section, stacks.json, /health): stack-thread jobs only, never topic-channel text.
   if (stack) stackRouter.track(id, stack, preview, msg.url, msg.id, queue.status().running.some((r) => r.id === id));
@@ -2293,9 +2385,6 @@ async function handle(
     void postCheck(target.id, "no-start", msg).catch((e) => log(`check no-start ${id}: ${(e as Error).message}`));
   }, 60_000);
   if (position > 0) {
-    // P1: save the waiting job so a restart does not lose it.
-    savedJobs.set(id, { id, channelId: msg.channelId, messageId: msg.id, authorId, text, fromVoice: asOwner?.fromVoice, attachments, enqueuedAt: Date.now() });
-    saveQueue();
     queuedMsgs.set(id, { msg });
     void syncBadges();
     // Owner 2026-10-15: each queued message gets a silent "⏳ Queued." note with its own Cancel button.
@@ -2441,34 +2530,36 @@ async function onWatch(e: MirrorEntry, a: WatchAction): Promise<void> {
   jobKeys.set(id, ch.id);
 }
 
-/** P1: queue the jobs saved before the restart again, in their old order. */
+/** P1 + card sma-bot-lost-turns: queue the jobs saved before the restart again, in their old order (running ones once). */
 async function restoreQueue(): Promise<void> {
-  const jobs = toRestore.slice();
+  const jobs = savedJobs.toRestore();
   if (!jobs.length) return;
-  log(`queue: restoring ${jobs.length} waiting job(s) from before the restart`);
+  log(`queue: restoring ${jobs.length} job(s) from before the restart (${jobs.filter((j) => j.running).length} were running)`);
   for (const j of jobs) {
     try {
       const ch = await client.channels.fetch(j.channelId).catch(() => null);
       const msg = ch?.isTextBased() ? await ch.messages.fetch(j.messageId).catch(() => null) : null;
-      // The old "⏳ Queued." note has a Cancel button for the old job id: remove it (a new note follows).
+      // The old "⏳ Queued." / "Working…" note has a Cancel or Stop button for the old job id: remove it (a new note follows).
       if (j.noteId && ch?.isTextBased()) void ch.messages.fetch(j.noteId).then((n) => n.delete()).catch(() => {});
-      toRestore = toRestore.filter((x) => x !== j);
       if (!msg) {
+        savedJobs.restored(j);
         log(`queue: saved job ${j.id} dropped (message ${j.messageId} not found)`);
         saveQueue();
         continue;
       }
-      const decision = voiceRestoreDecision(j);
-      if (decision === "drop") {
-        log(`queue: voice turn ${j.id} not run again (already re-run after a restart)`);
-        await msg.reply({ content: "⚠️ This voice-call question was cut off by a bot restart twice, so it was not run again. Please ask it again.", ...QUIET }).catch(() => {});
+      const plan = restorePlan(j);
+      if (plan.note) await msg.reply({ content: plan.note, ...QUIET }).catch(() => {});
+      if (plan.action === "drop") {
+        log(`queue: running job ${j.id} not run again (already re-run after a restart)`);
+        savedJobs.restored(j);
         saveQueue();
         continue;
       }
-      await handle(msg, { authorId: j.authorId, text: j.text, fromVoice: j.fromVoice, attachments: j.attachments ?? [], restored: true, voiceRestarts: decision });
-      log(`queue: saved job ${j.id} queued again`);
+      await handle(msg, { authorId: j.authorId, text: j.text, fromVoice: j.fromVoice, attachments: j.attachments ?? [], restored: true, restarts: plan.restarts, replaces: j });
+      savedJobs.restored(j); // no-op when handle() queued it; else (e.g. a pinned-model route) it leaves the file
+      log(`queue: saved job ${j.id} queued again${j.running ? " (was running)" : ""}`);
     } catch (e) {
-      toRestore = toRestore.filter((x) => x !== j);
+      savedJobs.restored(j);
       log(`queue: saved job ${j.id} restore failed: ${(e as Error).message}`);
     }
   }
@@ -2484,6 +2575,25 @@ client.once(Events.ClientReady, () => {
   const validate = () => void stackRouter.pruneGone((id) => client.channels.fetch(id), log).catch((e) => log(`router: prune: ${(e as Error).message}`));
   validate();
   setInterval(validate, 5 * 60_000);
+});
+client.once(Events.ClientReady, () => {
+  // Card discord-charts: run owner messages the bot missed (state/replay.json, see src/replay.ts), once.
+  for (const r of takeReplays(join(STATE_DIR, "replay.json"))) {
+    void (async () => {
+      const ch = await client.channels.fetch(r.channelId);
+      if (!ch?.isTextBased()) throw new Error("not a text channel");
+      const m = await ch.messages.fetch(r.messageId);
+      if (!replayAllowed({ authorId: m.author.id, createdMs: m.createdTimestamp }, OWNER_ID)) throw new Error("not a recent owner message");
+      // Only missed messages: skip one the bot already reacted to or answered (a reply that references it).
+      if (m.reactions.cache.some((x) => x.me)) throw new Error("bot already reacted");
+      const after = await ch.messages.fetch({ after: m.id, limit: 50 });
+      if (after.some((x) => x.author.id === client.user?.id && x.reference?.messageId === m.id)) throw new Error("bot already answered");
+      log(`replay: running missed owner message ${r.messageId} in ${r.channelId}`);
+      // discord.js types emit() as never for gateway events; this re-emits one real fetched message.
+      const bus = client as unknown as { emit(event: string, msg: unknown): boolean };
+      bus.emit(Events.MessageCreate, m);
+    })().catch((e) => log(`replay ${r.messageId}: skipped (${(e as Error).message})`));
+  }
 });
 client.once(Events.ClientReady, (c) => {
   // Keep the ~1.5 s home-directory walk off the main thread: prime now, refresh every 50 s.
@@ -2522,7 +2632,7 @@ client.once(Events.ClientReady, (c) => {
     return own(await ch.send({ content, components, ...QUIET })).id;
   };
   void mirror.sync().then(() => mirror.tail(post, status, onWatch, Date.now, onWait));
-  setInterval(() => void mirror.sync(), 15_000); // new/closed tabs (was 60 s)
+  setInterval(() => void mirror.sync().then(() => jobQueue.tick()), 15_000); // new/closed tabs (was 60 s)
   setInterval(() => void mirror.tail(post, status, onWatch, Date.now, onWait).catch((e) => log(`tail error: ${(e as Error).message}`)), 1_000); // owner 2026-10-13: near-instant (was 5 s); tail() skips overlapping runs
   setTimeout(() => void limitWatch.tick().catch((e) => log(`limitwatch: ${(e as Error).message}`)), 20_000);
   setInterval(() => void limitWatch.tick().catch((e) => log(`limitwatch: ${(e as Error).message}`)), LIMIT_TICK_MS);
@@ -2694,13 +2804,13 @@ const needsYou = FIRSTMATE_CHANNEL_ID
  * 📋 Master queue (owner 2026-10-23): every job (bot runs in all channels + FIRSTMATE cards with a job) in one
  * live board in the FIRSTMATE channel, kept at the bottom (only the ⏳ Queue box may sit below it).
  */
-function masterJobView(id: number, label: string, preview: string | undefined): Omit<LiveJob, "running" | "since"> {
+function masterJobView(id: number, label: string, preview: string | undefined): Omit<LiveJob, "state" | "since"> {
   const channelId = jobKeys.get(id) ?? "";
   const name = CHANNELS[channelId]?.name ?? label.split(" ", 1)[0]?.replace(/^#/, "");
   // Finance channels: no message text on the FIRSTMATE board (it can carry positions or account data).
   const title = isFinanceChannel(channelId, [name]) ? `Finance job #${id}` : preview || label;
   const link = jobOwnerLinks.get(id) ?? jobLinks.get(id);
-  const stack = jobStacks.get(id);
+  const stack = jobStacks.get(id) ?? jobStacksFallback.get(id);
   return { id, title, channelId, ...(link ? { link } : {}), ...(stack ? { stack } : {}) };
 }
 /** Card `job` (Herdr pane/tab id or tab label) -> its mirrored Discord channel or tab name (agents.json, cached 30 s). */
@@ -2738,6 +2848,22 @@ function masterJobPlace(job: string): JobPlace | undefined {
     ...(live?.session ? { session: live.session } : {}),
   };
 }
+/** Card stack-coverage: reopen or create a stack's thread for a board row; at most once per stack per 10 min. */
+const stackThreadTried = new Map<string, number>();
+function ensureStackThread(name: string): void {
+  const now = Date.now();
+  if (now - (stackThreadTried.get(name) ?? 0) < 600_000) return;
+  const def = stackRouter.stack(name);
+  if (!def || !FIRSTMATE_CHANNEL_ID || !client.isReady()) return;
+  stackThreadTried.set(name, now);
+  void (async () => {
+    const parent = await client.channels.fetch(FIRSTMATE_CHANNEL_ID).catch(() => null);
+    if (!parent || parent.type !== ChannelType.GuildText) return;
+    const t = await stackRouter.thread(parent as Parameters<typeof stackRouter.thread>[0], def);
+    log(`master queue: stack thread ready for ${name}: ${t.id}`);
+    masterQueue?.schedule(5_000, true);
+  })().catch((e) => { stackThreadTried.delete(name); log(`master queue: stack thread ${name}: ${(e as Error).message}`); });
+}
 const masterQueue = FIRSTMATE_CHANNEL_ID
   ? new MasterQueueBoard({
       getChannel: async () => {
@@ -2748,15 +2874,17 @@ const masterQueue = FIRSTMATE_CHANNEL_ID
       jobs: () => {
         const st = queue.status();
         return [
-          ...st.running.map((j) => ({ ...masterJobView(j.id, j.label, j.preview), running: true, since: j.since })),
-          ...st.queued.map((j) => ({ ...masterJobView(j.id, j.label, j.preview), running: false, since: j.since })),
+          ...st.running.map((j) => ({ ...masterJobView(j.id, j.label, j.preview), state: j.state, since: j.since })),
+          ...st.queued.map((j) => ({ ...masterJobView(j.id, j.label, j.preview), state: j.state, since: j.since })),
         ];
       },
       mayBeBelow: (m) => isBoardText(m.content) || isAlert(m.content), // 🔔 needs-you pings may sit below (owner 2026-10-27)
-      notice: () => [maintLine(readMaintPause()), pauseLine(readPause()), boardCtxCached()].filter(Boolean).join("\n"),
+      // Owner 2026-11-03: no context lines on the Master queue (neither FIRSTMATE nor stacks).
+      notice: () => [maintLine(readMaintPause()), pauseLine(readPause())].filter(Boolean).join("\n"),
       components: () => {
         // Owner 2026-11-01: show ⏸️ Pause all only while work runs (bot jobs or running cards); ▶️ Resume all while paused.
-        const paused = readMaintPause() !== null;
+        // Test allowlist pause (card pause-all-live-button-check) also shows ▶️.
+        const paused = readMaintPause() !== null || pauseall.readState(PAUSE_TEST_STATE) !== null;
         if (!paused && !masterWorkActive()) return [];
         const b = maintButton(paused);
         return [new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId(b.customId).setLabel(b.label).setEmoji(b.emoji).setStyle(ButtonStyle.Secondary)).toJSON()];
@@ -2768,7 +2896,13 @@ const masterQueue = FIRSTMATE_CHANNEL_ID
       log,
       menus: needsMenuSource,
       resolvers: {
-        stackChannel: (s) => stackRouter.tracker.threads[s],
+        stackChannel: (s, live) => {
+          const id = stackRouter.tracker.threads[s];
+          // Owner 2026-11-03 (card stack-coverage): every row shows its stack thread as a link. An archived or
+          // missing thread is reopened or created in the background; the next board post links it.
+          if (live && (!id || channelMention(id, "") === "")) ensureStackThread(s);
+          return id;
+        },
         job: (job) => masterJobPlace(job),
         areaStack: (area) => {
           const a = area.toLowerCase().trim();
@@ -2812,11 +2946,13 @@ function closeTransientThread(jobId: number): void {
     th.setArchived(true, "alert-channel reply finished").then(() => log(`archived finished alert thread ${th.id}`), (e) => log(`archive alert thread ${th.id}: ${(e as Error).message}`));
   }, 90_000);
 }
-queue.onSettled = (j, res, err) => {
+queue.onSettled = (j) => {
+  // Card sma-bot-lost-turns: a run that ends during the shutdown runs again after the start; it did not finish.
+  if (shuttingDown) return;
   closeTransientThread(j.id);
-  masterQueue?.finished(j.id, err ? "failed" : res?.cancelled ? "stopped" : res?.ok ? "done" : "failed", masterJobView(j.id, j.label, j.preview));
+  masterQueue?.finished(j.id, j.state, masterJobView(j.id, j.label, j.preview));
   jobOwnerLinks.delete(j.id);
-  stackRouter.ended(j.id, res?.cancelled ? undefined : Boolean(res?.ok && !err));
+  stackRouter.ended(j.id, j.state);
   jobStacks.delete(j.id);
 };
 
@@ -2829,7 +2965,7 @@ async function routeFirstmate(
   msg: Message,
   text: string,
   attachments: { name: string; url: string }[],
-  asOwner: { authorId: string; fromVoice?: boolean; restored?: boolean; menuIds?: string[]; voiceRestarts?: number } | undefined,
+  asOwner: { authorId: string; fromVoice?: boolean; restored?: boolean; menuIds?: string[]; restarts?: number } | undefined,
   replyRef: string | undefined,
   parentId: string | null,
 ): Promise<boolean> {
@@ -2863,7 +2999,7 @@ async function routeFirstmate(
   return forwardToStack(msg, s, d, body, attachments, asOwner, replyRef);
 }
 
-type OwnerTurn = { authorId: string; fromVoice?: boolean; restored?: boolean; menuIds?: string[]; voiceRestarts?: number } | undefined;
+type OwnerTurn = { authorId: string; fromVoice?: boolean; restored?: boolean; menuIds?: string[]; restarts?: number } | undefined;
 
 /** The old path: the message copy goes to the stack thread and runs there as a new side job. */
 async function forwardToStack(msg: Message, s: StackDef, d: RouteDecision, body: string, attachments: { name: string; url: string }[], asOwner: OwnerTurn, replyRef: string | undefined): Promise<boolean> {
@@ -2877,7 +3013,7 @@ async function forwardToStack(msg: Message, s: StackDef, d: RouteDecision, body:
   }
   void msg.react("🧭").catch(() => {});
   await markQueued(responseRefs(asOwner ? [msg.id, ...(asOwner.menuIds ?? [])] : [msg.id, replyRef], asOwner?.menuIds ? [] : [body]), { log, expand: true });
-  void handle(copy, { authorId: asOwner?.authorId ?? msg.author.id, text: body, fromVoice: asOwner?.fromVoice, attachments, restored: true, voiceRestarts: asOwner?.voiceRestarts }).catch((e) => log(`router: stack ${s.name} handle: ${(e as Error).message}`));
+  void handle(copy, { authorId: asOwner?.authorId ?? msg.author.id, text: body, fromVoice: asOwner?.fromVoice, attachments, restored: true, restarts: asOwner?.restarts }).catch((e) => log(`router: stack ${s.name} handle: ${(e as Error).message}`));
   lastOwnerChannelId = msg.channelId; // spoken turns keep going to FIRSTMATE (the router), not the stack thread
   return true;
 }
@@ -2921,7 +3057,7 @@ async function forwardToJob(msg: Message, s: StackDef, job: OpenJob, by: string,
   stackRouter.remember([msg.id, note?.id, copy.id], s.name);
   void msg.react("🧭").catch(() => {});
   await markQueued(responseRefs(asOwner ? [msg.id, ...(asOwner.menuIds ?? [])] : [msg.id, replyRef], asOwner?.menuIds ? [] : [body]), { log, expand: true });
-  void handle(copy, { authorId: asOwner?.authorId ?? msg.author.id, text: body, fromVoice: asOwner?.fromVoice, attachments, restored: true, voiceRestarts: asOwner?.voiceRestarts }).catch((e) => log(`router: job ${job.id} handle: ${(e as Error).message}`));
+  void handle(copy, { authorId: asOwner?.authorId ?? msg.author.id, text: body, fromVoice: asOwner?.fromVoice, attachments, restored: true, restarts: asOwner?.restarts }).catch((e) => log(`router: job ${job.id} handle: ${(e as Error).message}`));
   lastOwnerChannelId = msg.channelId;
   return true;
 }
@@ -3121,6 +3257,7 @@ client.on(Events.MessageReactionRemove, (r, user) => {
 client.on(Events.MessageCreate, (msg) => {
   if (needsYou && msg.channelId === FIRSTMATE_CHANNEL_ID) needsYou.onMessage(msg);
   if (masterQueue && msg.channelId === FIRSTMATE_CHANNEL_ID) masterQueue.onMessage(msg);
+  if (msg.channelId === FIRSTMATE_CHANNEL_ID && msg.author.id === OWNER_ID && pauseall.isFinanceInstruction(msg.content)) void financeYield(msg.content);
   // 🧠-local-omp channels: never reach Claude. Owner → one local-model OMP turn; everyone else is ignored.
   // Threads under a local-omp channel never reach the mirror or Claude: they are ignored.
   const loParent = msg.channel.isThread() ? msg.channel.parentId : null;
@@ -3418,8 +3555,112 @@ function masterWorkActive(): boolean {
   return showMaintButton(false, st.running.length + st.queued.length, tracker);
 }
 
+/** Card pause-all-unreliable: real pause (Esc to working panes, running cards paused) and the bank yield. */
+const PAUSE_STATE = join(STATE_DIR, "pause-all.json");
+const YIELD_STATE = join(STATE_DIR, "finance-yield.json");
+const mainHerdr: pauseall.Herdr = (args) => herdrOn({ machine: "main" } as InjectTarget, args, 20_000);
+const fmRun: pauseall.Fm = async (args) => {
+  try {
+    const r = await execFileAsync(FM_BIN, args, { env: { ...process.env, FM_BY: "bot:pause-all" }, timeout: 15_000 });
+    return { code: 0, out: String(r.stdout) };
+  } catch (e) {
+    log(`pause-all: fm ${args.slice(0, 3).join(" ")} failed: ${(e as Error).message.slice(0, 200)}`);
+    return { code: 1, out: "" };
+  }
+};
+function trackerCards(): pauseall.Card[] {
+  try {
+    return parseCards(readFileSync(ITEMS_FILE, "utf8")) as pauseall.Card[];
+  } catch {
+    return [];
+  }
+}
+async function postFirstmate(text: string): Promise<void> {
+  if (!FIRSTMATE_CHANNEL_ID) return;
+  const ch = await privateChannel(FIRSTMATE_CHANNEL_ID).catch(() => null);
+  await ch?.send({ content: text, allowedMentions: { parse: [] } }).catch(() => undefined);
+}
+/** After the flag is written: stop bot runs outside FIRSTMATE, Esc every working pane, pause running cards, report. */
+async function hardPause(why: string): Promise<void> {
+  let botStopped = 0;
+  for (const j of queue.status().running) if (!FIRSTMATE_CHANNEL_ID || !j.key.startsWith(FIRSTMATE_CHANNEL_ID)) botStopped += Number(stopRun(j.key));
+  try {
+    const r = await pauseall.pause({ reason: why, kind: "all", herdr: mainHerdr, fm: fmRun, tracker: trackerCards, stateFile: PAUSE_STATE });
+    log(`pause-all: ${JSON.stringify(r)}`);
+    const left = trackerCards().filter((c) => c.s === "running").length;
+    await postFirstmate(`⏸️ ${pauseall.pauseSummary(r, "Pause all")} Bot jobs stopped: ${botStopped}. Cards still running: ${left}${left ? " (FIRSTMATE's own)" : ""}. ▶️ Resume all restarts them.`);
+  } catch (e) {
+    log(`pause-all failed: ${(e as Error).message}`);
+    await postFirstmate(`❌ Pause all: the flag is set (no new jobs), but interrupting panes failed: ${(e as Error).message.slice(0, 300)}`);
+  }
+  masterQueue?.schedule(0, true);
+}
+
+/**
+ * bank priority (card pause-all-unreliable): an owner bank position/portfolio instruction in FIRSTMATE makes running
+ * non-finance cards yield at once (Esc to their panes, card paused). A message with "dry run" only reports the plan.
+ * They continue (continue prompt, card running) when no FIRSTMATE bot turn has run for YIELD_QUIET_MS.
+ */
+const YIELD_QUIET_MS = 3 * 60_000;
+let lastFirstmateBusy = 0;
+let yieldBusy = 0; // yields in flight; the resume timer waits for them
+let yieldResuming = false;
+async function financeYield(text: string): Promise<void> {
+  lastFirstmateBusy = Date.now();
+  yieldBusy++;
+  const dryRun = /\bdry[- ]?run\b/i.test(text);
+  try {
+    const r = await pauseall.pause({ reason: "yield to owner bank request", kind: "yield", herdr: mainHerdr, fm: fmRun, tracker: trackerCards, stateFile: YIELD_STATE, cards: (c) => !pauseall.isFinanceCard(c), dryRun, verifyMs: dryRun ? 0 : 60_000 });
+    log(`finance-yield${dryRun ? " (dry run)" : ""}: ${JSON.stringify(r)}`);
+    if (dryRun) await postFirstmate(`🧪 bank priority (dry run): would pause ${r.cards.length} non-finance card(s) (${r.cards.join(", ") || "none"}) and Esc ${r.panes.length} pane(s). Nothing was changed; no order is placed.`);
+    else if (r.cards.length || r.panes.length) await postFirstmate(`🚦 bank priority: ${pauseall.pauseSummary(r, "non-finance jobs yielded")} They continue a few minutes after FIRSTMATE is idle.`);
+  } catch (e) {
+    log(`finance-yield failed: ${(e as Error).message}`);
+  } finally {
+    yieldBusy--;
+    lastFirstmateBusy = Date.now();
+  }
+}
+setInterval(() => {
+  if (yieldBusy || yieldResuming || !pauseall.readState(YIELD_STATE) || readMaintPause()) return;
+  if (FIRSTMATE_CHANNEL_ID && [...queue.status().running, ...queue.status().queued].some((j) => j.key.startsWith(FIRSTMATE_CHANNEL_ID))) lastFirstmateBusy = Date.now();
+  if (Date.now() - lastFirstmateBusy < YIELD_QUIET_MS) return;
+  yieldResuming = true;
+  void pauseall.resume({ herdr: mainHerdr, fm: fmRun, stateFile: YIELD_STATE, prompt: true }).then((r) => {
+    log(`finance-yield resume: ${JSON.stringify(r)}`);
+    if (r.cards.length) void postFirstmate(`▶️ bank request done: ${r.cards.length} yielded job(s) continue (${r.cards.join(", ")}).`);
+  }).catch((e: Error) => log(`finance-yield resume failed: ${e.message}`)).finally(() => { yieldResuming = false; lastFirstmateBusy = Date.now(); });
+}, 30_000).unref?.();
+
+/** Card pause-all-live-button-check: test allowlist mode for the real ⏸️/▶️ buttons (see pauseall.readTestAllowlist). */
+const PAUSE_TEST_ALLOWLIST = join(STATE_DIR, "pause-test-allowlist.json");
+const PAUSE_TEST_STATE = join(STATE_DIR, "pause-test.json");
+async function testMaintAction(i: ChatInputCommandInteraction | ButtonInteraction, action: "pause" | "resume", allow: pauseall.TestAllowlist | null): Promise<void> {
+  const tag = allow ? `🧪 Test mode (cards ${allow.cards.join(", ")}; panes ${allow.panes.join(", ")}; until ${allow.until.slice(11, 16)}Z)` : "🧪 Test mode";
+  if (action === "pause" && allow) {
+    const t0 = Date.now();
+    const r = await pauseall.pause({ reason: "live button test (allowlist)", kind: "all", herdr: mainHerdr, fm: fmRun, tracker: trackerCards, stateFile: PAUSE_TEST_STATE, cards: pauseall.allowlistFilter(allow), onlyPanes: allow.panes, verifyMs: 30_000 });
+    log(`pause-all test: ${JSON.stringify(r)}`);
+    const msg = `⏸️ ${tag}: ${pauseall.pauseSummary(r, "Pause")} in ${Math.round((Date.now() - t0) / 1000)} s. No other pane, card or bot job was touched.`;
+    await i.editReply(msg).catch(() => {});
+    await postFirstmate(msg);
+  } else {
+    if (!pauseall.readState(PAUSE_TEST_STATE)) return void (await i.editReply(`▶️ ${tag}: nothing is paused.`).catch(() => {}));
+    const r = await pauseall.resume({ herdr: mainHerdr, fm: fmRun, stateFile: PAUSE_TEST_STATE, prompt: true });
+    log(`pause-all test resume: ${JSON.stringify(r)}`);
+    const msg = `▶️ ${tag}: ${r.cards.length} card(s) back to running (${r.cards.join(", ") || "none"}); continue prompt to ${r.prompted.length} pane(s).${r.errors.length ? ` Errors: ${r.errors.join("; ")}` : ""}`;
+    await i.editReply(msg).catch(() => {});
+    await postFirstmate(msg);
+  }
+  masterQueue?.schedule(0, true);
+}
+
 async function maintAction(i: ChatInputCommandInteraction | ButtonInteraction, action: "pause" | "resume", reason: string): Promise<void> {
   await i.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+  const testAllow = pauseall.readTestAllowlist(PAUSE_TEST_ALLOWLIST);
+  const mode = pauseall.testModeDecision({ action, maintPaused: readMaintPause() !== null, allowFileExists: existsSync(PAUSE_TEST_ALLOWLIST), allow: testAllow, testStatePresent: pauseall.readState(PAUSE_TEST_STATE) !== null });
+  if (mode === "test") return testMaintAction(i, action, testAllow);
+  if (mode === "refuse") return void (await i.editReply(`🧪 Test allowlist ${PAUSE_TEST_ALLOWLIST} is broken or expired, or a test pause is still saved. Nothing was paused. Fix or remove the file (resume the test first).`).catch(() => {}));
   const was = readMaintPause();
   if (action === "pause" && was) return void (await i.editReply(`⏸️ Already paused: ${was.reason}.`).catch(() => {}));
   if (action === "resume" && !was) return void (await i.editReply("▶️ Work is not paused.").catch(() => {}));
@@ -3433,6 +3674,7 @@ async function maintAction(i: ChatInputCommandInteraction | ButtonInteraction, a
       const n = pauseNotice(why);
       const b = new ButtonBuilder().setCustomId(n.button.customId).setLabel(n.button.label).setEmoji(n.button.emoji).setStyle(ButtonStyle.Success);
       await i.editReply({ content: n.content, components: [new ActionRowBuilder<ButtonBuilder>().addComponents(b)] }).catch(() => {});
+      void hardPause(why);
     } else await i.editReply(`❌ Pause failed: ${err.slice(0, 500)}`).catch(() => {});
   } else {
     // A fixed transient unit: a second tap cannot start a second resume (duplicate continue prompts), and a bot
@@ -3445,6 +3687,12 @@ async function maintAction(i: ChatInputCommandInteraction | ButtonInteraction, a
       return void (await i.editReply(/already (loaded|exists)|already active/i.test(err) ? "▶️ Resume is already running." : `❌ Resume failed: ${err.slice(0, 500)}`).catch(() => {}));
     }
     log("maintenance resume from Discord");
+    // omp-maintenance resume prompts the saved sessions; here only the cards go back to running.
+    void pauseall.resume({ herdr: mainHerdr, fm: fmRun, stateFile: PAUSE_STATE }).then((r) => {
+      log(`pause-all resume: ${JSON.stringify(r)}`);
+      void postFirstmate(`▶️ Resume all: ${r.cards.length} card(s) back to running; saved sessions get a continue prompt.${r.errors.length ? ` Errors: ${r.errors.join("; ")}` : ""}`);
+      masterQueue?.schedule(0, true);
+    });
     await i.editReply("▶️ Resuming: saved sessions get a continue prompt, then the queue starts again (the board updates when the pause ends).").catch(() => {});
   }
   masterQueue?.schedule(0, true);
@@ -3826,7 +4074,7 @@ const mirrorChannel = (ref: string) => {
   return e ? { id: e.channelId, name: e.name } : null;
 };
 const server = startHttp({
-  health: () => ({ ready: client.isReady(), voice: voicechat.active, boards: boardTimers.size + boardInflight, approvals: activeButtonRuns(), drain: queue.drainInfo(), restoring: toRestore.length, stacks: stackRouter.tracker.status(), ...queue.status() }),
+  health: () => ({ ready: client.isReady(), voice: voicechat.active, boards: boardTimers.size + boardInflight, approvals: activeButtonRuns(), drain: queue.drainInfo(), restoring: savedJobs.toRestore().length, stacks: stackRouter.tracker.status(), ...queue.status() }),
   incident: startTriage,
   drain: (on, ttlMs) => {
     const was = queue.draining();
@@ -4014,6 +4262,11 @@ if (shortcutConfigured()) {
 
 const shutdown = (sig: string) => {
   log(`${sig}: shutting down`);
+  // Card sma-bot-lost-turns: save the running and waiting jobs as they are now; systemd also stops the omp children,
+  // and their ends must neither erase the records nor post a false ❌ answer.
+  shuttingDown = true;
+  const st = queue.status();
+  saveQueueState(STATE_DIR, savedJobs.freeze(queue.peekNextId(), [...st.running, ...st.queued]));
   server.stop(true);
   sdServer?.stop(true);
   voicechat.leave();
@@ -4027,15 +4280,18 @@ if (!OWNER_ID || !GUILD_ID || Object.keys(CHANNELS).length === 0) {
   log(`config incomplete: ownerId, guildId and channels are required in ${CONFIG_FILE} (see config.example.json)`);
   process.exit(1);
 }
+// Card discord-config-hot-reload (2026-11-03): a channel added to config.json routes without a restart.
+// watchFile polls the path, so it also sees editors that replace the file by rename.
+watchFile(CONFIG_FILE, { interval: 3000, persistent: false }, (cur, prev) => {
+  if (cur.mtimeMs === prev.mtimeMs) return;
+  const r = reloadChannels(CONFIG_FILE);
+  if (!r.ok) log(`config reload: kept the old channels map (${r.error})`);
+  else if (r.added.length || r.removed.length || r.changed.length) log(`config reload: channels added=[${r.added.join(",")}] removed=[${r.removed.join(",")}] changed=[${r.changed.join(",")}]; now ${Object.keys(CHANNELS).length} routed`);
+});
 await client.login(loadToken());
 
 /** Owner 2026-11-03 (card context-meter): "· ctx 83%" after the model in the reply footer. */
 function withCtx(model: string | undefined, file?: string): string | undefined {
   return model && file ? model + ctxSuffix(ctxOfFile(file)) : model;
 }
-let ctxCache = { at: 0, text: "" };
-function boardCtxCached(): string {
-  // An empty result (windows still loading) is not cached, so the next render tries again.
-  if (!ctxCache.text || Date.now() - ctxCache.at > 60_000) ctxCache = { at: Date.now(), text: boardCtxLines(dirname(sessionDir("firstmate"))) };
-  return ctxCache.text;
-}
+

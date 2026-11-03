@@ -30,7 +30,7 @@ export function maintLine(p: MaintPause | null): string {
   if (!p) return "";
   const t = Date.parse(p.since);
   const since = Number.isFinite(t) ? ` (since <t:${Math.floor(t / 1000)}:R>)` : "";
-  return `⏸️ **Paused**: ${p.reason.replace(/[\r\n]+/g, " ").slice(0, 200)}${since}. New jobs wait; running jobs finish. Tap ▶️ Resume or use /resume-work.`;
+  return `⏸️ **Paused**: ${p.reason.replace(/[\r\n]+/g, " ").slice(0, 200)}${since}. Running jobs were interrupted and new jobs wait. Tap ▶️ Resume or use /resume-work.`;
 }
 
 /** The single button below the master board: ⏸️ Pause when running, ▶️ Resume when paused. */

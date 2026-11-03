@@ -98,3 +98,21 @@ String scan over files and full history: **0 hits**. The history was rewritten o
 2026-11-03) so every commit uses the noreply author and committer. One existing redaction test fixture with fake order text is
 kept on purpose. `gitleaks dir` and `gitleaks git`: **no leaks found**. `bunx tsc --noEmit`, `bun test test/`,
 `bun test src/` and `lint:mentions`: pass.
+
+## Sync 2026-11-03 (second UX update)
+Source: the private repository's changes after the morning sync (43 commits, 55 files), copied with the same
+three-way merge (base = the private commit of the morning sync, sides = this tree and the private main branch).
+Nine files had merge conflicts; each was resolved to the new private code and then scrubbed. No private history
+was pushed. This repository gets one new commit.
+
+Replaced or removed in the new code and tests (same table as above):
+- Broker-specific "priority yield" names: `isFinanceInstruction`, `isFinanceCard`, `financeYield`; the match words
+  are generic banking words.
+- Trading, project and copy-service names in the `fm` kit and tests: `finance`, `webapp`, `budget`.
+- A remote server name: `remote` (`remote:x.service` unit prefix). The machine name: `main` / "the main host".
+- The tailnet dashboard URL in a test: `my-host.example-tailnet.ts.net`.
+- Real Discord message IDs in comments and tests: removed or synthetic IDs `1000000000000004NN`.
+- `fm-prwatch` owner-repo check: `FM_OWNER_REPO_PREFIX` (default `owner/`) instead of a fixed account name.
+- The symbol-link import stays removed.
+
+New: README sections Architecture and Prerequisites, and a dashboard screenshot rendered from fake sample data.

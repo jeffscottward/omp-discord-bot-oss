@@ -17,12 +17,13 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFile
 import { dirname, join } from "node:path";
 import { actionBlock, actionSteps, isFinanceCard, itemLink, linkLabel, loadOpenMenus, needsYouEntries, type BoardChannel, type BoardMsg, type FmItem, type MenuRow, type MenuSource } from "./needsyou.ts";
 import { edges, openRefs } from "./blockers.ts";
+import type { FinalJobState, JobState } from "./jobstate.ts";
 
 export const MASTER_HEAD = "📋 **Master queue**";
 export const isMasterBoard = (text: string): boolean => text.startsWith(MASTER_HEAD) || text.startsWith("\u2063") || text.startsWith(`━━━━━━━━━━━━━━━━━━━━\n${MASTER_HEAD}`);
 export const KEEP_FINISHED_MS = 12 * 3_600_000; // owner 2026-10-24: finished jobs older than 12 h are not listed
 
-export type RowState = "queued" | "running" | "done" | "failed" | "stopped" | "blocked" | "check" | "bot" | "needs";
+export type RowState = JobState | "blocked" | "check" | "bot" | "needs";
 export type Row = {
   key: string;
   /** Needs-you rows: the owner's action steps (owner 2026-10-25, needs-you-action-gate). */
@@ -96,7 +97,8 @@ export function herdrPlace(job: string, panes: HerdrPane[], tabs: HerdrTab[]): J
 }
 export type Resolvers = {
   job?: (job: string) => JobPlace | undefined;
-  stackChannel?: (stack: string) => string | undefined;
+  /** `live`: the row is running/queued/blocked (card stack-coverage: only those may reopen a stack thread). */
+  stackChannel?: (stack: string, live?: boolean) => string | undefined;
   /** Owner 2026-10-24: stack of a card area (router areas), for cards without a `stack` field. */
   areaStack?: (area: string) => string | undefined;
 };
@@ -121,10 +123,10 @@ export function jobPlace(raw: string | string[], r?: Resolvers): string {
   return `💻 ${job}`;
 }
 
-/** A live bot job (src/queue.ts view plus the bridge's own maps). */
-export type LiveJob = { id: number; title: string; channelId: string; link?: string; running: boolean; since: number; stack?: string };
+/** A live bot job (src/queue.ts view plus the bridge's own maps). `state`: queued or running (src/jobstate.ts). */
+export type LiveJob = { id: number; title: string; channelId: string; link?: string; state: JobState; since: number; stack?: string };
 /** A finished bot job, saved for 12 h. */
-export type DoneJob = { id: number; title: string; channelId: string; link?: string; state: "done" | "failed" | "stopped"; at: number; stack?: string };
+export type DoneJob = { id: number; title: string; channelId: string; link?: string; state: FinalJobState; at: number; stack?: string };
 
 export type FmCard = { id: string; action?: string; t?: string; area?: string; s?: string; q?: string; src?: string; job?: string | string[]; cts?: number | string; stack?: string; blockedBy?: string | string[]; blocks?: string | string[]; ext?: string; until?: string; queued?: unknown };
 export type Receipt = { card?: string; result?: string; tsMs?: number | string; summary?: string; /** File name under receipts/ (set by readReceipts). */ file?: string };
@@ -157,6 +159,11 @@ function cardLink(c: FmCard, dash: string): string | undefined {
   return dash ? `${dash}?item=${encodeURIComponent(c.id)}` : undefined;
 }
 
+/** Dashboard 🧾 Why panel for a card's receipt file (deeplink-contract.md: ?item=<id>&why=1&receipt=<file>). */
+export function whyLink(dash: string, id: string, file: string): string {
+  return `${dash}?item=${encodeURIComponent(id)}&why=1&receipt=${encodeURIComponent(file)}`;
+}
+
 /** Cards as the Needs-you code reads them (numeric cts, one job string); other fields stay as they are. */
 export function asItems(cards: FmCard[]): FmItem[] {
   return cards.map((c) => ({ ...c, cts: num(c.cts) || undefined, job: Array.isArray(c.job) ? c.job[0] : c.job }));
@@ -165,7 +172,7 @@ export function asItems(cards: FmCard[]): FmItem[] {
 const NEEDS_WHERE = { waiting: "your action", open: "your answer to a question", blocked: "your step" } as const;
 
 /**
- * Owner 2026-10-24: ✍️ Needs you at the top of the board. Card mq-needs-menus: the SAME items as the 🔔 Needs-you board
+ * Owner 2026-10-24: ✍️ Needs you on the board (owner 2026-11-03: at the bottom). Card mq-needs-menus: the SAME items as the 🔔 Needs-you board
  * (src/needsyou.ts needsYouEntries): open question menus plus waiting/open/blocked-on-you cards. A card whose q is a
  * menu shows once. The "Waiting on bots / Blocker unclear" summaries stay off this board.
  */
@@ -234,10 +241,11 @@ export function cardRows(cards: FmCard[], receipts: Map<string, Receipt>, now: n
         : open.length
           ? `⛔ waits for ${waitsFor.join(", ")}${open.length > 2 ? ` +${open.length - 2} more` : ""}`
           : `⛔ ${finance ? safeSubject(reason, "blocked") : reason}`;
-    // The why link opens the receipt itself (receipts/<card>.json, served next to the dashboard): the card note may have
-    // changed since, and the receipt holds the exact text that the row cuts (live check 2026-11-03).
-    const why = blocked && dash ? { why: `${dash}receipts/${encodeURIComponent(r?.file ?? `${c.id}.json`)}` } : {};
-    const base = { key: `card:${c.id}`, title, link: cardLink(c, dash), where, ...why, ...stackOf(cardStack(c, res), res) };
+    // The why link opens the card's receipt (receipts/<file>, the exact text that the row cuts; the card note may have
+    // changed since) in the dashboard's 🧾 Why panel, not as raw JSON (owner 2026-11-03, card why-link-dashboard;
+    // deeplink-contract.md ?why= ?receipt=). The file name is kept: it may differ from the card id.
+    const why = blocked && dash ? { why: whyLink(dash, c.id, r?.file ?? `${c.id}.json`) } : {};
+    const base = { key: `card:${c.id}`, title, link: cardLink(c, dash), where, ...why, ...stackOf(cardStack(c, res), res, c.s !== "done") };
     // Owner 2026-10-24: background services and scheduled jobs are not queue jobs; they get their own section.
     const first = String(Array.isArray(job) ? (job[0] ?? "") : job);
     if (/\.(service|timer)$/.test(first) || first.startsWith("remote:")) {
@@ -260,16 +268,16 @@ export function cardRows(cards: FmCard[], receipts: Map<string, Receipt>, now: n
   return rows;
 }
 
-function stackOf(stack: string | undefined, res?: Resolvers): Pick<Row, "stack" | "stackChannel"> {
+function stackOf(stack: string | undefined, res?: Resolvers, live = false): Pick<Row, "stack" | "stackChannel"> {
   if (!stack) return {};
-  const ch = res?.stackChannel?.(stack);
+  const ch = res?.stackChannel?.(stack, live);
   // Owner 2026-10-26 (no-unknown-channel): keep only a stack thread id that resolves; a dead id is dropped here.
   const ok = ch && channelMention(ch, "") !== "";
   return { stack, ...(ok ? { stackChannel: ch } : {}) };
 }
 
 export function botRows(live: LiveJob[], done: DoneJob[], now: number, res?: Resolvers): Row[] {
-  const rows: Row[] = live.map((j) => ({ key: `job:${j.id}`, title: j.title, ...(j.link ? { link: j.link } : {}), where: j.channelId ? channelMention(j.channelId, "💬 a closed channel") : "💬 no channel recorded", state: j.running ? "running" : "queued", at: j.since, ...stackOf(j.stack, res) }));
+  const rows: Row[] = live.map((j) => ({ key: `job:${j.id}`, title: j.title, ...(j.link ? { link: j.link } : {}), where: j.channelId ? channelMention(j.channelId, "💬 a closed channel") : "💬 no channel recorded", state: j.state, at: j.since, ...stackOf(j.stack, res, true) }));
   const liveIds = new Set(live.map((j) => j.id));
   for (const d of done) {
     if (liveIds.has(d.id) || now - d.at >= KEEP_FINISHED_MS) continue;
@@ -304,10 +312,13 @@ export function rowLine(r: Row, now: number, n?: number, gear = "⚙️"): strin
   // Owner 2026-10-24: a job running in its own stack thread shows that thread once, not twice.
   // Owner 2026-10-24: show a stack only as a link to a DIFFERENT channel; plain-text stack names duplicate the channel link.
   const stackRef = r.stackChannel ? channelMention(r.stackChannel, "") : "";
-  const stack = !stackRef || r.where === stackRef ? "" : ` · ${stackRef}`;
+  // Owner 2026-11-03 (card stack-coverage): every job shows its stack. A stack with no live thread shows its name,
+  // so the row never looks like it went straight to a channel.
+  const stackShown = stackRef || (r.stack ? `🧭 ${r.stack} stack` : "");
+  const stack = !stackShown || r.where === stackRef ? "" : ` · ${stackShown}`;
   const detail = r.state === "bot" ? `↳ ${where}` : stack
       ? // Owner 2026-10-24: stack first, then the job's own channel (or 💻) one level deeper.
-        `↳ ${stackRef}\n\u2003\u2003\u2003\u2003↳ ${where}`
+        `↳ ${stackShown}\n\u2003\u2003\u2003\u2003↳ ${where}`
       : `↳ ${where}`;
   return `${n !== undefined ? `${n}. ` : ""}${r.state === "running" ? gear : ICON[r.state]} ${title} · ${when}\n\u2003\u2003${detail}`;
 }
@@ -331,8 +342,9 @@ export const MASTER_CONT = "\u2063";
  * more messages. Sections: Running, Queued, Blocked (receipt reason), Finished (12 h), then 🤖 Bots and scheduled jobs.
  */
 export function renderMasterPages(rows: Row[], now: number, dash: string, limit = 1900, gear = "⚙️", notice = ""): string[] {
-  const head = `${RULE}\n${MASTER_HEAD} · updated <t:${Math.floor(now / 1000)}:R>`;
   const foot = dash ? `🗂️ [Dashboard: running jobs](<${dash}?tab=running>)` : "";
+  // Owner 2026-11-03 (card mq-top-link): the dashboard link also sits near the top, right below the title.
+  const head = [RULE, `${MASTER_HEAD} · updated <t:${Math.floor(now / 1000)}:R>`, foot].filter(Boolean).join("\n");
   if (!rows.length) return [[head, notice, SUB, "✅ No jobs queued, running or finished in the last 12 h.", foot, RULE].filter(Boolean).join("\n")];
   const running = rows.filter((r) => r.state === "running").sort((a, b) => a.at - b.at);
   const queued = rows.filter((r) => r.state === "queued").sort((a, b) => a.at - b.at);
@@ -345,20 +357,24 @@ export function renderMasterPages(rows: Row[], now: number, dash: string, limit 
   const bots = rows.filter((r) => r.state === "bot").sort((a, b) => a.title.localeCompare(b.title));
   // Board notice (owner alert pause, src/alertpause.ts) right below the head.
   const lines: string[] = notice ? [notice] : [];
-  const section = (title: string, ls: string[]) => ls.length && lines.push("\u200b", title, SUB, ...ls);
+  // Owner 2026-11-03: the whole board reads from the BOTTOM up, so the owner never scrolls.
+  // Bottom to top: ✍️ Needs you, Running, Queued, Blocked, Needs a check, Finished, Bots. Inside each list the
+  // oldest row is lowest (seen first from the bottom); the section title stays above its rows.
+  const section = (title: string, ls: string[]) => ls.length && lines.push("\u200b", title, SUB, ...ls.reverse());
   const needs = rows.filter((r) => r.state === "needs").sort((a, b) => a.at - b.at);
-  section(`✍️ **Needs you** (${needs.length})`, needs.map((r) => rowLine(r, now)));
-  section(`${gear} **Running** (${running.length})`, running.map((r) => rowLine(r, now, undefined, gear)));
-  section(`⏳ **Queued** (${queued.length})`, queued.map((r, i) => rowLine(r, now, i + 1)));
-  section(`⛔ **Blocked** (${blocked.length})`, blocked.map((r) => rowLine(r, now)));
-  section(`🔧 **Blocker done, needs a check** (${check.length})`, check.map((r) => rowLine(r, now)));
-  // Owner 2026-10-24: finished jobs are one count line with a dashboard link (they made a 4-message board).
-  const failed = finished.filter((r) => r.state !== "done").length;
-  lines.push("\u200b", `🏁 **Finished, last 12 h:** ${finished.length}${failed ? ` (⚠️ ${failed} failed or stopped)` : ""}${dash ? ` → [list](<${dash}?tab=done>)` : ""}`);
   // Owner 2026-10-24 (pick "Count line + link"): bots and scheduled jobs are one count line, not rows.
   const c = botCounts();
   const n = c ? `${c.running} running · ${c.scheduled} scheduled${c.down ? ` · ⚠️ ${c.down} down` : ""}` : `${bots.length} linked to cards`;
   lines.push("\u200b", `🤖 **Bots and scheduled jobs:** ${n}${dash ? ` → [list](<${dash}?tab=services>)` : ""}`);
+  // Owner 2026-10-24: finished jobs are one count line with a dashboard link (they made a 4-message board).
+  const failed = finished.filter((r) => r.state !== "done").length;
+  lines.push("\u200b", `🏁 **Finished, last 12 h:** ${finished.length}${failed ? ` (⚠️ ${failed} failed or stopped)` : ""}${dash ? ` → [list](<${dash}?tab=done>)` : ""}`);
+  section(`🔧 **Blocker done, needs a check** (${check.length})`, check.map((r) => rowLine(r, now)));
+  section(`⛔ **Blocked** (${blocked.length})`, blocked.map((r) => rowLine(r, now)));
+  section(`⏳ **Queued** (${queued.length})`, queued.map((r, i) => rowLine(r, now, i + 1)));
+  section(`${gear} **Running** (${running.length})`, running.map((r) => rowLine(r, now, undefined, gear)));
+  // Owner 2026-11-03 (card mq-needs-bottom): ✍️ Needs you sits at the BOTTOM, right above the dashboard link.
+  section(`✍️ **Needs you** (${needs.length})`, needs.map((r) => rowLine(r, now)));
   if (foot) lines.push("\u200b", foot); // owner 2026-10-24: blank line above the dashboard link
   const pages: string[] = [];
   let cur = [head];
@@ -367,10 +383,15 @@ export function renderMasterPages(rows: Row[], now: number, dash: string, limit 
     const l = raw.length > limit - 200 ? `${raw.slice(0, limit - 201)}…` : raw;
     if (len + l.length + 1 + RULE.length + 1 > limit) {
       pages.push(cur.join("\n"));
-      cur = [MASTER_CONT];
+      cur = [];
       len = MASTER_CONT.length;
     }
-    cur.push(l);
+    // Owner 2026-11-03: the invisible page mark sits INSIDE the first line of a later page, never on its own line
+    // (an own line showed as a blank gap between list items). A page never starts with a blank spacer line.
+    if (!cur.length) {
+      if (l.replace(/[\u200b\s]/g, "") === "") continue;
+      cur.push(`${MASTER_CONT}${l}`);
+    } else cur.push(l);
     len += l.length + 1;
   }
   cur.push(RULE);
@@ -450,7 +471,7 @@ export class MasterQueueBoard {
   private lastEdit = 0;
   private force = false;
   private done: DoneJob[] = [];
-  private readonly titles = new Map<number, Omit<LiveJob, "running" | "since">>();
+  private readonly titles = new Map<number, Omit<LiveJob, "state" | "since">>();
 
   constructor(private o: MasterOpts) {
     try {

@@ -30,7 +30,7 @@ test("state chart: ambiguous message → judge (confident) or fallback to FIRSTM
   ans.send({ type: "OWNER_MESSAGE", text: "option 2", answering: true });
   expect(ans.getSnapshot().context.decision?.stack).toBe("firstmate");
   ans.send({ type: "CANCEL" });
-  expect(ans.getSnapshot().value).toBe("cancelled");
+  expect(ans.getSnapshot().value).toBe("stopped");
 });
 
 test("stack machine: serial queue, failure does not block the next job", () => {

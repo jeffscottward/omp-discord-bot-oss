@@ -134,28 +134,3 @@ export function ctxSuffix(c?: CtxUse): string {
   return c ? ` · ctx ${c.pct}%${c.pct >= 70 ? ` ${ctxIcon(c.pct)}` : ""}` : "";
 }
 
-/**
- * Master queue lines: FIRSTMATE in long form, then stack sessions used in the last 12 h in short form.
- * `sessionsRoot` holds one folder per session key (firstmate, stack-<name>).
- */
-export function boardCtxLines(sessionsRoot: string, now = Date.now(), win?: (model: string) => number | undefined): string {
-  const out: string[] = [];
-  const fm = newestSession(join(sessionsRoot, "firstmate"));
-  const c = fm && ctxOfFile(fm, win);
-  if (c) out.push(ctxLine("FIRSTMATE", c));
-  let keys: string[] = [];
-  try {
-    keys = readdirSync(sessionsRoot).filter((k) => /^stack-[a-z0-9-]+$/.test(k)).sort();
-  } catch {
-    /* no sessions */
-  }
-  const stacks: string[] = [];
-  for (const k of keys) {
-    const f = newestSession(join(sessionsRoot, k));
-    if (!f || now - statSync(f).mtimeMs > 12 * 3600_000) continue;
-    const s = ctxOfFile(f, win);
-    if (s) stacks.push(ctxShort(k.slice(6), s));
-  }
-  if (stacks.length) out.push(`🧵 Stacks context: ${stacks.join(" · ")}`);
-  return out.join("\n");
-}

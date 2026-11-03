@@ -55,6 +55,7 @@
    "id": "needs-your-step",
    "t": "Blocked by your setup step (example)",
    "s": "blocked",
+   "action": "Finish the setup step",
    "blockedBy": [
     "finish-setup"
    ],

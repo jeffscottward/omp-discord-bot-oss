@@ -39,7 +39,7 @@ describe("reply dashboard deep link", () => {
 
   test("run replies pass the run start into sendText (normal, late-audio, timeout, auto-continue, cyber reset, failure)", () => {
     const src = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-    const done = src.slice(src.indexOf("onDone: async (res, err)"), src.indexOf("jobKeys.set(id, target.id);"));
+    const done = src.slice(src.indexOf("onDone: async (res, err, state)"), src.indexOf("jobKeys.set(id, target.id);"));
     // The success path has one sendText call; with late audio it gets audio=undefined and the link ends the text.
     expect(done).toContain('typeof ready === "string" && ready !== "late" ? ready : undefined, audioName(text), [], startedAt, fmRun, undefined, modelWithThinking(withCtx(res.model ?? models.defaultModel(), res.sessionFile), lastThinking(res.sessionFile)));');
     expect(done.match(/sendText\(/g)?.length).toBe(5);

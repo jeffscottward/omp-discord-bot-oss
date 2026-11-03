@@ -187,6 +187,38 @@ export const CHANNELS: Record<string, { name: string; cwd: string }> = CONFIG.ch
  */
 export const ALERT_CHANNELS: Record<string, { name: string }> = CONFIG.alertChannels;
 
+/**
+ * Card discord-config-hot-reload (2026-11-03): re-read only the `channels` map from `file` and update CHANNELS in place,
+ * so a channel added to config.json routes without a restart (policy.ts reads CHANNELS per message).
+ * Bad JSON, a missing/unreadable file or a non-object `channels` keeps the old map. Returns added/removed ids, or the error.
+ */
+export function reloadChannels(
+  file = CONFIG_FILE,
+  target: Record<string, { name: string; cwd: string }> = CHANNELS,
+): { ok: true; added: string[]; removed: string[]; changed: string[] } | { ok: false; error: string } {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(file, "utf8"));
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+  const ch = (raw as { channels?: unknown } | null)?.channels;
+  if (!ch || typeof ch !== "object" || Array.isArray(ch)) return { ok: false, error: "channels is missing or not an object" };
+  const next: Record<string, { name: string; cwd: string }> = {};
+  for (const [id, v] of Object.entries(ch as Record<string, unknown>)) {
+    const e = v as { name?: unknown; cwd?: unknown } | null;
+    if (!e || typeof e.name !== "string" || typeof e.cwd !== "string") return { ok: false, error: `channels.${id} needs string name and cwd` };
+    next[id] = { name: e.name, cwd: expandHome(e.cwd) };
+  }
+  if (Object.keys(next).length === 0) return { ok: false, error: "channels is empty" };
+  const added = Object.keys(next).filter((id) => !(id in target));
+  const removed = Object.keys(target).filter((id) => !(id in next));
+  const changed = Object.keys(next).filter((id) => id in target && (target[id]!.name !== next[id]!.name || target[id]!.cwd !== next[id]!.cwd));
+  for (const id of removed) delete target[id];
+  Object.assign(target, next);
+  return { ok: true, added, removed, changed };
+}
+
 /** DMs have no channel mapping; they run in ~/Github. */
 export const DM_CWD = join(HOME, "Github");
 

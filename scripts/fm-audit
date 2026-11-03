@@ -353,6 +353,8 @@ def log(line, dry):
 
 def fm(argv, why):
     r = subprocess.run([FM, *argv], env={**os.environ, "FM_AUTO": f"fm-audit {why}"}, capture_output=True, text=True, timeout=60)
+    if r.returncode == 3:  # fm set --from: the card moved since this run read it; nothing written (card sma-fm-set-cas)
+        return False, "skipped: card moved since the read"
     return r.returncode == 0, (r.stderr or r.stdout).strip()[:200]
 
 
@@ -470,7 +472,8 @@ def post_asks(todo, st, asked, by, now, dry, post_fn=None, fm_fn=None):
             ok, err = fm_fn(["q", f["id"], url], "F5 unclear")
             if ok:
                 ok, err = fm_fn(["set", f["id"], "waiting", note[:560], "--action",
-                                 f"Pick what happens with blocker {f.get('root') or '(none recorded)'} in the FIRSTMATE menu"], "F5 unclear")
+                                 f"Pick what happens with blocker {f.get('root') or '(none recorded)'} in the FIRSTMATE menu",
+                                 *(["--from", it["s"]] if it.get("s") else [])], "F5 unclear")
         except Exception as e:
             ok, err = False, str(e)
         if ok:
@@ -524,14 +527,14 @@ def main(dry, rep):
     for f in found:
         it = by[f["id"]]
         if f["fix"] == "partial+flow":
-            ok, err = (True, "") if dry else fm(["set", f["id"], "partial", note_with(it, "[running with no job; needs check]")], "F2 no-job")
+            ok, err = (True, "") if dry else fm(["set", f["id"], "partial", note_with(it, "[running with no job; needs check]"), "--from", "running"], "F2 no-job")
             log(f"F2 {f['id']}: running -> partial (no job)" + ("" if ok else f" FAILED: {err}"), dry)
         elif f["fix"] == "unjob+flow":
             ok, err = True, ""
             if not dry:
                 ok, err = fm(["field", f["id"], "job", "-"], "F3 daemon-job")
                 if ok:
-                    ok, err = fm(["set", f["id"], "partial", note_with(it, f"[job was the always-on {f['unit']}; needs check]")], "F3 daemon-job")
+                    ok, err = fm(["set", f["id"], "partial", note_with(it, f"[job was the always-on {f['unit']}; needs check]"), "--from", "running"], "F3 daemon-job")
             log(f"F3 {f['id']}: job {f['unit']} removed; running -> partial" + ("" if ok else f" FAILED: {err}"), dry)
         else:
             continue

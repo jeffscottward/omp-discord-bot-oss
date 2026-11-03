@@ -177,9 +177,9 @@ describe("status reporting", () => {
     const lines = t.boardLines((j) => j.preview);
     expect(lines[0]).toBe("🧭 **Stacks**");
     expect(lines).toContain("💹 **finance**: ⚙️ newsletter check · 1. second");
-    t.finish("1", true);
-    t.finish("3", false);
-    t.finish("2");
+    t.finish("1", "done");
+    t.finish("3", "failed");
+    t.finish("2", "stopped");
     const s = Object.fromEntries(t.status().map((x) => [x.stack, x]));
     expect(s.finance).toMatchObject({ done: 1, failed: 0, running: [], queued: [] });
     expect(s.kb).toMatchObject({ done: 0, failed: 1 });
@@ -228,10 +228,10 @@ describe("status reporting", () => {
     r.track(11, r.stack("finance")!, "second", "x", copy2.id, false);
     await Promise.resolve();
     expect(notes.some((t) => t.includes("⚙️ running"))).toBe(true);
-    r.sync([10], []); // 11 left the queue without starting: cancelled
+    r.sync([10], []); // 11 left the queue without starting: stopped
     await Promise.resolve();
-    expect(notes.some((t) => t.includes("🛑 cancelled"))).toBe(true);
-    r.ended(10, true);
+    expect(notes.some((t) => t.includes("🛑 stopped"))).toBe(true);
+    r.ended(10, "done");
     await Promise.resolve();
     expect(notes.at(-1)).toContain("✅ done");
     expect(notes.at(-1)).toContain(`/T1/${copy1.id}`);
@@ -272,4 +272,18 @@ test("StackRouter.thread: a transient lookup error keeps the saved thread; only 
   err = { code: 10003 };
   const t = await r.thread(parent as never, r.stack("finance")!);
   expect(t.id).toBe("N1");
+});
+
+describe("stack-coverage: every direct-channel job gets a stack", () => {
+  test("mapped channel, then channel name keywords, then message keywords, else firstmate", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sc-"));
+    writeFileSync(join(dir, "items.json"), JSON.stringify({ items: [] }));
+    const r = new StackRouter(cfg, { stateFile: join(dir, "state.json"), statusFile: join(dir, "stacks.json"), itemsFile: join(dir, "items.json"), guildId: "G", log: () => {} });
+    expect(r.stackForJob("T1", null, "random", "hello")?.name).toBe("finance");
+    expect(r.stackForJob("C9", null, "📈-main-webapp-charts", "hello")?.name).toBe("webapp");
+    expect(r.stackForJob("C9", null, "misc", "transcribe the youtube videos into the kb")?.name).toBe("kb");
+    expect(r.stackForJob("C9", null, "misc", "hello there")?.name).toBe(GENERAL);
+    // A tie between two stacks goes to the general stack.
+    expect(r.stackForJob("C9", null, "misc", "the webapp finance page")?.name).toBe(GENERAL);
+  });
 });

@@ -4,7 +4,7 @@
  * Rendered to docs/router/router-chart.svg by scripts/render-router-chart.ts.
  *
  * One owner message:  idle → routing (rules → judge → fallback) → dispatch (stack thread) | general (FIRSTMATE)
- *                     → queued → running → reported (✅/❌) | cancelled (🛑)
+ *                     → queued → running → reported (✅/❌) | stopped (🛑; src/jobstate.ts)
  * One stack:          a serial queue (one job at a time); stacks run in parallel up to maxParallelStacks.
  */
 import { assign, fromPromise, setup } from "xstate";
@@ -87,11 +87,11 @@ export const messageMachine = setup({
     /** FIRSTMATE's own session (the mirrored pane's side session). */
     general: { always: { target: "queued" } },
     /** Waits for its stack (serial) and a free parallel slot. */
-    queued: { on: { START: "running", CANCEL: "cancelled" } },
-    running: { on: { DONE: { target: "reported", actions: assign({ outcome: "done" }) }, FAIL: { target: "reported", actions: assign({ outcome: "failed" }) }, CANCEL: "cancelled" } },
+    queued: { on: { START: "running", CANCEL: "stopped" } },
+    running: { on: { DONE: { target: "reported", actions: assign({ outcome: "done" }) }, FAIL: { target: "reported", actions: assign({ outcome: "failed" }) }, CANCEL: "stopped" } },
     /** Report up: router note ✅/❌, FIRSTMATE board, stacks.json, /health. */
     reported: { type: "final" },
-    cancelled: { type: "final" },
+    stopped: { type: "final" },
   },
 });
 

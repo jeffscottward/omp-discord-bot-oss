@@ -156,6 +156,12 @@ done
 NOW="$($HEADCMD)"
 if [ "$NOW" != "$GATED" ]; then
   undrain
+  # Owner 2026-11-03: new commits during the wait are normal; check the new HEAD instead of giving up (max 5 rounds).
+  n=${OMP_RESTART_REGATE:-0}
+  if [ "$n" -lt 5 ] && git merge-base --is-ancestor "$NOW" origin/main 2>/dev/null; then
+    echo "HEAD moved from ${GATED:0:7} to ${NOW:0:7} after the gate; checking the new HEAD (round $((n + 1)) of 5)"
+    exec env OMP_RESTART_REGATE=$((n + 1)) "$0" "$@"
+  fi
   onmain=""
   git merge-base --is-ancestor "$NOW" origin/main 2>/dev/null || onmain=" \`${NOW:0:7}\` is not on origin/main (unpushed, no CI)."
   alert "$(printf "%s\n🤖 **Bot restart abandoned**\n———————————\nThe checks passed at \`%s\`, but the checkout moved to \`%s\` during the wait. The bot keeps its current code; it never loads an unchecked commit.%s Queue the restart again (\`/restart\`).\n%s" \

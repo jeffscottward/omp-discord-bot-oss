@@ -20,6 +20,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { jobTransition, type FinalJobState, type JobState } from "./jobstate.ts";
 import { redact } from "./redact.ts";
 
 export type StackDef = {
@@ -382,8 +383,7 @@ export function cardAreasFor(items: { id?: string; area?: string; q?: string; sr
 
 // ---------- status ("report up") ----------
 
-export type StackJobState = "queued" | "running" | "done" | "failed";
-export type StackJob = { id: string; stack: string; preview: string; link?: string; state: StackJobState; at: number; by: RouteBy; detail: string };
+export type StackJob = { id: string; stack: string; preview: string; link?: string; state: JobState; at: number; by: RouteBy; detail: string };
 export type StackStatus = { stack: string; emoji: string; title: string; threadId?: string; running: StackJob[]; queued: StackJob[]; done: number; failed: number; last?: StackJob };
 
 /**
@@ -408,20 +408,20 @@ export class StackTracker {
   start(id: string): void {
     const j = this.jobs.get(id);
     if (!j) return;
-    j.state = "running";
+    j.state = jobTransition(j.state, { type: "start" });
     j.at = this.now();
     this.changed();
   }
-  /** `ok` undefined: cancelled (removed without counting). */
-  finish(id: string, ok?: boolean): void {
+  /** The job ended (src/jobstate.ts). A stopped job is removed without counting. */
+  finish(id: string, state: FinalJobState): void {
     const j = this.jobs.get(id);
     if (!j) return;
     this.jobs.delete(id);
-    if (ok !== undefined) {
+    if (state !== "stopped") {
       const c = this.counts.get(j.stack) ?? { done: 0, failed: 0 };
-      if (ok) c.done++;
+      if (state === "done") c.done++;
       else c.failed++;
-      c.last = { ...j, state: ok ? "done" : "failed", at: this.now() };
+      c.last = { ...j, state, at: this.now() };
       this.counts.set(j.stack, c);
     }
     this.changed();
@@ -517,11 +517,10 @@ export function saveRouterState(file: string, st: RouterState, now = Date.now())
 }
 
 /** The router reply's text in the FIRSTMATE channel (edited in place as the job moves). */
-export function routeNote(s: StackDef, d: RouteDecision, state: StackJobState | "cancelled", messageUrl: string): string {
-  const icon = { queued: "⏳", running: "⚙️", done: "✅", failed: "❌", cancelled: "🛑" }[state];
+export function routeNote(s: StackDef, d: RouteDecision, state: JobState, messageUrl: string): string {
+  const icon = { queued: "⏳", running: "⚙️", done: "✅", failed: "❌", stopped: "🛑" }[state];
   const why = d.by === "judge" ? `judge ${Math.round(d.confidence * 100)}%` : d.by === "fallback" ? "fallback" : d.by;
-  const word = { queued: "queued", running: "running", done: "done", failed: "failed", cancelled: "cancelled" }[state];
-  return `🧭 → stack: ${s.emoji} **${s.name}** (${why}) · ${icon} ${word} · [open the routed message](<${messageUrl}>)`;
+  return `🧭 → stack: ${s.emoji} **${s.name}** (${why}) · ${icon} ${state} · [open the routed message](<${messageUrl}>)`;
 }
 
 /** Header the stack's run gets in front of the owner's text. */

@@ -136,12 +136,15 @@ describe("renderPng (real headless Chrome)", () => {
       "| Item | Size | Date | Ratio | Cost | Note |\n|---|--:|---|--:|--:|---|\n" +
         Array.from({ length: 8 }, (_, i) => `| item${i} | ${500 + i * 5} | 2026-12-18 | 0.${30 + i} | $${(4.1 + i).toFixed(2)} | row ${i + 1} with a longer note that should wrap inside its cell ✅ |`).join("\n"),
     );
-    await renderPng(t!, png);
-    const head = readFileSync(png).subarray(0, 8);
+    // 8 wide rows -> 3 card images of at most 3 cards (owner 2026-11-03, card card-images-3).
+    const parts = await renderPng(t!, png);
+    expect(parts?.length).toBe(3);
+    const first = parts![0]!;
+    const head = readFileSync(first).subarray(0, 8);
     expect([...head]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
     // Wide table -> phone cards: 390 CSS px at scale 3 = 1170 px wide, taller than wide (owner 2026-10-21).
     expect(head.length).toBe(8);
-    const ihdr = readFileSync(png).subarray(16, 24);
+    const ihdr = readFileSync(first).subarray(16, 24);
     const w = ihdr.readUInt32BE(0), h = ihdr.readUInt32BE(4);
     expect(w).toBe(PNG_CARD_W * 3);
     expect(h).toBeGreaterThan(w);

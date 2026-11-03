@@ -13,6 +13,63 @@ Those features stay off or show nothing when the tools are missing.
 - Internals (sandbox, approval broker, loopback API, voice details): [docs/REFERENCE.md](docs/REFERENCE.md).
 - Dashboard and tracker kit: [kit/README.md](kit/README.md). OMP slash commands: [docs/omp-commands.md](docs/omp-commands.md).
 
+![FIRSTMATE dashboard with the fake sample data (dark)](docs/screenshots/dashboard.png)
+
+The dashboard has its own public repository: [omp-firstmate-dashboard](https://github.com/jeffscottward/omp-firstmate-dashboard).
+The screenshot shows only fake sample data.
+
+## Architecture
+
+| Part | What it does | Where |
+|---|---|---|
+| Bot (this repository) | Discord gateway, OMP runs, Herdr pane mirror, voice, master queue, ask menus, loopback API on `127.0.0.1:47821` | `src/`, `systemd/omp-discord-bot.service` |
+| `fm` tracker | Cards in one JSON file (`$FM_DIR/items.json`) plus worker receipts (`$FM_DIR/receipts/`). Agents call `fm set`, `fm field`, `fm beat`, `fm receipt`. Timers (`fm-autoclear`, `fm-prwatch`, `fm-tabwatch`) apply receipts and rules. | `kit/bin/` (Python 3) |
+| Dashboard | Reads the same tracker files and shows cards, reports, running jobs and a blocker map. Read-only. | [omp-firstmate-dashboard](https://github.com/jeffscottward/omp-firstmate-dashboard) (TrailBase + Vike), or the static page in `kit/dashboard/web/` |
+| Phone access | `tailscale serve` publishes the loopback dashboard and report pages to your tailnet only | §8 in docs/SETUP.md |
+
+Data flow: Discord message → bot → OMP run (or a Herdr pane) → agent updates cards with `fm` → the bot boards and
+the dashboard read the tracker files → answers go back to Discord.
+
+## Prerequisites
+
+Every tool and login that the full setup assumes. Optional items only switch off the named feature.
+
+| Need | Version checked | Used for | Required? |
+|---|---|---|---|
+| Linux with systemd user units (`systemctl --user`, `loginctl enable-linger`) | Omarchy (Arch) | bot, timers, sandbox | yes |
+| Bun | 1.4.0 | runs the bot and tests | yes |
+| Node.js | 24 or newer | dashboard build, some scripts | for the dashboard |
+| Python | 3.11 or newer (3.14 tested), `uv` | `fm` kit, voice servers | yes |
+| git, curl, jq, bubblewrap (`bwrap`) | distro packages | basics, run sandbox | yes |
+| OMP (`omp` binary) with your own Claude subscription sign-in (`omp` then `/login`) | 18.16.0 | the agent | yes |
+| Herdr | 0.9.5 | panes, mirror channels, approval tabs | yes for mirror and approvals |
+| tmux | 3.8 | helper TUIs started detached | optional |
+| Tailscale (`tailscale serve`) | 1.104 | dashboard and reports on your phone | optional |
+| Kokoro TTS server (`systemd/omp-tts.service`) and Whisper (`systemd/omp-whisper.service`) | — | voice answers and voice input | optional |
+| ffmpeg | 9.0 | voice audio | for voice |
+| Google Chrome or Chromium (headless) | any current | table and chart images (`OMP_TABLES_CHROME`) | optional |
+| Graphviz (`dot`) | 16.1 | flow charts in answers (`OMP_DOT`) | optional |
+| gh (GitHub CLI), signed in; glab for GitLab | gh 2.103 | `fm-prwatch` PR badges, CI gates | optional |
+| ntfy topic and the `omp-notify` sender | — | one phone push per owner question | optional |
+| Discord application + bot token, Message Content and Server Members intents, invite with the permissions in docs/SETUP.md §2.4 | — | the bot | yes |
+| Secret drop (built in, `scripts/secret-drop.ts`, `OMP_BOT_SECRET_DROP_PORT`) | — | one-time secret forms | optional |
+
+Config and env files (examples in this repository):
+
+| Path | Example | Holds |
+|---|---|---|
+| `~/.config/omp-discord/config.json` | [config.example.json](config.example.json) | IDs, channels, categories, stacks, peers |
+| `~/.config/omp-discord/bot.env` (mode 0600) | [.env.example](.env.example) | `DISCORD_BOT_TOKEN`, `DISCORD_APP_ID` |
+| `~/.config/omp-discord/kit.env` | [kit/kit.env.example](kit/kit.env.example) | `fm` kit settings (`FM_DIR` and others) |
+| `~/.config/omp-discord/stacks.json` | written by `scripts/stack-add.ts` | router stack catalog |
+| `~/.config/systemd/user/*.service`, `*.timer` | [systemd/](systemd/) | bot, voice, cleanup timers |
+
+Common env vars: `OMP_BOT_CONFIG`, `OMP_BOT_STATE_DIR`, `OMP_BOT_HTTP_PORT` (47821), `OMP_BOT_OMP_BIN`,
+`OMP_FM_BIN`, `FM_DIR`, `OMP_TABLES_CHROME`, `OMP_DOT`, `OMP_FINANCE_CHANNEL_IDS`, `OMP_MAINT_BIN`. The full list
+is in docs/REFERENCE.md and docs/SETUP.md §4.
+
+Setup from zero: follow docs/SETUP.md §1 to §8 in order (`scripts/bootstrap.sh --dry-run` checks each tool).
+
 ## Configuration
 
 | File | Holds |
@@ -156,6 +213,20 @@ must also have a green CI pipeline when GitLab is configured (`scripts/ci-green.
 restart loads only the commit the gate checked: a dirty checkout or a moved HEAD stops it. Then it waits until no
 job runs and the owner is not in a voice call. After 10 min it drains: new jobs stay queued (saved, run after the
 restart) while running jobs finish. After 2 h of a busy bot it gives up and posts one notice.
+
+### What is new (2026-11-03, second update)
+- The 📋 Master queue reads from the bottom up: ✍️ Needs you is last, just above the dashboard link
+  (`src/masterqueue.ts`). Blocked rows show a short reason and a 🧾 Why link that opens the dashboard Why panel.
+- Every job gets a stack; the board reopens or creates stack threads so each row links its stack (`src/stackroute.ts`).
+- Owner turns that run during a bot restart are saved and run once after the restart (`src/jobqueue.ts`,
+  `src/jobstate.ts`); missed owner messages from the last 24 h are replayed once (`src/replay.ts`).
+- Messages for a busy job pane are queued instead of refused.
+- ```` ```chart ````, ```` ```mermaid ```` and ```` ```flow ```` blocks in answers become dark PNG images (`src/chartrender.ts`).
+- Card tables: at most 3 cards per image, rendered in parallel.
+- ⏸️ Pause all sends Esc to every working OMP pane and pauses running cards; a test allowlist mode checks the real
+  buttons safely (`src/pauseall.ts`, `scripts/pause-live-test.ts`). An owner finance request can make other jobs yield.
+- `config.json` channel map reloads on change. `fm set --from` is a compare-and-set for automated writers.
+- `restart-when-idle.sh` re-checks a moved HEAD (max 5 rounds) instead of giving up.
 
 ### What is new (2026-11-03)
 - Rate limits: a 429, rate-limit or overloaded error retries by itself after a growing cool-down. The failure
