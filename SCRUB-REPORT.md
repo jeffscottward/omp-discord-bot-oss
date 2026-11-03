@@ -94,7 +94,7 @@ Replaced or removed in the new code and tests (same table as above):
 - Private client project code: none found (name grep over files and history).
 
 Scan results (2026-11-03): real-ID scan (43 IDs from the private repository) over files and full history: **0 hits**.
-String scan over files and file history: **0 hits**. One open hit: the author name and email of the first commit
-(c0e2363, 2026-10-26); it can only be removed by a history rewrite. One existing redaction test fixture with fake order text is
+String scan over files and full history: **0 hits**. The history was rewritten once (owner-approved force-push,
+2026-11-03) so every commit uses the noreply author and committer. One existing redaction test fixture with fake order text is
 kept on purpose. `gitleaks dir` and `gitleaks git`: **no leaks found**. `bunx tsc --noEmit`, `bun test test/`,
 `bun test src/` and `lint:mentions`: pass.
