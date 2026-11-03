@@ -47,6 +47,7 @@ import {
 import { blockFromContent } from "./blocks.ts";
 import { BUSY_TEXT, buttonAllowed, FIRSTMATE_PANE, FirstmateSender, SEND_BUTTON_ID } from "./firstmate.ts";
 import { isCyberRefusal, newestJsonl, resetFirstmate, resetNotice } from "./cyberreset.ts";
+import { checkApiFallback } from "./apifallback.ts";
 import type { LinkButton } from "./heeler.ts";
 import { Approvals, APPROVE_PREFIX } from "./approvals.ts";
 import { activeButtonRuns } from "../gate/run.ts";
@@ -68,7 +69,7 @@ import { isAlert, NeedsYouBoard, type BoardChannel, type MenuSource } from "./ne
 import { herdrPlace, isMasterBoard, MasterQueueBoard, TITLE_MAX, parseHerdrPanes, parseHerdrTabs, queueBoxAllowed, type HerdrPane, type HerdrTab, type JobPlace, type LiveJob } from "./masterqueue.ts";
 import { cancelQueuedJob } from "./cancel.ts";
 import { clearPause, HELD_FILE, holdAlert, parseDuration, pauseLine, pauseTransition, readPause, restoreHeld, resumeDigest, setPause, takeHeld } from "./alertpause.ts";
-import { MAINT_BIN, MAINT_PREFIX, maintButton, maintLine, readMaintPause } from "./maintpause.ts";
+import { MAINT_BIN, MAINT_PREFIX, maintButton, maintLine, readMaintPause, showMaintButton } from "./maintpause.ts";
 import { forcedStack, GENERAL, jevJudge, routerConfig, stackPreamble, type RouteDecision, type StackDef } from "./router.ts";
 import { jevJobJudge, JOBROUTE_PREFIX, jobRouteClickAllowed, matchJob, openJobs, type JobMatch, type OpenJob } from "./jobmatch.ts";
 import { readCards } from "./masterqueue.ts";
@@ -80,17 +81,20 @@ import { VoiceChat } from "./voicechat.ts";
 import { resolveChannel, startHttp, type PostResult } from "./http.ts";
 import { claimsMissingMenu, earlierExtras, runAnswers } from "./earlier.ts";
 import { StatusReactions } from "./reactions.ts";
-import { SECRET_DROP_PATH, SecretDrops, startSecretDropServer } from "./secretdrop.ts";
+import { dropCardCommands } from "./dropcards.ts";
+import { type Drop, SECRET_DROP_PATH, SecretDrops, startSecretDropServer } from "./secretdrop.ts";
 import { Triage, triagePrompt, type Incident } from "./triage.ts";
 import { hasSession, isolatedTag, modelArgs, sessionDir, onApprovalRequest, qwenSessionKey, refreshDiscovery, resetSession, runHeartbeat, runOmp, stopRun, type RunResult } from "./omp.ts";
 import { HEARTBEAT_MS, lastActivity } from "./heartbeat.ts";
 import { refreshSecretValues } from "./secrets.ts";
 import { emptyAnswerFallback, emptyAnswerPlan, type OutMsg, prepareCopy, prepareOutbound } from "./outbound.ts";
 import { renderTables, tableLineCount } from "./tablerender.ts";
+import { boardCtxLines, ctxOfFile, ctxSuffix, newestSession, windowOf } from "./ctxmeter.ts";
+import { baselineLine, newBaselines } from "./compactbase.ts";
 import { attachTail, buildTail, isFinanceChannel, lastThinking, modelWithThinking } from "./replytail.ts";
 import { messageProvenance, route, threadName, timeLimitContinue, unrestrictedRoute, watchdogContinue } from "./policy.ts";
 import { ASK_BLOCK_RULE, buildPrompt, setOwnerInVoiceProbe, type PromptInput } from "./preamble.ts";
-import { ARCHIVE_IDS, HOSTS, Mirror, oneLine, rejectLongChannelCreate, sh, sideSessionKey, type MirrorEntry, type WaitHandler } from "./mirror.ts";
+import { ARCHIVE_IDS, busyReply, HOSTS, Mirror, oneLine, rejectLongChannelCreate, sh, sideSessionKey, type MirrorEntry, type WaitHandler } from "./mirror.ts";
 import { choicesFor, closedCard, PaneInjector, QR_MODAL_PREFIX, QR_PREFIX, redactTerminal, SB_PREFIX, SCROLLBACK_LINES, scrollbackMessages, shellQuote, waitCard, MAX_TEXT, type Choice, type InjectTarget, type PaneWait } from "./quickreply.ts";
 import { redactKnownSecrets } from "./secrets.ts";
 import { MAX_CONTINUES, STALL_MS, type WatchAction } from "./stall.ts";
@@ -105,6 +109,7 @@ import { fitLines, markRestarted, pendingLine, pendingRestart, recordPendingBoar
 import { maskedLabelText } from "./links.ts";
 import { dashboardLine, stripTokens } from "./dashlink.ts";
 import { ASK_CANCEL_PREFIX, ASK_DELETE_PREFIX, askRows } from "./askrows.ts";
+import { stopCardsForPane } from "./stopsync.ts";
 import { FM_BIN, ITEMS_FILE, markQueued, messageIdOf, parseCards, QUEUED_BY, responseRefs, setRefExpander } from "./queued.ts";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -236,6 +241,26 @@ mirror.alert = (text) => {
 mirror.alertFirstmate = FIRSTMATE_CHANNEL_ID
   ? (text) => { void privateChannel(FIRSTMATE_CHANNEL_ID).then(async (ch) => { await ch?.send({ content: text, allowedMentions: { parse: [] } }); }).catch(() => undefined); }
   : null;
+/** Owner 2026-11-03 (card compact-baseline): one line in FIRSTMATE after each auto-compaction (src/compactbase.ts). */
+if (FIRSTMATE_CHANNEL_ID) {
+  let lastSize = -1;
+  setInterval(() => {
+    const file = newestSession(join(SESSIONS_DIR, FIRSTMATE_SESSION.key));
+    if (!file) return;
+    const size = statSync(file, { throwIfNoEntry: false })?.size ?? -1;
+    if (size === lastSize) return;
+    lastSize = size;
+    try {
+      for (const b of newBaselines(readFileSync(file, "utf8"), join(STATE_DIR, "compact-baseline.json"))) {
+        const line = baselineLine(b, (b.model && windowOf(b.model)) || 1_000_000);
+        log(`compact-baseline: ${b.id} ${line}`);
+        mirror.alertFirstmate?.(line);
+      }
+    } catch (e) {
+      log(`compact-baseline: ${(e as Error).message}`);
+    }
+  }, 60_000);
+}
 /** Plan P12: incident triage runs in #omp-alerts threads (src/triage.ts). */
 const triage = new Triage(STATE_DIR);
 // /models (owner 2026-10-19): per-channel model override, saved in the state dir.
@@ -458,7 +483,7 @@ async function stopAnsweredQuestions(target: SendableChannels, questions: AskQue
     lines.push(`↩️ Already answered: **${answerLabel(e).slice(0, 300)}**${url ? ` (${url})` : ""} for "${q.question.slice(0, 120)}"`);
   }
   if (lines.length) {
-    const body = `${lines.join("\n")}\nThe owner's earlier answer stands; act on it. No new menu was posted.`.slice(0, 1900);
+    const body = `${lines.join("\n")}\nNo new menu was posted. Act on the earlier answer only if it is the same decision; if your question asks something else (another leg, item or action), ask again and start the question with \"New question (not <the earlier one>):\" so it posts.`.slice(0, 1900);
     const sent = await target.send({ content: body, allowedMentions: { parse: [] } }).catch(() => undefined);
     if (sent) sink?.messages.push(sent);
     if (sent) onSent?.();
@@ -472,7 +497,7 @@ async function stopAnsweredQuestions(target: SendableChannels, questions: AskQue
   // A run's own ask block (no /post caller to read `alreadyAnswered`): when nothing is left to ask, the earlier answers
   // go back to the session as the owner's next turn, once per earlier answer (a session that asks again is not fed again).
   if (lines.length && !keep.length && !sink && sentReask && !repeat) {
-    const text = `Answers (the owner already answered these earlier; do not ask again):\n${lines.join("\n")}`;
+    const text = `Answers (the owner already answered these earlier; do not ask again if it is the same decision; a question about another leg, item or action needs a new menu that starts with "New question (not …):"):\n${lines.join("\n")}`;
     void handle(sentReask, { authorId: OWNER_ID, text }).catch((e) => log(`reask feed-back failed: ${(e as Error).message}`));
   }
   return keep.length ? keep : undefined;
@@ -1206,7 +1231,13 @@ async function handlePaneStop(i: ButtonInteraction): Promise<void> {
   }
   await i.deferReply({ flags: MessageFlags.Ephemeral });
   const r = await stopPane(ref, herdrOn, log);
-  await i.editReply(r.text);
+  // Stop-sync (card dev-freeze-gate): the stop also ends the job's cards (master queue, dashboard, spawn queue) and
+  // says so in the job's channel or stack thread. A closed pane counts too: its job is over.
+  const stopped = ref.machine === "main" && (r.ok || /is closed/.test(r.text)) ? await stopCardsForPane(ref.paneId, "owner pressed Stop in Discord", log) : [];
+  if (stopped.length && i.channel && "send" in i.channel) {
+    await i.channel.send({ content: `⏹️ Stopped by owner: card${stopped.length > 1 ? "s" : ""} ${stopped.map((c) => `\`${c}\``).join(", ")} → partial, job unlinked.`, ...NO_PINGS }).catch((e: Error) => log(`stop-sync post: ${e.message}`));
+  }
+  await i.editReply(r.text + (stopped.length ? `\nCards stopped: ${stopped.join(", ")}.` : ""));
 }
 
 async function setReaction(msg: Message, emoji: string, on: boolean): Promise<void> {
@@ -1251,8 +1282,9 @@ async function runMirrored(
   runId?: string,
   model?: string,
 ): Promise<RunResult> {
-  const d = await mirror.decide(channelId, threadId);
+  const d = await mirror.decide(channelId, threadId, FIRSTMATE_CHANNEL_ID);
   if (!d) throw new Error("this channel is no longer mirrored");
+  if (d.mode === "busy") throw new NotContinued(d.reason);
   // P5 automatic continue: only the pane's own session, never a side session; never while a live omp holds it.
   if (paneOnly && d.mode !== "pane") throw new NotContinued(d.reason);
   // Owner 2026-10-19: Qwen never writes into the pane's own (Claude) session; it gets its own side session.
@@ -1296,6 +1328,21 @@ const queueBoards = new Map<string, { msg: Message; text: string; recent: string
 
 /** 🔙 Undo (was ↩️; owner 2026-10-22: the ↩️ button emoji did not show on the phone, U+21A9 needs FE0F) after Stop (owner request 2026-10-14): a new run in the same session that reverts the stopped turn. */
 const UNDO_PREFIX = "undo:";
+/** Owner 2026-11-01: after every run, one notice when the run used the paid OpenRouter Claude fallback (src/apifallback.ts). */
+function noteApiFallback(res: RunResult | undefined, label: string): void {
+  if (!res) return;
+  void checkApiFallback({
+    sessionFile: res.sessionFile,
+    startedAt: res.startedAt,
+    channelLabel: label,
+    log,
+    post: async (text) => {
+      const ch = FIRSTMATE_CHANNEL_ID ? await client.channels.fetch(FIRSTMATE_CHANNEL_ID).catch(() => null) : null;
+      if (ch?.isSendable()) await ch.send({ content: text, allowedMentions: { parse: [] } });
+    },
+  });
+}
+
 const undoJobs = new Map<string, { msg: Message; startedAt: number; text: string }>();
 
 async function handleUndoButton(i: ButtonInteraction): Promise<void> {
@@ -2005,6 +2052,15 @@ async function handle(
   const followUp = hasSession(sessKey);
   let planRun = false; // /mode plan was on for this run: its answer gets Approve/Reject buttons
   const stackHeader = stack ? stackPreamble(stack, routed?.decision ?? { stack: stack.name, by: "inherit", confidence: 1, detail: "typed in the stack thread" }, routed?.sourceUrl ?? threadUrl) : "";
+  // Card discord-side-run-duplicates-job-pane: never start a second omp in a live job pane's folder; refuse with a reply.
+  if (mirrored && !stack) {
+    const d = await mirror.decide(mirrored.channelId, threadId, FIRSTMATE_CHANNEL_ID).catch(() => null);
+    if (d?.mode === "busy") {
+      log(`mirror: refused new run in ${d.cwd}: live job pane ${d.entry.machine}:${d.entry.paneId}`);
+      await target.send({ content: busyReply(d.entry.tab, d.entry.paneId, d.cwd), ...QUIET }).catch(() => {});
+      return;
+    }
+  }
   const run = mirrored && !stack
     ? () => runMirrored(mirrored.channelId, threadId, target, { source, content: text, threadUrl, messageUrl: routed?.sourceUrl ?? msg.url, where, attachments }, false, fmRun, model)
     : () => {
@@ -2090,6 +2146,7 @@ async function handle(
     },
     onDone: async (res, err) => {
       let answer: Message | undefined;
+      noteApiFallback(res, where);
       try {
       // Owner 2026-10-15: delete the ⚙️ Working… message when the job ends (it cluttered the chat).
       clearInterval(heartbeatTimers.get(id));
@@ -2125,7 +2182,7 @@ async function handle(
         const voice = asOwner?.fromVoice === true;
         const audio = voice ? synthesize(spokenSource).catch(() => null) : Promise.resolve(null);
         const ready = voice ? await Promise.race([audio, new Promise<"late">((r) => setTimeout(() => r("late"), 45_000))]) : null;
-        answer = await sendText(target, res.stdout, undefined, msg, voice, typeof ready === "string" && ready !== "late" ? ready : undefined, audioName(text), [], startedAt, fmRun, undefined, modelWithThinking(res.model ?? models.defaultModel(), lastThinking(res.sessionFile)));
+        answer = await sendText(target, res.stdout, undefined, msg, voice, typeof ready === "string" && ready !== "late" ? ready : undefined, audioName(text), [], startedAt, fmRun, undefined, modelWithThinking(withCtx(res.model ?? models.defaultModel(), res.sessionFile), lastThinking(res.sessionFile)));
         if (!voice && answer && speakable(spokenSource)) void addSpeakButton(answer, spokenSource, audioName(text));
         if (planRun && isPlanAnswer(res.stdout)) await target.send({ content: "📝 Plan ready.", components: [sessionCmds.planRow()], ...QUIET }).catch(() => {});
         answer = (await postEarlierExtras(target, res, msg).catch((e) => void log(`earlier extras: ${(e as Error).message}`))) ?? answer;
@@ -2302,6 +2359,7 @@ async function startTriage(i: Incident): Promise<{ started: boolean; reason?: st
         ),
       onDone: async (res, err) => {
         triage.finish(i.key);
+        noteApiFallback(res, "#omp-alerts triage");
         jobKeys.delete(id);
         log(`triage ${i.key} done ok=${res?.ok ?? false} code=${res?.code ?? "n/a"}`);
         if (err) return void (await sendText(thread, `❌ Triage run failed: ${redact((err as Error).message).text.slice(0, 300)}`));
@@ -2366,6 +2424,7 @@ async function onWatch(e: MirrorEntry, a: WatchAction): Promise<void> {
       ),
     onDone: async (res, err) => {
       jobKeys.delete(id);
+      noteApiFallback(res, "a background run");
       if (err instanceof NotContinued) {
         e.watch?.continues?.pop(); // nothing ran: it does not count
         mirror.save();
@@ -2694,9 +2753,12 @@ const masterQueue = FIRSTMATE_CHANNEL_ID
         ];
       },
       mayBeBelow: (m) => isBoardText(m.content) || isAlert(m.content), // 🔔 needs-you pings may sit below (owner 2026-10-27)
-      notice: () => [maintLine(readMaintPause()), pauseLine(readPause())].filter(Boolean).join("\n"),
+      notice: () => [maintLine(readMaintPause()), pauseLine(readPause()), boardCtxCached()].filter(Boolean).join("\n"),
       components: () => {
-        const b = maintButton(readMaintPause() !== null);
+        // Owner 2026-11-01: show ⏸️ Pause all only while work runs (bot jobs or running cards); ▶️ Resume all while paused.
+        const paused = readMaintPause() !== null;
+        if (!paused && !masterWorkActive()) return [];
+        const b = maintButton(paused);
         return [new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId(b.customId).setLabel(b.label).setEmoji(b.emoji).setStyle(ButtonStyle.Secondary)).toJSON()];
       },
       itemsFile: process.env.OMP_FM_ITEMS ?? join(FM_DIR, "items.json"),
@@ -3344,6 +3406,18 @@ let lastMaintPaused = readMaintPause() !== null;
  * ⏸️ Pause = `omp-maintenance pause <reason>`; ▶️ Resume = `omp-maintenance resume` (continues the saved sessions,
  * then removes the flag). Resume can wait for sessions, so it runs detached; the 5 s timer sees the flag go away.
  */
+/** Live work for the ⏸️ Pause all button: bot jobs running/queued, or a FIRSTMATE card in state running. */
+function masterWorkActive(): boolean {
+  const st = queue.status();
+  let tracker: unknown;
+  try {
+    tracker = JSON.parse(readFileSync(process.env.OMP_FM_ITEMS ?? join(FM_DIR, "items.json"), "utf8"));
+  } catch {
+    return true; // unreadable tracker: keep the button rather than hide a needed control
+  }
+  return showMaintButton(false, st.running.length + st.queued.length, tracker);
+}
+
 async function maintAction(i: ChatInputCommandInteraction | ButtonInteraction, action: "pause" | "resume", reason: string): Promise<void> {
   await i.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
   const was = readMaintPause();
@@ -3721,6 +3795,24 @@ client.on(Events.ShardResume, (id) => log(`shard ${id} resumed`));
 client.on(Events.Error, (e) => log(`client error: ${e.message}`));
 
 const secretDrops = new SecretDrops();
+// Owner 2026-11-01 (card drop-clears-card): a received or expired drop clears the cards that wait on it.
+async function clearDropCards(d: Drop, outcome: "received" | "expired"): Promise<void> {
+  if (!d.messageId) return;
+  try {
+    const { FM_AUTO: _auto, ...base } = process.env;
+    const env = { ...base, FM_BY: QUEUED_BY };
+    const cmds = dropCardCommands(parseCards(readFileSync(ITEMS_FILE, "utf8")), d.messageId, outcome);
+    for (const argv of cmds) await execFileAsync(FM_BIN, argv, { env, timeout: 10_000 }).catch((e: Error) => log(`secret-drop card: fm ${argv.slice(0, 2).join(" ")} failed: ${e.message.slice(0, 200)}`));
+    if (cmds.length) {
+      log(`secret-drop: ${outcome} "${d.name}" → cleared ${new Set(cmds.map((c) => c[1])).size} card(s)`);
+      needsYou?.schedule(1_000);
+    }
+  } catch (e) {
+    log(`secret-drop card update failed: ${(e as Error).message}`);
+  }
+}
+secretDrops.onExpired = (d) => void clearDropCards(d, "expired");
+setInterval(() => secretDrops.sweep(), 60_000).unref?.();
 /** Tailnet origin of the secret form (same host as the dashboard: tailnet-only HTTPS, not the Funnel port). */
 const SECRET_DROP_ORIGIN = (() => {
   try {
@@ -3749,7 +3841,7 @@ const server = startHttp({
   holdAlert: alertHeld,
   post: async (channelId, text, files = [], opts) => {
     if (!client.isReady()) throw new Error("gateway not ready");
-    if (!CHANNELS[channelId] && !ALERT_CHANNELS[channelId] && !mirrorChannel(channelId)) throw new Error("channel not sendable");
+    // Configured, alert, mirrored, or any raw id the guild check below accepts (job channels in stack categories).
     const ch = await privateChannel(channelId);
     if (!ch) throw new Error("channel not sendable");
     // Owner 2026-10-23: `replyTo` (the owner's request) makes the post and its menus Discord replies to it.
@@ -3814,6 +3906,7 @@ const server = startHttp({
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(`Open the secret form (${mins} min)`).setEmoji("🔐").setURL(url));
     // Owner 2026-10-23: the value never goes through Discord; this message holds only the one-time link.
     const m = own(await ch.send({ content: `🔐 **Secret needed: ${d.name}.** Tap the button and paste it there (tailnet only, works once). It is saved on the main host as a 0600 file; do not paste it in Discord.`, components: [row], ...NO_PINGS }));
+    secretDrops.setMessage(d.id, m.id);
     ownerNtfy(`secret:${d.id}`, "authentication", `Secret needed: ${d.name}`, m.url, { log });
     log(`secret-drop: link for "${d.name}" → ${d.dest} (expires in ${mins} min)`);
     return { id: d.id, url, expiresAt: d.expiresAt, message: m.url };
@@ -3889,6 +3982,7 @@ try {
     drops: secretDrops,
     log,
     onReceived: (d) => {
+      void clearDropCards(d, "received");
       if (!d.channelId) return;
       void privateChannel(d.channelId)
         .then(async (ch) => void (await ch?.send({ content: `🔐 Received **${d.name}** (${d.chars} characters). Saved on the main host (0600).`, ...QUIET })))
@@ -3934,3 +4028,14 @@ if (!OWNER_ID || !GUILD_ID || Object.keys(CHANNELS).length === 0) {
   process.exit(1);
 }
 await client.login(loadToken());
+
+/** Owner 2026-11-03 (card context-meter): "· ctx 83%" after the model in the reply footer. */
+function withCtx(model: string | undefined, file?: string): string | undefined {
+  return model && file ? model + ctxSuffix(ctxOfFile(file)) : model;
+}
+let ctxCache = { at: 0, text: "" };
+function boardCtxCached(): string {
+  // An empty result (windows still loading) is not cached, so the next render tries again.
+  if (!ctxCache.text || Date.now() - ctxCache.at > 60_000) ctxCache = { at: Date.now(), text: boardCtxLines(dirname(sessionDir("firstmate"))) };
+  return ctxCache.text;
+}

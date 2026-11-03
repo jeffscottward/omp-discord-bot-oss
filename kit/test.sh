@@ -15,6 +15,11 @@ SCRATCH=$(mktemp -d /tmp/omp-kit-test.XXXXXX)
 SRV_PID=""
 cleanup() { [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null; rm -rf "$SCRATCH"; }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+# Card test-tmp-leak (2026-11-01): the tests' temp files (Chrome profiles, Chrome's own temp files) go into the
+# scratch folder, which is removed at exit. Before, every run left them in /tmp.
+export TMPDIR="$SCRATCH"
 
 # Browser test settings from the user's kit.env (only these two keys; nothing else is read from it).
 USER_ENV="${OMP_KIT_ENV:-$HOME/.config/omp-discord/kit.env}"
@@ -82,6 +87,10 @@ t "fm needs" sh -c "python3 '$KIT/bin/fm' needs | grep -q needs-your-step"
 t "fm set" sh -c "FM_BY=kit-test python3 '$KIT/bin/fm' set plain-progress done 'smoke test' && python3 '$KIT/bin/fm' get plain-progress | grep -q '\"by\": \"kit-test\"'"
 mkdir -p "$SCRATCH/fakegh"; printf '#!/bin/sh\necho "{\\"state\\":\\"MERGED\\",\\"mergedAt\\":\\"t\\",\\"mergeCommit\\":{\\"oid\\":\\"abcdef1\\"}}"\n' > "$SCRATCH/fakegh/gh"; chmod +x "$SCRATCH/fakegh/gh"
 t "fm-prwatch --dry-run" sh -c "python3 '$KIT/bin/fm' field pick-theme l https://github.com/o/r/pull/1 >/dev/null && PATH='$SCRATCH/fakegh':\$PATH python3 '$KIT/bin/fm-prwatch' --dry-run | grep -q 'merged abcdef1'"
+mkdir -p "$SCRATCH/fakegh2"; printf '#!/bin/sh\necho "{\\"state\\":\\"MERGED\\",\\"mergedAt\\":\\"2026-01-01T00:00:00Z\\",\\"mergeCommit\\":{\\"oid\\":\\"abcdef1\\"}}"\n' > "$SCRATCH/fakegh2/gh"; chmod +x "$SCRATCH/fakegh2/gh"
+t "fm-prwatch keeps a card with a blocked receipt after merge" sh -c "FM_BY=kit-test python3 '$KIT/bin/fm' set plain-progress partial 'receipt test' >/dev/null && python3 '$KIT/bin/fm' field plain-progress l https://github.com/o/r/pull/2 >/dev/null && echo '{\"card\":\"plain-progress\",\"result\":\"blocked\",\"tsMs\":1893456000000}' > '$FM/receipts/plain-progress.json' && PATH='$SCRATCH/fakegh2':\$PATH python3 '$KIT/bin/fm-prwatch' --dry-run > '$SCRATCH/prw.out'; rm -f '$FM/receipts/plain-progress.json'; grep -q 'plain-progress: receipt blocked after merge' '$SCRATCH/prw.out'"
+t "fm-prwatch closes when the blocked receipt is older than the merge" sh -c "echo '{\"card\":\"plain-progress\",\"result\":\"blocked\",\"tsMs\":1700000000000}' > '$FM/receipts/plain-progress.json' && PATH='$SCRATCH/fakegh2':\$PATH python3 '$KIT/bin/fm-prwatch' --dry-run > '$SCRATCH/prw.out'; rm -f '$FM/receipts/plain-progress.json'; grep -q 'plain-progress: partial -> done' '$SCRATCH/prw.out'"
+t "fm-prwatch keeps a blocked card (owner step left)" sh -c "python3 '$KIT/bin/fm' field needs-your-step l https://github.com/o/r/pull/3 >/dev/null && PATH='$SCRATCH/fakegh2':\$PATH python3 '$KIT/bin/fm-prwatch' --dry-run | grep -q 'needs-your-step: blocked card (owner step left)'"
 t "fm receipt" sh -c "python3 '$KIT/bin/fm' receipt nightly-build done 'smoke' --evidence test && test -s '$FM/receipts/nightly-build.json'"
 t "fm refuses a non-Discord q" sh -c "! python3 '$KIT/bin/fm' q pick-theme https://example.com/x 2>/dev/null"
 t "build-index.py" sh -c "python3 '$KIT/dashboard/build-index.py' && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d[\"reports\"], list)' '$FM/reports.json'"

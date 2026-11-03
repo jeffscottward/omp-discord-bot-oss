@@ -33,6 +33,8 @@ export interface Drop {
   receivedAt?: number;
   /** Channel to tell when the value arrived (no value, only the length). */
   channelId?: string;
+  /** Discord message id of the posted form link (cards point their q at it). */
+  messageId?: string;
 }
 
 /** Status view (no secret, ever). */
@@ -97,6 +99,8 @@ export function writeSecretFile(dest: string, value: string, overwrite: boolean)
 
 export class SecretDrops {
   private drops = new Map<string, Drop>();
+  /** Called once when a waiting drop expires (lazy on any access, or via sweep()). */
+  onExpired?: (d: Drop) => void;
   constructor(private home = homedir()) {}
 
   create(o: { name: string; dest: string; overwrite?: boolean; ttlMs?: number; channelId?: string }, now = Date.now()): Drop | { error: string } {
@@ -157,11 +161,28 @@ export class SecretDrops {
     return { chars: v.length, drop: d };
   }
 
-  private prune(now: number): void {
+  /** Record the Discord message that holds the form link. */
+  setMessage(id: string, messageId: string): void {
+    const d = this.drops.get(id);
+    if (d) d.messageId = messageId;
+  }
+
+  /** Expire due drops; returns the drops that changed to "expired" in this call. */
+  sweep(now = Date.now()): Drop[] {
+    return this.prune(now);
+  }
+
+  private prune(now: number): Drop[] {
+    const expired: Drop[] = [];
     for (const [k, d] of this.drops) {
-      if (d.state === "waiting" && now > d.expiresAt) d.state = "expired";
+      if (d.state === "waiting" && now > d.expiresAt) {
+        d.state = "expired";
+        expired.push(d);
+        this.onExpired?.(d);
+      }
       if (now - d.expiresAt > 24 * 60 * 60_000) this.drops.delete(k);
     }
+    return expired;
   }
 }
 

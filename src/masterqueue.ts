@@ -16,12 +16,13 @@ import { channelMention, safeTitle } from "./mention.ts";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { actionBlock, actionSteps, isFinanceCard, itemLink, linkLabel, loadOpenMenus, needsYouEntries, type BoardChannel, type BoardMsg, type FmItem, type MenuRow, type MenuSource } from "./needsyou.ts";
+import { edges, openRefs } from "./blockers.ts";
 
 export const MASTER_HEAD = "📋 **Master queue**";
-export const isMasterBoard = (text: string): boolean => text.startsWith(MASTER_HEAD) || text.startsWith(`━━━━━━━━━━━━━━━━━━━━\n${MASTER_HEAD}`);
+export const isMasterBoard = (text: string): boolean => text.startsWith(MASTER_HEAD) || text.startsWith("\u2063") || text.startsWith(`━━━━━━━━━━━━━━━━━━━━\n${MASTER_HEAD}`);
 export const KEEP_FINISHED_MS = 12 * 3_600_000; // owner 2026-10-24: finished jobs older than 12 h are not listed
 
-export type RowState = "queued" | "running" | "done" | "failed" | "stopped" | "blocked" | "bot" | "needs";
+export type RowState = "queued" | "running" | "done" | "failed" | "stopped" | "blocked" | "check" | "bot" | "needs";
 export type Row = {
   key: string;
   /** Needs-you rows: the owner's action steps (owner 2026-10-25, needs-you-action-gate). */
@@ -39,6 +40,8 @@ export type Row = {
   stack?: string;
   /** Discord thread/channel of that stack (shown as a channel link). */
   stackChannel?: string;
+  /** Blocked/check rows: link to the worker receipt with the full reason (card mq-blocked-reason-full). */
+  why?: string;
 };
 
 /** Where a card's job runs, in plain words (owner 2026-10-23: no raw Herdr ids like "wB:pMC"). */
@@ -123,8 +126,27 @@ export type LiveJob = { id: number; title: string; channelId: string; link?: str
 /** A finished bot job, saved for 12 h. */
 export type DoneJob = { id: number; title: string; channelId: string; link?: string; state: "done" | "failed" | "stopped"; at: number; stack?: string };
 
-export type FmCard = { id: string; action?: string; t?: string; area?: string; s?: string; q?: string; src?: string; job?: string | string[]; cts?: number | string; stack?: string; blockedBy?: string | string[]; ext?: string; queued?: unknown };
-export type Receipt = { card?: string; result?: string; tsMs?: number | string };
+export type FmCard = { id: string; action?: string; t?: string; area?: string; s?: string; q?: string; src?: string; job?: string | string[]; cts?: number | string; stack?: string; blockedBy?: string | string[]; blocks?: string | string[]; ext?: string; until?: string; queued?: unknown };
+export type Receipt = { card?: string; result?: string; tsMs?: number | string; summary?: string; /** File name under receipts/ (set by readReceipts). */ file?: string };
+
+/** A receipt summary on one board line: links become 🔗 (the board cuts long lines), whitespace collapses. */
+function receiptReason(summary: unknown): string {
+  return String(summary ?? "").replace(/<?https?:\/\/[^\s,;)>]+>?/g, "🔗").replace(/\s+/g, " ").trim() || "blocked";
+}
+
+/** First sentence of a reason: up to the first ". ", "! " or "? " (a dot inside "1.3" or "a.b" does not end it). */
+export function firstSentence(s: string): string {
+  const m = /^.*?[.!?](?=\s|$)/.exec(s.trim());
+  return (m ? m[0].replace(/\.$/, "") : s).trim();
+}
+
+/** Text cut to max chars at a word boundary, with "…" (card mq-blocked-reason-full: no cut-off words). */
+export function cutWords(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const head = s.slice(0, max - 1);
+  const sp = head.lastIndexOf(" ");
+  return `${(sp > max / 2 ? head.slice(0, sp) : head).replace(/[\s,;:(]+$/, "")}…`;
+}
 
 const DISCORD_MSG = /^https:\/\/discord\.com\/channels\/\d+\/\d+\/\d+$/;
 const num = (v: unknown) => (typeof v === "number" ? v : typeof v === "string" && /^\d+$/.test(v) ? Number(v) : 0);
@@ -159,41 +181,76 @@ export function needsRows(cards: FmCard[], now: number, dash: string, menus: Men
   });
 }
 
-/** Card rows: cards with a `job` field. Running/queued now, or finished (card done / receipt) in the last 12 h. */
+/**
+ * Card rows: cards with a `job` field. Running/queued now, or finished (card done / receipt) in the last 12 h.
+ * Owner 2026-11-01 (card fm-job-cap-ci-wait): a blocked receipt unlinks the job (fm-autoclear R11); the card still gets
+ * a ⛔ row for 12 h, and its place line shows the worker's reason ("waiting on CI: PR #N ...").
+ * Card mq-blocked-reason-full: the reason is its first sentence (≤ 100 chars, cut at a word) plus a "why" link to the
+ * worker receipt (full text). A card blocked by other cards (blockedBy) shows "waits for <title> (<state>)";
+ * when every blocker card is done, the row is 🔧 "blocker done; needs a check" (fm-autoclear R15 flags the card too).
+ */
 export function cardRows(cards: FmCard[], receipts: Map<string, Receipt>, now: number, dash: string, res?: Resolvers): Row[] {
   const rows: Row[] = [];
+  const byId = new Map(cards.map((c) => [c.id, c]));
+  // Blockers resolve like the dashboard and fm-audit (src/blockers.ts): id or title, reverse `blocks` edges, a
+  // passed time gate counts as cleared.
+  const items = asItems(cards);
+  const itemById = new Map(items.map((i) => [i.id, i]));
+  const blockEdges = edges(items);
   // Owner 2026-10-24 ("are these not the same thing?"): cards that share one job session show it once.
   const sessionOwner = new Map<string, string>();
   for (const c of cards) {
-    if (!c.job || !c.id) continue;
+    if (!c.id) continue;
+    const r = receipts.get(c.id);
+    const rAt = num(r?.tsMs);
+    // partial only: fm-spawn's queue sets a re-queued card to planned, and an old reason must not show there.
+    const blocked = c.s === "partial" && r?.result === "blocked" && now - rAt < KEEP_FINISHED_MS;
+    if (!c.job && !blocked) continue;
+    const job = c.job ?? "";
     const finance = isFinanceCard(c);
     // Finance cards: subject, or the id when the title carries money, sizes or account data (owner 2026-10-30).
     const title = finance ? safeSubject(c.t, c.id) : (c.t ?? c.id);
-    const first0 = String(Array.isArray(c.job) ? (c.job[0] ?? "") : c.job).trim();
+    const first0 = String(Array.isArray(job) ? (job[0] ?? "") : job).trim();
     const place = res?.job?.(first0);
     const session = place?.session; // only live Herdr sessions are grouped
     // Only cards that get a job row may own or share a session (blocked/waiting cards are not listed here).
     const listed = c.s === "running" || c.s === "partial" || c.s === "planned";
+    // Owner 2026-11-02: rows that share a session show the same place link as the first row, not "same session as …".
     const sharedWith = session && listed ? sessionOwner.get(session) : undefined;
-    if (session && listed && !sharedWith) sessionOwner.set(session, title);
-    const shortOf = (t: string) => (t.length > TITLE_MAX ? `${t.slice(0, TITLE_MAX - 1).trimEnd()}…` : t);
-    const where = sharedWith ? `same session as ${shortOf(linkLabel(sharedWith))}` : jobPlace(c.job, res);
-    const base = { key: `card:${c.id}`, title, link: cardLink(c, dash), where, ...stackOf(cardStack(c, res), res) };
+    if (session && listed && !sharedWith) sessionOwner.set(session, jobPlace(job, res));
+    const blockers = blockEdges.get(c.id) ?? [];
+    const open = openRefs(itemById.get(c.id) ?? { id: c.id }, itemById, now, blockEdges);
+    const cleared = blocked && blockers.length > 0 && !open.length;
+    const waitsFor = open.slice(0, 2).map((id) => {
+      const b = byId.get(id);
+      const t = !b ? id : isFinanceCard(b) ? safeSubject(b.t, b.id) : linkLabel(safeTitle(b.t ?? b.id, b.id, b.id)); // no markdown or pings from titles
+      return `${cutWords(t, 40)} (${b?.s ?? "not a card"})`;
+    });
+    const reason = firstSentence(receiptReason(r?.summary));
+    const where = !blocked
+      ? (sharedWith ?? jobPlace(job, res))
+      : cleared
+        ? "🔧 blocker done; needs a check"
+        : open.length
+          ? `⛔ waits for ${waitsFor.join(", ")}${open.length > 2 ? ` +${open.length - 2} more` : ""}`
+          : `⛔ ${finance ? safeSubject(reason, "blocked") : reason}`;
+    // The why link opens the receipt itself (receipts/<card>.json, served next to the dashboard): the card note may have
+    // changed since, and the receipt holds the exact text that the row cuts (live check 2026-11-03).
+    const why = blocked && dash ? { why: `${dash}receipts/${encodeURIComponent(r?.file ?? `${c.id}.json`)}` } : {};
+    const base = { key: `card:${c.id}`, title, link: cardLink(c, dash), where, ...why, ...stackOf(cardStack(c, res), res) };
     // Owner 2026-10-24: background services and scheduled jobs are not queue jobs; they get their own section.
-    const first = String(Array.isArray(c.job) ? (c.job[0] ?? "") : c.job);
+    const first = String(Array.isArray(job) ? (job[0] ?? "") : job);
     if (/\.(service|timer)$/.test(first) || first.startsWith("remote:")) {
       // Title = the bot's own name; the card it belongs to goes on the second line.
       const bot = first.replace(/^remote:/, "remote host ").replace(/\.(service|timer)$/, "");
       if (c.s !== "done") rows.push({ ...base, title: bot, where: `card: ${title}`, state: "bot", at: num(c.cts) || now });
       continue;
     }
-    const r = receipts.get(c.id);
-    const rAt = num(r?.tsMs);
     const cAt = num(c.cts);
     if (c.s === "running") rows.push({ ...base, state: "running", at: cAt || now });
     else if (c.s === "partial" || c.s === "planned") {
       if (r?.result === "failed" && now - rAt < KEEP_FINISHED_MS) rows.push({ ...base, state: "failed", at: rAt });
-      else if (r?.result === "blocked" && now - rAt < KEEP_FINISHED_MS) rows.push({ ...base, state: "blocked", at: rAt });
+      else if (blocked) rows.push({ ...base, state: cleared ? "check" : "blocked", at: rAt });
       else rows.push({ ...base, state: "queued", at: cAt || now });
     } else if (c.s === "done") {
       const at = rAt || cAt;
@@ -228,9 +285,9 @@ export function age(ms: number): string {
   return h < 48 ? `${h}h ${m % 60}m` : `${Math.round(h / 24)}d`;
 }
 
-const ICON: Record<RowState, string> = { queued: "⏳", running: "⚙️", done: "✅", failed: "❌", stopped: "🛑", blocked: "⛔", bot: "🤖", needs: "✍️" };
+const ICON: Record<RowState, string> = { queued: "⏳", running: "⚙️", done: "✅", failed: "❌", stopped: "🛑", blocked: "⛔", check: "🔧", bot: "🤖", needs: "✍️" };
 export const TITLE_MAX = 26;
-const FINISHED: Partial<Record<RowState, true>> = { done: true, failed: true, stopped: true, blocked: true };
+const FINISHED: Partial<Record<RowState, true>> = { done: true, failed: true, stopped: true, blocked: true, check: true };
 
 export function rowLine(r: Row, now: number, n?: number, gear = "⚙️"): string {
   const label = linkLabel(safeTitle(r.title, r.key.replace(/^[a-z]+:/, ""), r.key));
@@ -241,7 +298,9 @@ export function rowLine(r: Row, now: number, n?: number, gear = "⚙️"): strin
   const title = r.link ? `[${short}](<${r.link}>)` : short;
   const when = r.state === "bot" ? `on ${age(now - r.at)}` : FINISHED[r.state] ? `<t:${Math.floor(r.at / 1000)}:t>` : r.state === "running" ? age(now - r.at) : `⏳ ${age(now - r.at)}`; // owner 2026-10-24: emoji instead of the word "waiting"
   // Owner 2026-10-23: details on their own indented line, in plain words, with channel links.
-  const where = r.where.length > 60 ? `${r.where.slice(0, 59)}…` : r.where;
+  // A blocked row carries the worker's reason (card fm-job-cap-ci-wait), cut at a word, plus a "why" link to the full
+  // receipt text (card mq-blocked-reason-full).
+  const where = r.state === "blocked" || r.state === "check" ? cutWords(r.where, 100) + (r.why ? ` · [why](<${r.why}>)` : "") : r.where.length > 60 ? `${r.where.slice(0, 59)}…` : r.where;
   // Owner 2026-10-24: a job running in its own stack thread shows that thread once, not twice.
   // Owner 2026-10-24: show a stack only as a link to a DIFFERENT channel; plain-text stack names duplicate the channel link.
   const stackRef = r.stackChannel ? channelMention(r.stackChannel, "") : "";
@@ -265,10 +324,11 @@ export function botCounts(file = join(process.env.HOME ?? "", "Documents/reports
     return null;
   }
 }
-export const MASTER_CONT = `${MASTER_HEAD} (continued)`;
+// Owner 2026-11-03: no "(continued)" title on later pages; an invisible mark (U+2063) still lets the bot find its own pages.
+export const MASTER_CONT = "\u2063";
 /**
  * Board pages (each ≤ limit chars). Owner 2026-10-24: every row is shown, no "+N more"; a long board continues in
- * more messages. Sections: Running, Queued, Finished (12 h), then 🤖 Bots and scheduled jobs.
+ * more messages. Sections: Running, Queued, Blocked (receipt reason), Finished (12 h), then 🤖 Bots and scheduled jobs.
  */
 export function renderMasterPages(rows: Row[], now: number, dash: string, limit = 1900, gear = "⚙️", notice = ""): string[] {
   const head = `${RULE}\n${MASTER_HEAD} · updated <t:${Math.floor(now / 1000)}:R>`;
@@ -276,7 +336,12 @@ export function renderMasterPages(rows: Row[], now: number, dash: string, limit 
   if (!rows.length) return [[head, notice, SUB, "✅ No jobs queued, running or finished in the last 12 h.", foot, RULE].filter(Boolean).join("\n")];
   const running = rows.filter((r) => r.state === "running").sort((a, b) => a.at - b.at);
   const queued = rows.filter((r) => r.state === "queued").sort((a, b) => a.at - b.at);
-  const finished = rows.filter((r) => FINISHED[r.state]).sort((a, b) => b.at - a.at);
+  // Owner 2026-11-01 (card fm-job-cap-ci-wait): blocked jobs (e.g. "waiting on CI: PR #N ...") wait, they are not
+  // finished; they get their own section so the reason line shows on the board.
+  const blocked = rows.filter((r) => r.state === "blocked").sort((a, b) => a.at - b.at);
+  // Card mq-blocked-reason-full: blocked rows whose blocker cards are all done wait for a check, not for the blocker.
+  const check = rows.filter((r) => r.state === "check").sort((a, b) => a.at - b.at);
+  const finished = rows.filter((r) => FINISHED[r.state] && r.state !== "blocked" && r.state !== "check").sort((a, b) => b.at - a.at);
   const bots = rows.filter((r) => r.state === "bot").sort((a, b) => a.title.localeCompare(b.title));
   // Board notice (owner alert pause, src/alertpause.ts) right below the head.
   const lines: string[] = notice ? [notice] : [];
@@ -285,6 +350,8 @@ export function renderMasterPages(rows: Row[], now: number, dash: string, limit 
   section(`✍️ **Needs you** (${needs.length})`, needs.map((r) => rowLine(r, now)));
   section(`${gear} **Running** (${running.length})`, running.map((r) => rowLine(r, now, undefined, gear)));
   section(`⏳ **Queued** (${queued.length})`, queued.map((r, i) => rowLine(r, now, i + 1)));
+  section(`⛔ **Blocked** (${blocked.length})`, blocked.map((r) => rowLine(r, now)));
+  section(`🔧 **Blocker done, needs a check** (${check.length})`, check.map((r) => rowLine(r, now)));
   // Owner 2026-10-24: finished jobs are one count line with a dashboard link (they made a 4-message board).
   const failed = finished.filter((r) => r.state !== "done").length;
   lines.push("\u200b", `🏁 **Finished, last 12 h:** ${finished.length}${failed ? ` (⚠️ ${failed} failed or stopped)` : ""}${dash ? ` → [list](<${dash}?tab=done>)` : ""}`);
@@ -339,7 +406,7 @@ export function readReceipts(dir: string): Map<string, Receipt> {
       const key = r.card ?? f.slice(0, -5);
       // Two files can name one card: keep the newest (readdir order is arbitrary).
       const had = out.get(key);
-      if (!had || num(r.tsMs) >= num(had.tsMs)) out.set(key, r);
+      if (!had || num(r.tsMs) >= num(had.tsMs)) out.set(key, { ...r, file: f }); // the why link opens this file
     } catch {}
   }
   return out;

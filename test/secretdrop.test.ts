@@ -1,10 +1,11 @@
 // Owner 2026-10-23 (Discord UX item 2): one-time tailnet secret form; value only in a 0600 file.
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { destDenied, SecretDrops, startSecretDropServer, writeSecretFile } from "../src/secretdrop.ts";
 
-const home = mkdtempSync("/tmp/sdrop-");
+const home = mkdtempSync(join(tmpdir(), "sdrop-"));
 mkdirSync(join(home, ".config", "tahoma"), { recursive: true });
 mkdirSync(join(home, ".ssh"));
 mkdirSync(join(home, "elsewhere"));

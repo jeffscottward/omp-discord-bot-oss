@@ -365,3 +365,12 @@ decision, and record the new date.
 
 - Stacks are not a fixed set (owner 2026-10-24): add one with `bun scripts/stack-add.ts --name <slug> --emoji <e> --title <t> --keywords "a,b" [--areas ...]` (writes the stack catalog `~/.config/omp-discord/stacks.json`; the bot re-reads it within 10 s, no restart). Create a new stack whenever a new domain of work appears; its thread is made on the first routed message. 🎮 fun covers games, modding, recomps, emulators and 3D models.
 - Every request goes to a stack (owner 2026-10-28, card stack-catalog): ONE catalog file (`src/stackcatalog.ts`, 19 stacks from a judge_batch scan of the owner's requests) is read by the router and fm-spawn. fm-spawn `--stack` takes any name and adds an unknown one; a card area with no stack makes a new stack. A job whose pane gets no channel within 2 min is posted in its stack thread with a ❌ Stop button (Esc into the pane, `src/panestop.ts`) and FIRSTMATE gets an alert; mirrored pane status messages carry the same Stop. When every main pane category is full, the mirror creates the next "🖥️ Main N" category with the same overwrites and saves it in `mirror.overflow`.
+
+## Sync 2026-11-03
+- Rate errors retry by themselves after a growing cool-down; 🔁 Force retry retries at once.
+- ⏸️ Pause all shows only while work runs; ▶️ Resume all shows while paused. Stopped runs get a ▶️ Resume button.
+- New overflow categories post one alert: mute the category once, then its future channels stay quiet.
+- When no channel can be created, a pane gets a thread with ❌ Stop in its stack channel.
+- The master queue is its own silent message. Later pages have no "(continued)" title.
+- A stack hands off a message from another domain to the correct stack. Follow-ups go to the existing job channel.
+- Archive only near the category limit: at 40 or more of 50 channels, oldest closed channels first, down to 39.

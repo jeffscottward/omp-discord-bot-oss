@@ -2,6 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { channelMention, mentionable, safeTitle, setMentionCheck } from "../src/mention.ts";
 import { botRows, cardRows, renderMasterPages, rowLine } from "../src/masterqueue.ts";
 import { StackRouter } from "../src/stackroute.ts";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const LIVE = "100000000000000023";
 const DEAD = "100000000000000049";
@@ -39,7 +41,7 @@ test("Master queue with a dead stack thread and dead job channel: no unknown men
 test("StackRouter.pruneGone drops gone thread ids only", async () => {
   const r = Object.create(StackRouter.prototype) as any;
   r.st = { threads: { finance: DEAD, kb: LIVE, net: "100000000000000044" }, msgs: {} };
-  r.live = new Map(); r.tracker = { threads: {} }; r.opts = { stateFile: "/tmp/nu-router-test.json" };
+  r.live = new Map(); r.tracker = { threads: {} }; r.opts = { stateFile: join(tmpdir(), "nu-router-test.json") };
   const dropped = await r.pruneGone(async (id: string) => {
     if (id === DEAD) throw Object.assign(new Error("Unknown Channel"), { code: 10003 });
     if (id === "100000000000000044") throw Object.assign(new Error("502"), { code: 0 });

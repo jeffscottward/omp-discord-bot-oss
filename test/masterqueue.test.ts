@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NeedsYouBoard, type BoardChannel, type BoardMsg } from "../src/needsyou.ts";
-import { botRows, cardRows, herdrPlace, jobPlace, needsRows, parseHerdrPanes, parseHerdrTabs, isMasterBoard, renderMasterPages, KEEP_FINISHED_MS, MasterQueueBoard, renderMaster, rowLine, type FmCard, type LiveJob, type Receipt } from "../src/masterqueue.ts";
+import { botRows, cardRows, cutWords, firstSentence, herdrPlace, jobPlace, needsRows, parseHerdrPanes, parseHerdrTabs, isMasterBoard, renderMasterPages, KEEP_FINISHED_MS, MasterQueueBoard, renderMaster, rowLine, type FmCard, type LiveJob, type Receipt } from "../src/masterqueue.ts";
 import { JobQueue } from "../src/queue.ts";
 
 const DASH = "https://dash.example/reports/firstmate/";
@@ -32,6 +32,118 @@ describe("rows", () => {
     expect(by["card:f1"]).toMatchObject({ state: "failed", at: NOW - 1800_000 });
     expect(by["card:nojob"]).toBeUndefined();
     expect(by["card:tr"]?.title).toBe("tr");
+  });
+
+  test("blocked receipt (card fm-job-cap-ci-wait): the card keeps a ⛔ row with the worker's reason after the job is unlinked", () => {
+    const why = "waiting on CI: PR #212, run https://github.com/o/r/actions/runs/1, 40 jobs queued ahead since 14:05Z";
+    const cards: FmCard[] = [
+      { id: "b1", t: "Webapp fix", s: "partial", cts: NOW - 60_000 },
+      { id: "b2", t: "Old block", s: "partial", cts: NOW - 60_000 },
+      { id: "tr", t: "Sell 100 XYZ", area: "finance", s: "partial" },
+      { id: "p1", t: "Plain partial", s: "partial" },
+      { id: "tc", t: "Webapp CI", area: "finance", s: "partial" },
+      { id: "pl", t: "Re-queued by fm-spawn", s: "planned", job: "wB:p9" },
+    ];
+    const receipts = new Map<string, Receipt>([
+      ["b1", { card: "b1", result: "blocked", tsMs: NOW - 600_000, summary: why }],
+      ["b2", { card: "b2", result: "blocked", tsMs: NOW - KEEP_FINISHED_MS - 1, summary: why }],
+      ["tr", { card: "tr", result: "blocked", tsMs: NOW - 600_000, summary: "sell 100 at $5" }],
+      ["tc", { card: "tc", result: "blocked", tsMs: NOW - 600_000, summary: "waiting on CI: PR #7" }],
+      ["pl", { card: "pl", result: "blocked", tsMs: NOW - 600_000, summary: why }],
+    ]);
+    const by = Object.fromEntries(cardRows(cards, receipts, NOW, DASH).map((r) => [r.key, r]));
+    expect(by["card:b1"]).toMatchObject({ state: "blocked", where: "⛔ waiting on CI: PR #212, run 🔗, 40 jobs queued ahead since 14:05Z", at: NOW - 600_000 });
+    expect(by["card:b2"]).toBeUndefined();
+    expect(by["card:tr"]?.where).toBe("⛔ blocked");
+    expect(by["card:p1"]).toBeUndefined();
+    expect(by["card:tc"]?.where).toBe("⛔ waiting on CI: PR #7");
+    expect(by["card:pl"]?.state).toBe("queued");
+    const line = rowLine(by["card:b1"]!, NOW);
+    expect(line).toContain("⛔ waiting on CI: PR #212, run 🔗, 40 jobs queued ahead since 14:05Z");
+  });
+
+  test("blocked rows get their own section with the reason line; they are not counted as finished (card fm-job-cap-ci-wait)", () => {
+    const pages = renderMasterPages([
+      { key: "card:b1", title: "Webapp fix", where: "⛔ waiting on CI: PR #212, run 🔗, 40 jobs queued ahead since 14:05Z", state: "blocked", at: NOW - 600_000 },
+      { key: "card:d1", title: "Done work", where: "💻", state: "done", at: NOW - 60_000 },
+    ], NOW, DASH);
+    const text = pages.join("\n");
+    expect(text).toContain("⛔ **Blocked** (1)");
+    expect(text).toContain("⛔ waiting on CI: PR #212, run 🔗, 40 jobs queued ahead since 14:05Z");
+    expect(text).toContain("🏁 **Finished, last 12 h:** 1 →");
+  });
+
+  test("blocked reason (card mq-blocked-reason-full): first sentence, ≤ 100 chars cut at a word, plus a why link to the receipt", () => {
+    const long = "Local fix ready in worktree webapp-research-wt-dep63 (vinext 1.3 drops next/router from optimizer include; doctor pins synced and the lockfile matches). Commit is blocked because biome fails.";
+    const cards: FmCard[] = [
+      { id: "s1", t: "Short reason", s: "partial" },
+      { id: "l1", t: "Long reason", s: "partial" },
+    ];
+    const receipts = new Map<string, Receipt>([
+      ["s1", { card: "s1", result: "blocked", tsMs: NOW - 600_000, summary: "Fix pushed (ca2e1f41). CI run 4153 still waits on queued shards." }],
+      ["l1", { card: "l1", result: "blocked", tsMs: NOW - 600_000, summary: long }],
+    ]);
+    const by = Object.fromEntries(cardRows(cards, receipts, NOW, DASH).map((r) => [r.key, r]));
+    expect(by["card:s1"]).toMatchObject({ state: "blocked", where: "⛔ Fix pushed (ca2e1f41)", why: `${DASH}receipts/s1.json` });
+    const line = rowLine(by["card:l1"]!, NOW);
+    const detail = line.split("\n")[1]!;
+    // The reason is cut at a word (no half word before "…") and the full text is one tap away.
+    expect(detail).toContain("⛔ Local fix ready in worktree webapp-research-wt-dep63 (vinext 1.3 drops next/router from…");
+    expect(detail).toEndWith(` · [why](<${DASH}receipts/l1.json>)`);
+    expect(detail).not.toContain("Commit is blocked");
+    // No dashboard URL: no why link, the row still renders.
+    expect(cardRows(cards, receipts, NOW, "").find((r) => r.key === "card:s1")?.why).toBeUndefined();
+    // The why link opens the file the reason came from (its name may differ from the card id).
+    const odd = cardRows([{ id: "a b", t: "x", s: "partial" }], new Map([["a b", { card: "a b", result: "blocked", tsMs: NOW - 1, summary: "y", file: "old name.json" }]]), NOW, DASH)[0];
+    expect(odd?.why).toBe(`${DASH}receipts/old%20name.json`);
+    expect(firstSentence("vinext 1.3 drops next/router. Then more.")).toBe("vinext 1.3 drops next/router");
+    expect(cutWords("aaa bbb ccc", 8)).toBe("aaa bbb…");
+    expect(cutWords("short", 100)).toBe("short");
+  });
+
+  test("blockedBy (card mq-blocked-reason-full): 'waits for <blocker title> (<state>)' instead of the receipt text", () => {
+    const cards: FmCard[] = [
+      { id: "dep", t: "Stock page quant data", s: "partial", blockedBy: ["ci-prio"] },
+      { id: "dep2", t: "Two blockers", s: "partial", blockedBy: ["ci-prio", "gone-card", "Finished blocker"] },
+      // A reverse `blocks` edge counts too (same resolver as the dashboard and fm-audit).
+      { id: "dep3", t: "Blocked via blocks", s: "partial" },
+      { id: "rev", t: "Reverse blocker", s: "running", blocks: "dep3" },
+      { id: "ci-prio", t: "Webapp CI: deploys/live line first; cap Dependabot", s: "running" },
+      { id: "done-card", t: "Finished blocker", s: "done" },
+    ];
+    const receipts = new Map<string, Receipt>([
+      ["dep", { card: "dep", result: "blocked", tsMs: NOW - 600_000, summary: "waiting on CI: PR #158, run https://x/1, 1 run ahead." }],
+      ["dep2", { card: "dep2", result: "blocked", tsMs: NOW - 600_000, summary: "blocked." }],
+      ["dep3", { card: "dep3", result: "blocked", tsMs: NOW - 600_000, summary: "blocked." }],
+    ]);
+    const by = Object.fromEntries(cardRows(cards, receipts, NOW, DASH).map((r) => [r.key, r]));
+    expect(by["card:dep"]).toMatchObject({ state: "blocked", where: "⛔ waits for Webapp CI: deploys/live line first… (running)", why: `${DASH}receipts/dep.json` });
+    // Only open blockers are named (a title ref to a done card is cleared); a name that is not a card is never done.
+    expect(by["card:dep2"]?.where).toBe("⛔ waits for Webapp CI: deploys/live line first… (running), gone-card (not a card)");
+    expect(by["card:dep3"]?.where).toBe("⛔ waits for Reverse blocker (running)");
+    // A blocker title cannot break the why link or ping anyone.
+    const md = cardRows([{ id: "d3", t: "x", s: "partial", blockedBy: "mdb" }, { id: "mdb", t: "Fix [link](x) for <@123>", s: "running" }], new Map([["d3", { card: "d3", result: "blocked", tsMs: NOW - 1, summary: "b" }]]), NOW, DASH)[0]!.where;
+    expect(md).not.toMatch(/[\[\]]|<@/);
+  });
+
+  test("blocker done (card mq-blocked-reason-full): a dependent whose blockers are all done is 🔧 'blocker done; needs a check'", () => {
+    const cards: FmCard[] = [
+      { id: "dep", t: "Overseer section live", s: "partial", blockedBy: ["perf", "perf2"] },
+      { id: "perf", t: "Dashboard perf", s: "done" },
+      { id: "perf2", t: "Dashboard perf 2", s: "done" },
+    ];
+    const receipts = new Map<string, Receipt>([["dep", { card: "dep", result: "blocked", tsMs: NOW - 600_000, summary: "Section only in commit 19d9c33." }]]);
+    const rows = cardRows(cards, receipts, NOW, DASH);
+    expect(rows).toEqual([expect.objectContaining({ key: "card:dep", state: "check", where: "🔧 blocker done; needs a check", why: `${DASH}receipts/dep.json` })]);
+    // A blocked receipt without blockers keeps its ⛔ reason (no blockers is not "blocker done").
+    const plain = cardRows([{ id: "p", t: "p", s: "partial" }], new Map([["p", { card: "p", result: "blocked", tsMs: NOW - 1, summary: "waiting on CI." }]]), NOW, DASH)[0];
+    expect(plain).toMatchObject({ state: "blocked", where: "⛔ waiting on CI" });
+    const text = renderMasterPages(rows, NOW, DASH).join("\n");
+    expect(text).toContain("🔧 **Blocker done, needs a check** (1)");
+    expect(text).not.toContain("⛔ **Blocked**");
+    expect(text).toContain(`🔧 blocker done; needs a check · [why](<${DASH}receipts/dep.json>)`);
+    // Not counted as finished.
+    expect(text).toContain("🏁 **Finished, last 12 h:** 0");
   });
 
   test("bot jobs: live first, finished kept 24 h, a live id wins over its saved finish", () => {
@@ -66,6 +178,7 @@ describe("rows", () => {
     const all = pages.join("\n");
     for (let i = 0; i < 80; i++) expect(all).toContain(`Job number ${i} with`);
     expect(all).not.toContain("more on the dashboard");
+    expect(all).not.toContain("(continued)"); // owner 2026-11-03
     expect(renderMaster([], NOW, DASH)).toContain("No jobs queued, running or finished");
   });
 });
@@ -252,17 +365,18 @@ describe("plain-English job place (owner 2026-10-23)", () => {
     expect(jobPlace("wB:pPV", res)).toBe("💻 📈 webapp-phases");
     expect(jobPlace("wB:pGONE", res)).toBe("💻 closed tab");
   });
-  test("two cards on one live pane: second row says 'same session as' (owner 2026-10-24)", () => {
+  test("cards on one live pane: every row shows the first row's channel link (owner 2026-11-02)", () => {
     const panes = [{ pane_id: "wB:pPV", tab_id: "wB:tBP" }];
     const tabs = [{ tab_id: "wB:tBP", label: "📈 webapp-phases" }];
     const res = { job: (j: string) => herdrPlace(j, panes, tabs) };
     const rows = cardRows([
       { id: "webapp-phases", t: "Webapp phases", job: "wB:pPV", s: "running" },
       { id: "master-rules-webapp", t: "Master rules in Webapp", job: "📈 webapp-phases", s: "running" },
+      { id: "third", t: "Third on same pane", job: "wB:pPV", s: "running" },
       { id: "other", t: "Other", job: "wB:pGONE", s: "running" },
       { id: "other2", t: "Other 2", job: "wB:pGONE", s: "running" },
     ], new Map(), NOW, DASH, res);
-    expect(rows.map((r) => r.where)).toEqual(["💻 📈 webapp-phases", "same session as Webapp phases", "💻 closed tab", "💻 closed tab"]);
+    expect(rows.map((r) => r.where)).toEqual(["💻 📈 webapp-phases", "💻 📈 webapp-phases", "💻 📈 webapp-phases", "💻 closed tab", "💻 closed tab"]);
     // A blocked card (no job row) listed first must not own the session (review finding).
     const rows2 = cardRows([
       { id: "b", t: "Blocked first", job: "wB:pPV", s: "blocked", action: "Do the step" },
@@ -270,7 +384,7 @@ describe("plain-English job place (owner 2026-10-23)", () => {
     ], new Map(), NOW, DASH, res);
     expect(rows2.map((r) => r.where)).toEqual(["💻 📈 webapp-phases"]);
     expect(jobPlace("wB:pX", { job: () => ({ session: "wB:pX" }) })).toBe("💻 terminal tab");
-    expect(rowLine(rows[1]!, NOW)).toContain("↳ same session as Webapp phases");
+    expect(rows.map((r) => rowLine(r, NOW)).join("\n")).not.toContain("same session as");
   });
 });
 
@@ -401,6 +515,8 @@ test("readReceipts: two files for one card keep the newest receipt", () => {
   expect(r.get("c1")!.result).toBe("done");
   expect(r.get("c3")!.result).toBe("done");
   expect(r.get("c2")!.result).toBe("done");
+  // The kept file name is recorded for the board's why link.
+  expect([r.get("c1")!.file, r.get("c3")!.file, r.get("c2")!.file]).toEqual(["a.json", "y.json", "c2.json"]);
 });
 
 test("master queue needs rows are action blocks with the unblock count (owner 2026-10-25)", async () => {
@@ -425,3 +541,4 @@ test("needs-you alerts-only mode: no board in FIRSTMATE, one ping per new card (
   expect(fm.list.length).toBe(1);
   expect(fm.list[0]!.content.startsWith("🔔")).toBe(true);
 });
+

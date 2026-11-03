@@ -15,4 +15,5 @@ test:
     - bun install --frozen-lockfile
     - bunx tsc --noEmit -p .
     - bun test test/
+    - python3 scripts/test_fm_flow.py
     - bun run lint:mentions

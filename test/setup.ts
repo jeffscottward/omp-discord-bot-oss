@@ -1,3 +1,6 @@
+// First import: every later tmpdir() call (here, in src/ and in the tests) uses this run's private temp root,
+// which is removed when the run ends (test/tmproot.ts).
+import "./tmproot.ts";
 import { copyFileSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";

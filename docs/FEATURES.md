@@ -319,6 +319,14 @@ nothing.
 **Needs.** The Heeler app; your own Worker deploy (`cd heeler-link && bunx wrangler deploy`) on your own domain.
 Without it, use the terminal tab on the server.
 
+## 14b. Queue and channel UX (2026-11-03) — REQUIRED (no setup)
+
+Rate errors retry by themselves after a cool-down (🔁 Force retry skips the wait). ⏸️ Pause all shows only while
+work runs. Stopped runs get ▶️ Resume. Full pane categories create an overflow category and an alert to mute it once.
+A pane with no channel gets a thread with ❌ Stop. The master queue is its own silent message without "(continued)"
+pages. Stacks hand off wrong-domain messages; follow-ups go to the existing job channel. Closed channels are
+archived only when a category holds 40 or more channels.
+
 ## 15. Safe restarts — REQUIRED
 
 **What it does.** Never restart the bot directly. Schedule `systemd-run --user --collect "$PWD/scripts/restart-when-idle.sh"` from the repo

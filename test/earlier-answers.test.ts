@@ -1,6 +1,7 @@
 // Owner 2026-10-23 (Discord UX item 4): ask blocks and attach lines from earlier answers of a run are posted.
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claimsMissingMenu, earlierExtras, newestSessionFile, runAnswers } from "../src/earlier.ts";
 
@@ -10,7 +11,7 @@ const entry = (ts: string, text: string, stopReason = "stop") =>
 
 describe("runAnswers", () => {
   test("returns end-of-turn answers since the run start, oldest first", async () => {
-    const dir = mkdtempSync("/tmp/earlier-");
+    const dir = mkdtempSync(join(tmpdir(), "earlier-"));
     const f = join(dir, "s.jsonl");
     writeFileSync(
       f,

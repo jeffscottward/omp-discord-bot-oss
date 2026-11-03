@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkPostFiles } from "../src/attach.ts";
 import { startHttp } from "../src/http.ts";
 
-const home = mkdtempSync("/tmp/postfiles-");
+const home = mkdtempSync(join(tmpdir(), "postfiles-"));
 mkdirSync(join(home, "Documents"));
 const ok = join(home, "Documents", "t.pdf");
 writeFileSync(ok, "pdf");
@@ -57,7 +58,7 @@ describe("extractAttachments roots (owner 2026-10-19: sandboxed models attach on
   test("a path outside the given roots is refused; inside is attached", async () => {
     const { extractAttachments } = await import("../src/attach.ts");
     const { mkdtempSync, writeFileSync, mkdirSync } = await import("node:fs");
-    const h = mkdtempSync("/tmp/attroots-");
+    const h = mkdtempSync(join(tmpdir(), "attroots-"));
     mkdirSync(`${h}/work`); mkdirSync(`${h}/Documents`);
     writeFileSync(`${h}/work/ok.txt`, "x"); writeFileSync(`${h}/Documents/private.txt`, "y");
     const r = extractAttachments(`hi\n📎 attach: ${h}/work/ok.txt\n📎 attach: ${h}/Documents/private.txt`, h, 1024, [`${h}/work`]);

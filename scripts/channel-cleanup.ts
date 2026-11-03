@@ -6,7 +6,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG, FIRSTMATE_CHANNEL_ID, FM_DIR, GUILD_ID, HTTP_PORT, OWNER_ID, STATE_DIR } from "../src/config.ts";
-import { ARCHIVE_IDS, DETACHED_CHANNEL_IDS, HOSTS, paneCategoryIds, pickArchive, sh, type MirrorEntry } from "../src/mirror.ts";
+import { ARCHIVE_IDS, DETACHED_CHANNEL_IDS, HOSTS, mayArchive, paneCategoryIds, pickArchive, pickToArchive, sh, type MirrorEntry } from "../src/mirror.ts";
 import { classify, discord, dueForAsk, fetchMessages, loadToken, paneBusy, sessionEnded, trackerOpen, type Verdict } from "../src/cleanup.ts";
 import { askedAgainOpen, askSetId, CLOSED_LINE, discordLink, menuQuestion, staleCards, staleMenus, type Card, type ChannelState, type MenuMsg } from "../src/cardsweep.ts";
 import { ASK_TTL_MS } from "../src/ask.ts";
@@ -109,7 +109,15 @@ for (const r of results.sort((a, b) => b.idleH - a.idleH))
   log(`${r.v.kind.padEnd(9)} ${r.idleH.toFixed(1).padStart(6)} h  ${r.e.machine}  #${r.e.name}  (${r.v.reason})`);
 
 const archived: string[] = [];
-for (const r of results.filter((x) => x.v.kind === "finished")) {
+// Owner 2026-11-01: archive only in a category with >= 40 of 50 channels; oldest (most idle) first, only enough to get under 40.
+// Channels whose tab was closed on an earlier run (entry archived, waiting for purge) already count as archived.
+const closedIds = new Set(entries.filter((x) => x.archived).map((x) => x.channelId));
+const catCount = (cat: string) => chans.filter((c) => c.type !== 4 && (c.parent_id ?? "") === cat && !closedIds.has(c.id)).length;
+const finished = results.filter((x) => x.v.kind === "finished");
+const allowed = pickToArchive(finished.map((r) => ({ key: r.e.channelId, cat: chanById.get(r.e.channelId)?.parent_id ?? "", oldest: -r.idleH })), catCount);
+for (const r of finished) {
+  const cat = chanById.get(r.e.channelId)?.parent_id ?? "";
+  if (!allowed.has(r.e.channelId)) { log(`keep #${r.e.name}: category ${cat} has ${catCount(cat)} channels (${mayArchive(catCount(cat)) ? "enough older ones archived" : "below 40"})`); continue; }
   // A tab is closable only when every live channel mapped to it is finished.
   const sharing = results.filter((x) => x.e.machine === r.e.machine && (x.e.tabId === r.e.tabId || x.e.paneId === r.e.paneId));
   if (sharing.some((x) => x.v.kind !== "finished")) { log(`skip #${r.e.name}: its tab also maps to a channel that is not finished`); continue; }

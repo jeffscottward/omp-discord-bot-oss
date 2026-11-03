@@ -6,7 +6,10 @@
   fm add <id> <status> <area> <title> [--q url|--src url] [-- note]  add a new item
   fm needs                      ids of items with status waiting/blocked
   fm q <id> <discord-url>       set the item's open-question link (q); "-" removes it
-  fm field <id> <key> <value|->  set/remove one field. Keys: job, l, auto, src, task, owner, blockedBy, blocks, queued, queuedFrom, receipt
+  fm field <id> <key> <value|->  set/remove one field. Keys: job, l, auto, src, task, owner, blockedBy, blocks, queued, queuedFrom, receipt, bootGate
+                                bootGate (card fm-boot-gate, 2026-11-02): `now` = this host's current boot id; the card
+                                waits for the next reboot (fm-autoclear R14: not idle, not swept; receipts still apply;
+                                the gate is removed after a reboot)
                                 job/blockedBy/blocks take a comma list (job: Herdr tab label/code/pane id, or a unit
                                 name like kb-daily-retry.timer / <peer-host>:report-sync.service)
   fm receipt <id> <done|failed|blocked> <summary...> [--evidence TEXT]... [--q URL|--src URL] [--blocked-by CARD[,CARD]]
@@ -73,7 +76,7 @@ def need_discord(key, url):
                 else "Put GitHub/report/other links in the `l` field: fm field <id> l <url>")
         sys.exit(f"{key} must be a Discord message link ({DISCORD}<guild>/<channel>/<message>); got {url[:120]!r}. {hint}")
 STATUSES = {"open", "waiting", "blocked", "partial", "running", "planned", "backlog", "done"}
-FIELDS = {"job", "l", "auto", "src", "task", "owner", "blockedBy", "blocks", "queued", "queuedFrom", "receipt"}
+FIELDS = {"job", "l", "auto", "src", "task", "owner", "blockedBy", "blocks", "queued", "queuedFrom", "receipt", "bootGate"}
 RECEIPTS = os.path.join(os.path.dirname(F), "receipts")
 RESULTS = ("done", "failed", "blocked")
 OWNER_STATES = ("waiting", "open", "blocked")
@@ -187,6 +190,14 @@ elif cmd == "field" and len(a) == 4 and a[2] == "q":
 elif cmd == "field" and len(a) == 4 and a[2] in FIELDS:
     if a[2] == "src":
         need_discord("src", a[3])
+    if a[2] == "bootGate" and a[3] != "-":
+        if a[3] == "now":
+            try:
+                a[3] = open("/proc/sys/kernel/random/boot_id").read().strip()
+            except OSError as e:
+                sys.exit(f"bootGate now: cannot read the boot id ({e})")
+        if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", a[3]):
+            sys.exit("bootGate takes `now` or a boot id (/proc/sys/kernel/random/boot_id)")
     with open(F + ".lock", "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         d = load()

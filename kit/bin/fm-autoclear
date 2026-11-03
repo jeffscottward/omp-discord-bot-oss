@@ -25,7 +25,7 @@ Rules (each card is checked; finance cards are never touched; nothing is deleted
  R9 queued (owner 2026-10-18): a card with `queued` (the owner responded; set by the Discord bot) is never
     moved back to waiting/open/blocked, also when this run read the card before the bot changed it (`fm` refuses too).
  R10 idle (owner 2026-10-18, "nothing sits in In progress without moving"): a partial card with no job, not blocked
-    by an unfinished card, not a finance card, and unchanged for more than 2 h is listed as "⏳ idle" in idle.json
+    by an unfinished card, not a finance card, not boot-gated (R14), and unchanged for more than 2 h is listed as "⏳ idle" in idle.json
     (the card itself is not edited). "No job" = no Herdr pane working or active in the last 10 min, and no tagged
     unit that is running or waiting for its timer (a waiting timer = blocked on time). firstmate-sweep.timer
     (every 2 h) starts one OMP sweep session when idle.json lists items.
@@ -41,6 +41,15 @@ Rules (each card is checked; finance cards are never touched; nothing is deleted
     "[silent 30 min; no receipt; needs check]" (it stays running; the flag goes when activity resumes).
     A job pane that is gone (R5) or stopped (R8, pane jobs) without a receipt gets "no receipt; needs check".
     A recent beat counts as activity for R8 and R10.
+ R14 boot gate (card fm-boot-gate, 2026-11-02): a card with field `bootGate` = the boot id it waits on
+    (/proc/sys/kernel/random/boot_id; set with `fm field <id> bootGate now`) waits for the next reboot. While the
+    current boot id equals it (or the new boot is younger than 30 min, so a boot-time check can still write its
+    receipt), the rules leave the card alone like a time gate (only R7 link flags) and R10 never lists it as idle;
+    receipts (R11) still apply. After a reboot the gate is removed (`fm field <id> bootGate -`), so a card whose
+    receipt did not arrive flows normally again.
+ R15 blocker done (card mq-blocked-reason-full, 2026-11-03): a partial card whose note still says "[blocked by …]"
+    and whose blockedBy cards all exist and are done gets "[blocker done; needs check]" instead (the master queue
+    shows it as 🔧 "blocker done; needs a check"; fm-audit lists it for the sweep). A name that is not a card never counts as done.
 Every write goes through `fm` (file lock) with FM_AUTO set, so the card shows "🤖 auto-updated".
 Changes are logged to $FM_DIR/autoclear.log. Settings: ~/.config/omp-discord/kit.env (see kit/kit.env.example):
 FM_DIR, REPORTS_WEB_DIR, FM_HOST_LABEL, FM_PEER_HOST, FM_SKIP_AREAS, FM_SKIP_WORDS, FM_BIN, OMP_BOT_ENV.
@@ -110,9 +119,13 @@ ENDED_OLD = "job ended without a report; needs check"  # before 2026-10-19; stil
 STOPPED = "job stopped; queued"  # unit jobs (a timer waiting for its next run)
 STOPPED_NR = "job stopped; no receipt; needs check"  # pane jobs: the session stopped without fm receipt
 SILENT = "silent 30 min; no receipt; needs check"
+BLOCKER_DONE = "blocker done; needs check"  # R15
+BLOCKED_BY = re.compile(r"\s*\[blocked by [^\]]*\]")  # R11 flag "[blocked by a, b]"
 MARKS = re.compile(r"\s*\[(?:" + "|".join(re.escape(x) for x in (ENDED, ENDED_OLD, STOPPED, STOPPED_NR, SILENT)) + r")\]")
 WORKING = r"^working: .*?\.(?:\s+|$)"  # lead written by R2/R3; labels may contain dots (unit.service)
 RECENT_S = 600  # a pane that worked in the last 10 min still counts as its job (no flapping between turns)
+BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"  # R14
+BOOT_GRACE_S = 30 * 60  # R14: a new boot this young keeps the gate (the boot check may still write its receipt)
 QUEUED_KEEP_OUT = ("waiting", "open", "blocked")  # R9
 
 
@@ -141,6 +154,36 @@ def holds():
         return dict(json.load(open(HOLD)).get("cards") or {})
     except Exception:
         return {}
+
+
+def boot_id():
+    """R14: id of the current boot ('' when unreadable: then every gate stays held)."""
+    try:
+        with open(BOOT_ID_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def boot_age():
+    """R14: seconds since this boot (0 when unknown: the gate stays held)."""
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def boot_gate(it, ctx):
+    """R14: None (no gate), "held" (still the gated boot, the boot is unknown, or the new boot is younger than
+    BOOT_GRACE_S) or "passed" (rebooted: the gate is removed)."""
+    g = str(it.get("bootGate") or "").strip()
+    if not g:
+        return None
+    cur = str(ctx.get("boot_id") or "")
+    if not cur or cur == g or float(ctx.get("boot_age") or 0) < BOOT_GRACE_S:
+        return "held"
+    return "passed"
 
 
 def report_path(l):
@@ -304,8 +347,22 @@ def _decide(it, ctx):
             if int(it.get("cts") or 0) and rms < int(it.get("cts") or 0) - RECEIPT_SLACK_S * 1000:
                 return [("field", [iid, "receipt", str(rms)], "R11 stale receipt skipped (card changed after it)")]
             return r11(it, rec, rms)
+    # R14 boot gate: a card that waits for the next reboot is left alone (receipts above still apply); after a reboot
+    # the gate is removed and the card flows normally from the next pass.
+    gate = boot_gate(it, ctx)
+    if gate == "held":
+        return []
+    if gate == "passed":
+        return [("field", [iid, "bootGate", "-"], "R14 boot gate passed (rebooted)")]
     if finance(it):
         return []
+    # R15 blocker done (card mq-blocked-reason-full): every blocker card is done, so the "[blocked by …]" flag is stale.
+    if s == "partial" and BLOCKED_BY.search(note):
+        raw = it.get("blockedBy")
+        bb = [str(b).strip() for b in (raw if isinstance(raw, list) else re.split(r"[,\s]+", str(raw or ""))) if str(b).strip()]
+        state = {i.get("id"): i.get("s") for i in ctx.get("items") or []}
+        if bb and all(state.get(b) == "done" for b in bb):
+            return [("set", [iid, "partial", (BLOCKED_BY.sub("", note).strip()[:600 - len(BLOCKER_DONE) - 3] + f" [{BLOCKER_DONE}]").strip()], "R15 blocker done")]
     acts = []
     # R1
     rp = report_path(it.get("l"))
@@ -379,6 +436,9 @@ def idle_scan(items, ctx):
     for it in items:
         iid = it.get("id")
         if not iid or it.get("s") != "partial":
+            continue
+        if boot_gate(it, ctx) == "held":
+            skipped.append({"id": iid, "reason": "waits for next boot (boot gate)"})
             continue
         if finance(it):
             skipped.append({"id": iid, "reason": "time gate or skipped area: no automatic sweep"})
@@ -536,7 +596,7 @@ def main(dry):
     ctx = {"jobs": run.get("jobs") or [], "jobs_ok": bool(run.get("jobsOk")) and fresh,
            "item_jobs": run.get("itemJobs") or {}, "services": run.get("services") or [], "file": real_file, "holds": holds(),
            "l_count": __import__("collections").Counter(i.get("l") for i in items if i.get("l")), "answer": make_answer(), "unit": real_unit,
-           "receipt": real_receipt}
+           "receipt": real_receipt, "boot_id": boot_id(), "boot_age": boot_age(), "items": items}
     try:
         ctx["run_ms"] = int(datetime.fromisoformat(str(run.get("generated"))).timestamp() * 1000)
     except Exception:
@@ -752,6 +812,38 @@ def test():
     a = D(id="r5p", s="running", job="GONE", n=f"working: X. y [{SILENT}]"); ok(a[0][1] == ["r5p", "partial", f"y [{ENDED}]"], a)
     its3 = [P(id="b1", job="IDL", beat=ms(now - 60)), P(id="b2", job="IDL", beat=ms(now - 3 * 3600))]
     ok({i["id"] for i in idle_scan(its3, ctx)[0]} == {"b2"}, "R10: a recent beat is activity")
+    # R14 boot gate (card fm-boot-gate, 2026-11-02)
+    ctx.update(boot_id="BOOT-1", boot_age=7200.0)
+    ok(boot_gate({"id": "x"}, ctx) is None and boot_gate({"id": "x", "bootGate": "BOOT-1"}, ctx) == "held", "no gate / same boot")
+    ok(D(id="g1", s="partial", bootGate="BOOT-1", job="GONE") == [], "a gated card (same boot) is left alone (no R5 flag)")
+    a = D(id="g2", s="partial", bootGate="BOOT-0"); ok(a == [("field", ["g2", "bootGate", "-"], "R14 boot gate passed (rebooted)")], f"new boot clears the gate: {a}")
+    a = D(id="g2n", s="partial", bootGate="BOOT-0", n=f"x [{ENDED}]", job="GONE"); ok(a and a[0][1][1] == "bootGate", "passed gate is cleared first; the card flows from the next pass")
+    recs["g3"] = R("g3", "done")
+    a = D(id="g3", s="partial", bootGate="BOOT-1"); ok(a and a[0][1][1] == "done" and a[0][2] == "R11 receipt done", f"a receipt applies while gated: {a}")
+    recs["g3f"] = R("g3f", "failed")
+    a = D(id="g3f", s="partial", bootGate="BOOT-1"); ok(a and a[0][1][1] == "partial" and "[needs check]" in a[0][1][2], f"a failed receipt applies while gated: {a}")
+    gits = [P(id="gi1", bootGate="BOOT-1"), P(id="gi2", bootGate="BOOT-0"), P(id="gi3")]
+    idl, skp = idle_scan(gits, ctx)
+    ok({i["id"] for i in idl} == {"gi2", "gi3"}, f"same boot -> not idle; new boot -> idle again: {sorted(i['id'] for i in idl)}")
+    ok({"id": "gi1", "reason": "waits for next boot (boot gate)"} in skp, skp)
+    ctx["boot_age"] = 60.0  # rebooted 1 min ago: the boot check may still write its receipt
+    ok(D(id="g4", s="partial", bootGate="BOOT-0") == [] and "gi2" not in {i["id"] for i in idle_scan(gits, ctx)[0]}, "a young new boot keeps the gate")
+    ctx.update(boot_id="", boot_age=7200.0)  # boot id unreadable: never clear a gate by mistake
+    ok(D(id="g5", s="partial", bootGate="BOOT-0") == [] and boot_gate({"bootGate": "BOOT-0"}, ctx) == "held", "unknown boot keeps the gate")
+    # R15 blocker done (card mq-blocked-reason-full)
+    ctx["items"] = [{"id": "bd-a", "s": "done"}, {"id": "bd-b", "s": "done"}, {"id": "bd-o", "s": "running"}]
+    a = D(id="bd1", s="partial", blockedBy=["bd-a", "bd-b"], n="🧾 Receipt blocked (11-03 10:00): waits. [blocked by bd-a, bd-b]")
+    ok(a == [("set", ["bd1", "partial", "🧾 Receipt blocked (11-03 10:00): waits. [blocker done; needs check]"], "R15 blocker done")], f"R15 all blockers done: {a}")
+    a = D(id="bd2", s="partial", blockedBy="bd-a,bd-o", n="x [blocked by bd-a, bd-o]")
+    ok(not any(x[2] == "R15 blocker done" for x in a), f"R15 one blocker open: {a}")
+    a = D(id="bd3", s="partial", blockedBy=["bd-a", "ghost"], n="x [blocked by bd-a, ghost]")
+    ok(not any(x[2] == "R15 blocker done" for x in a), f"R15 unknown blocker is not done: {a}")
+    a = D(id="bd4", s="partial", blockedBy=["bd-a"], n="x [blocker done; needs check]")
+    ok(not any(x[2] == "R15 blocker done" for x in a), f"R15 idempotent: {a}")
+    a = D(id="bd5", s="partial", blockedBy=["bd-a"], n="y" * 700 + " [blocked by bd-a]")
+    ok(a[0][1][2].endswith(" [blocker done; needs check]") and len(a[0][1][2]) <= 600, f"R15 long note keeps the flag: {len(a[0][1][2])}")
+    ctx.pop("items")
+    ctx.pop("boot_id"); ctx.pop("boot_age")
     print(f"all tests passed ({n})")
 
 

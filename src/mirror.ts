@@ -19,6 +19,7 @@ import { CONFIG, CONFIG_FILE, FIRSTMATE_SESSION, FM_DIR, GUILD_ID, STATE_DIR } f
 import { askInfo, isQuestionReply, questionLine, type AskInfo, type PaneWait } from "./quickreply.ts";
 import { freshWatch, watchCheck, watchEvents, type WatchAction, type WatchState } from "./stall.ts";
 import { channelMention } from "./mention.ts";
+import { SessionTail, shortModel, subagentFiles } from "./heartbeat.ts";
 import { routerConfig, type StackDef } from "./router.ts";
 import { catalogMtime, loadCatalog } from "./stackcatalog.ts";
 import { categoryOrder, paneStack, parseStackCategories, stackCategoryName, type StackCard } from "./stackcats.ts";
@@ -35,7 +36,8 @@ export const CATEGORY_IDS = { main: CONFIG.mirror.categories.local, second: CONF
 /** Archive categories in order (📦 Archive, 📦 Archive 2, …): config.mirror.categories.archive + config.mirror.archives. */
 export const ARCHIVE_IDS: string[] = [CONFIG.mirror.categories.archive, ...CONFIG.mirror.archives].filter(Boolean);
 /** Discord allows at most 50 channels in one category. */
-export const CATEGORY_LIMIT = 50;
+export { ARCHIVE_AT, CATEGORY_LIMIT, mayArchive, pickToArchive } from "./archivelimit.ts";
+import { CATEGORY_LIMIT } from "./archivelimit.ts";
 /** First archive category with room (fewer than 50 channels); undefined when all are full. */
 export function pickArchive(ids: string[], count: (id: string) => number): string | undefined {
   return ids.find((id) => count(id) < CATEGORY_LIMIT);
@@ -187,7 +189,54 @@ export type Progress = {
   thinking?: string;
   /** Owner 2026-10-19: latest tool call, shown as the last line; `done` once its result arrived. */
   lastTool?: { ts: number; tool: string; intent: string; callId?: string; done: boolean };
+  /** Owner 2026-10-31 (card job-subagents-line): subagents the pane's session started this turn. */
+  subagents?: ProgressSub[];
 };
+export type ProgressSub = { name: string; model?: string; done: boolean; lastTool?: string; running?: boolean; calls: number; lastWrite: number };
+/** At most this many subagent lines (running ones first), as in the bridge's Working message. */
+export const PROGRESS_SUBS = 5;
+
+/** Subagent lines of a status message (pure). */
+export function renderSubagents(subs: ProgressSub[] | undefined, mainModel?: string): string[] {
+  if (!subs?.length) return [];
+  const c = (x: string, n: number) => x.replace(/[`*_~|<>@\n]/g, "").slice(0, n);
+  const sorted = [...subs].sort((a, b) => Number(a.done) - Number(b.done) || b.lastWrite - a.lastWrite);
+  const out = [`🤝 **Subagents:** ${sorted.filter((x) => !x.done).length} running · ${sorted.filter((x) => x.done).length} finished`];
+  for (const x of sorted.slice(0, PROGRESS_SUBS)) {
+    const model = x.model && x.model !== mainModel ? ` (${c(shortModel(x.model), 40)})` : "";
+    const state = x.done ? "✅ finished" : x.lastTool ? `${x.running ? "🔧" : "🧠"} ${x.running ? "running" : "last"} \`${c(x.lastTool, 30)}\`` : "🧠 starting";
+    out.push(`  ↳ 🤖 **${c(x.name, 40)}**${model}: ${state} · ${x.calls} calls`);
+  }
+  if (sorted.length > PROGRESS_SUBS) out.push(`  ↳ +${sorted.length - PROGRESS_SUBS} more subagents`);
+  return out;
+}
+
+/** Subagent state for a session file (local files only); `tails` keeps read offsets between calls. */
+export function scanSubagents(sessionFile: string, sinceMs: number, tails: Map<string, SessionTail>): ProgressSub[] {
+  const dir = sessionFile.replace(/\.jsonl$/, "");
+  const out: ProgressSub[] = [];
+  for (const f of subagentFiles(dir)) {
+    // Checked on every call: a cached tail of an earlier turn's subagent is dropped (review 2026-10-31).
+    let old = true;
+    try {
+      old = statSync(f).mtimeMs < sinceMs;
+    } catch {}
+    if (old) {
+      tails.delete(f);
+      continue;
+    }
+    let t = tails.get(f);
+    if (!t) {
+      t = new SessionTail(f);
+      tails.set(f, t);
+    }
+    const mtime = t.poll();
+    const rel = f.slice(dir.length + 1).replace(/\.jsonl$/, "");
+    const p = [...t.pending.values()].at(-1) ?? t.lastTool;
+    out.push({ name: rel.slice(rel.lastIndexOf("/") + 1), ...(t.model ? { model: t.model } : {}), done: t.done, ...(p ? { lastTool: p.name, running: t.pending.size > 0 } : {}), calls: t.toolCalls, lastWrite: Math.max(t.lastEntryAt, mtime) });
+  }
+  return out;
+}
 export const PROGRESS_STEPS = 8;
 export const PROGRESS_GIT = 8;
 /** Minimum gap between edits of one status message (Discord allows about 5 edits per 5 s per channel). */
@@ -552,7 +601,7 @@ export function renderProgress(tab: string, p: Progress): string {
   const last = lt
     ? `🛠️ **Last tool:** \`${lt.tool.replace(/[`*_~|<>@]/g, "").slice(0, 30)}\`${lt.intent ? `: ${lt.intent}` : ""} · ${lt.done ? "done" : "running"} · called <t:${Math.floor(lt.ts / 1000)}:R>`
     : "🛠️ **Last tool:** none yet";
-  return [`⚙️ **${tab}** · working · started <t:${s}:R> · ${steps} · last step <t:${l}:R>`, ...model, ...task, ...git, ...lines, last].join("\n");
+  return [`⚙️ **${tab}** · working · started <t:${s}:R> · ${steps} · last step <t:${l}:R>`, ...model, ...renderSubagents(p.subagents, p.model), ...task, ...git, ...lines, last].join("\n");
 }
 
 /** Apply one event to a channel's progress (pure). Returns the new progress and whether to edit now. */
@@ -630,7 +679,22 @@ export function transcriptExcerpt(tail: Buffer, maxChars = 6000): string {
 /** How a Discord message in a mirrored channel runs. */
 export type Decision =
   | { mode: "pane"; entry: MirrorEntry; sessionFile: string; cwd: string; key: string }
-  | { mode: "side"; entry: MirrorEntry; key: string; cwd: string; reason: string; context: string };
+  | { mode: "side"; entry: MirrorEntry; key: string; cwd: string; reason: string; context: string }
+  | { mode: "busy"; entry: MirrorEntry; cwd: string; reason: string };
+
+/**
+ * Card discord-side-run-duplicates-job-pane (2026-11-01): a live omp in the job pane already works in its repo
+ * folder. A second `omp -p` there (side session or thread) writes the same files. Busy = main-host pane, live omp,
+ * cwd is a project folder (not the ~/Github root), and the channel is not FIRSTMATE (its side session is by design).
+ */
+/** Reply when a message would start a second run next to a live job pane. */
+export function busyReply(tab: string, paneId: string, cwd: string): string {
+  return `⛔ Not started: the job pane **${tab}** (${paneId}) is live and works in \`${cwd.replace(/^.*\/Github\//, "~/Github/")}\`. A second omp run there would edit the same files. Wait until the job ends, then send the message again (or stop the job first).`;
+}
+
+export function liveJobBusy(o: { machine: string; cwd: string; github: string; live: boolean; firstmate: boolean; archived?: boolean }): boolean {
+  return o.live && !o.firstmate && !o.archived && o.machine === "main" && o.cwd !== o.github && o.cwd.startsWith(`${o.github}/`);
+}
 
 const GITHUB = join(homedir(), "Github");
 
@@ -650,6 +714,8 @@ export class Mirror {
   /** Channels whose status message has unsent changes, and when each was last edited. */
   #pending = new Set<string>();
   #lastEdit = new Map<string, number>();
+  /** Subagent session tails per subagent file (card job-subagents-line). */
+  #subTails = new Map<string, SessionTail>();
   /** Wait cards of panes that closed or switched session; closed on the next tail. */
   #staleWaits: { e: MirrorEntry; w: PaneWait; why: string }[] = [];
   /** Posts one line to #omp-alerts (set by main). */
@@ -771,6 +837,8 @@ export class Mirror {
       const cat = await guild.channels.create({ name, type: ChannelType.GuildCategory, permissionOverwrites, ...(positions.length ? { position: Math.max(...positions) + 1 } : {}), reason: `stack ${stack.name} pane channels` });
       this.stackCats[stack.name] = [...ids, cat.id];
       log(`created stack category ${name} (${cat.id})`);
+      // Owner 2026-11-01: bots cannot mute a category; tell the owner so they can mute it once.
+      this.alert?.(`🗂️ New category "${name}" ${channelMention(cat.id, "")}: mute it once (long-press → Mute) and its future channels stay quiet.`);
       await this.orderCategories(guild, baseId);
       try {
         saveMirrorValue("stackCategories", this.stackCats, this.configFile);
@@ -844,7 +912,7 @@ export class Mirror {
         this.alert?.(`⚠️ Created pane category "${name}" (${cat.id}) but could not save it in config.json mirror.overflow: ${(e as Error).message}. Add the id by hand before the next bot restart.`);
       }
       log(`created overflow category ${name} (${cat.id}); pane categories: ${cats.length}`);
-      this.alert?.(`🗂️ All pane categories were full: created category "${name}" for new pane channels.`);
+      this.alert?.(`🗂️ All pane categories were full: created category "${name}" ${channelMention(cat.id, "")} for new pane channels. Mute it once (long-press → Mute) and its future channels stay quiet.`);
       return cat.id;
     } catch (err) {
       this.#overflowFailedAt = Date.now();
@@ -1395,6 +1463,15 @@ export class Mirror {
         }
         const { events, consumed } = r.chunk.length ? sessionEvents(r.chunk) : { events: [], consumed: 0 };
         if (onWatch && (await this.#watch(e, events, r.size, onWatch, now()))) dirty = true;
+        // Card job-subagents-line: list the turn's subagents (main-host session files only; remote hosts are skipped).
+        if (status && e.machine === "main" && e.progress?.state === "working" && e.progress.count > 0) {
+          const subs = scanSubagents(e.sessionFile, e.progress.startTs - 5_000, this.#subTails);
+          const key = (x?: ProgressSub[]) => JSON.stringify((x ?? []).map((y) => [y.name, y.model, y.done, y.lastTool, y.running, y.calls]));
+          if (key(subs) !== key(e.progress.subagents)) {
+            e.progress = { ...e.progress, subagents: subs.length ? subs : undefined };
+            this.#pending.add(e.channelId);
+          }
+        }
         const next = tailOffset(start, r.chunk.length, consumed);
         if (next === null) continue;
         e.offset = next;
@@ -1482,6 +1559,16 @@ export class Mirror {
     this.save();
   }
 
+  /** True only when the probe ran and found a live omp (a failed probe is "unknown", not live). */
+  async #confirmedLiveOmp(e: MirrorEntry): Promise<boolean> {
+    const host = HOSTS.find((h) => h.machine === e.machine)!;
+    const pane = e.paneId.replace(/[^A-Za-z0-9:_-]/g, "");
+    const r = await sh(host.ssh, `${host.herdr} pane process-info --pane '${pane}'; printf '\\n@@\\n'; ps -eo pid=,ppid=,comm=,args=`);
+    if (r.code !== 0) return false;
+    const [info = "", ps = ""] = r.out.toString("utf8").split("\n@@\n");
+    return paneHasLiveOmp(info, ps);
+  }
+
   async #liveOmp(e: MirrorEntry): Promise<boolean> {
     const host = HOSTS.find((h) => h.machine === e.machine)!;
     const pane = e.paneId.replace(/[^A-Za-z0-9:_-]/g, "");
@@ -1504,13 +1591,15 @@ export class Mirror {
    * Decide where a Discord message in a mirrored channel runs. threadId: messages in a thread
    * under the channel always get their own side session.
    */
-  async decide(channelId: string, threadId: string | null): Promise<Decision | null> {
+  async decide(channelId: string, threadId: string | null, firstmateId = ""): Promise<Decision | null> {
     const e = this.byChannel(channelId);
     if (!e) return null;
     const sideKey = sideSessionKey(e, threadId);
     const cwdOk = e.machine === "main" && e.cwd && (e.cwd === GITHUB || e.cwd.startsWith(`${GITHUB}/`)) && existsSync(e.cwd);
     const cwd = cwdOk ? e.cwd! : GITHUB;
     const side = async (reason: string): Promise<Decision> => ({ mode: "side", entry: e, key: sideKey, cwd, reason, context: await this.#excerpt(e) });
+    if (cwdOk && !e.archived && liveJobBusy({ machine: e.machine, cwd, github: GITHUB, firstmate: e.channelId === firstmateId || e.tab === "FIRSTMATE", live: await this.#confirmedLiveOmp(e) }))
+      return { mode: "busy", entry: e, cwd, reason: "a live omp in the job pane works in this folder" };
     if (threadId) return side("thread under the channel");
     if (e.archived) return side("the pane is closed");
     if (e.machine !== "main") return side("second machine panes are continued in a main side session");

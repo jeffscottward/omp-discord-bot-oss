@@ -23,17 +23,33 @@ export interface ReaskMatch {
 export const REASK_WINDOW_MS = 7 * 24 * 3_600_000;
 /** Jaccard score of topic words that counts as the same question. */
 export const REASK_MIN_SCORE = 0.2;
-/** Shared topic words needed in addition to the score (short questions must not match on 2 words). */
+/** Shared topic words needed in addition to the score (credit questions must not match on 2 words). */
 export const REASK_MIN_SHARED = 5;
 /** With the same card id in both questions, a weaker topic match is enough. */
 export const REASK_CARD_SCORE = 0.12;
 /** Shared topic words of the options (with descriptions): the same question offers the same kind of answers. */
 export const REASK_MIN_OPTION_SHARED = 3;
+/**
+ * Card reask-false-match (2026-11-01): a new question on the same topic ("Webapp Autopilot key: how should it be
+ * created?") units topic words with an answered one ("turn on the Autopilot tick timer?") but asks another thing
+ * and offers other answers. The question text alone (its intent) and the option set must each match too.
+ */
+export const REASK_MIN_QUESTION_SHARED = 3;
+export const REASK_MIN_QUESTION_SCORE = 0.2;
+export const REASK_MIN_OPTION_SCORE = 0.15;
+/**
+ * Card reask-false-match-2 (2026-11-02): descriptions of two sizing questions share words ("loss", "size", "stop",
+ * "spread") although the buttons offer other answers ("$10k max loss" vs "Full value counts as the loss"). The
+ * button labels alone must match too (true repeat "artifact quota": 3 shared label words). One shared word is never
+ * enough ("Merge"/"Wait" vs "Merge"/"Rebase"). Empty label words on one side only (Yes/No vs "Yes, merge") never match.
+ */
+export const REASK_MIN_LABEL_SHARED = 3;
+export const REASK_MIN_LABEL_SCORE = 0.25;
 
 const STOP = new Set(
   ("a an and are as at be been but by can do does done for from has have how i if in into is it its me my no not now of on only or our " +
     "out should so that the their them then there these they this to too us was we what when which who why will with you your yes " +
-    "other type dictate reply tap number recommended option options choose pick all any one two three four after before about need needs")
+    "other type dictate reply tap number recommended option options choose pick all any one two three four after before about need needs new")
     .split(" "),
 );
 
@@ -140,6 +156,25 @@ export function isOpenAnswer(answer: string[]): boolean {
   return answer.length > 0 && answer.every((a) => (/^\s*other:/i.test(a) ? leavesOpen(a) : DEFER_LABEL.test(a)));
 }
 
+// Card bot-reask-false-match (2026-11-02): a new DEF-line question matched the answered
+// "credit ABC" question twice. Both share the batch words (DEF, ABC, line, Acme, size). Two guards:
+// 1. A question that says it is new or separate ("New question (not the ABC credit)", "separate from the approved …")
+//    is never a re-ask: the asking session already knows the earlier answer does not cover it.
+// 2. Uppercase identifiers (codes, IDs like GHI, PR numbers) in the new question text that the earlier question
+//    and its options never named, next to one they share, mean another subject.
+const SAYS_NEW = /^\W*(?:new|separate|different) question\b|\((?:new question|not the [^)]{1,60})\)/i;
+const IDENT_STOP = new Set(["OK", "NO", "YES", "PR", "CI", "ET", "UTC", "AM", "PM", "US", "ID", "URL", "API", "LLM", "OMP", "GB", "MB", "KB", "TB", "EST", "EDT", "PT", "PST", "PDT", "USD", "ETF", "MOC", "MOO", "LMT", "MKT", "GTC", "DAY", "NOW", "NOT", "ALL", "ASAP", "FYI", "TODO"]);
+
+/** Uppercase identifiers (2-6 letters) named in the text: codes, unit names. */
+export function identifiers(text: string): Set<string> {
+  return new Set((text.replace(/https?:\/\/\S+/g, " ").match(/\b[A-Z][A-Z0-9]{1,5}\b/g) ?? []).filter((x) => /[A-Z]{2}/.test(x) && !IDENT_STOP.has(x)));
+}
+
+/** The question says itself that it is not the earlier one. */
+export function saysNew(question: string): boolean {
+  return SAYS_NEW.test(question);
+}
+
 /**
  * The best earlier answered question that matches, or null. `context` is extra text of the asking message
  * (for example the card id line) used only for the card-id match.
@@ -150,7 +185,10 @@ export function findAnswered(
   now = Date.now(),
   context = "",
 ): ReaskMatch | null {
+  // A marked-new question skips only unmarked earlier answers; a repeat of a marked question still matches.
+  const isNew = saysNew(q.question);
   const words = topicWords(q.question, q.options, q.descriptions);
+  const ids = identifiers(q.question);
   const cards = cardIds(`${q.question} ${context}`);
   let best: ReaskMatch | null = null;
   for (const e of answered) {
@@ -158,10 +196,20 @@ export function findAnswered(
     if (now - e.answeredAt > REASK_WINDOW_MS || !e.answer.length) continue;
     // Asking back or putting it off leaves the question open (card noreask-clarify).
     if (isOpenAnswer(e.answer)) continue;
+    if (isNew && !saysNew(e.question)) continue;
+    const earlierIds = identifiers([e.question, ...e.options, ...(e.descriptions ?? [])].join(" "));
+    // Only within one subject area: both name identifiers, share one, and the new one adds another (GHI next to DEF/ABC).
+    if ([...ids].some((x) => earlierIds.has(x)) && [...ids].some((x) => !earlierIds.has(x))) continue;
     const { score, shared } = similarity(words, topicWords(e.question, e.options, e.descriptions));
     const sameCard = [...cardIds(e.question)].some((c) => cards.has(c));
-    const opt = similarity(topicWords("", q.options, q.descriptions), topicWords("", e.options, e.descriptions)).shared;
-    const ok = shared >= REASK_MIN_SHARED && opt >= REASK_MIN_OPTION_SHARED && (score >= REASK_MIN_SCORE || (sameCard && score >= REASK_CARD_SCORE));
+    const intent = similarity(topicWords(q.question), topicWords(e.question));
+    const opt = similarity(topicWords("", q.options, q.descriptions), topicWords("", e.options, e.descriptions));
+    const qLabels = topicWords("", q.options), eLabels = topicWords("", e.options);
+    const label = similarity(qLabels, eLabels);
+    const labelsOk = (!qLabels.size && !eLabels.size) || label.shared >= REASK_MIN_LABEL_SHARED || (label.shared >= 2 && label.score >= REASK_MIN_LABEL_SCORE);
+    const ok = labelsOk && shared >= REASK_MIN_SHARED && opt.shared >= REASK_MIN_OPTION_SHARED && opt.score >= REASK_MIN_OPTION_SCORE &&
+      intent.shared >= REASK_MIN_QUESTION_SHARED && (intent.score >= REASK_MIN_QUESTION_SCORE || sameCard) &&
+      (score >= REASK_MIN_SCORE || (sameCard && score >= REASK_CARD_SCORE));
     if (ok && (!best || score > best.score)) best = { earlier: e, score };
   }
   return best;

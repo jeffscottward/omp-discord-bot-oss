@@ -216,8 +216,10 @@ export function startHttp(deps: HttpDeps, port = HTTP_PORT) {
       if ("error" in checked) return Response.json({ error: checked.error }, { status: 400 });
       const channelId = resolveChannel(channel);
       const extra = channelId ? null : (deps.resolveExtra?.(channel.trim().replace(/^#/, "")) ?? null);
-      if (!channelId && !extra) return Response.json({ error: "unknown channel" }, { status: 400 });
-      const id = channelId ?? extra!.id;
+      // Same rule as /messages: a raw snowflake (a job channel that is not mirrored); the dep checks it is in the guild.
+      const raw = channelId || extra ? null : resolveAny(channel, deps);
+      if (!channelId && !extra && !raw) return Response.json({ error: "unknown channel" }, { status: 400 });
+      const id = channelId ?? extra?.id ?? raw!.id;
       const copy = (body as { copy?: unknown }).copy;
       if (copy !== undefined && typeof copy !== "boolean") return Response.json({ error: "copy must be a boolean" }, { status: 400 });
       if (copy && checked.files.length) return Response.json({ error: "copy messages cannot carry files" }, { status: 400 });
@@ -226,7 +228,7 @@ export function startHttp(deps: HttpDeps, port = HTTP_PORT) {
       if (copy && replyTo) return Response.json({ error: "copy messages cannot reply" }, { status: 400 });
       const urgent = (body as { urgent?: unknown }).urgent;
       if (urgent !== undefined && typeof urgent !== "boolean") return Response.json({ error: "urgent must be a boolean" }, { status: 400 });
-      const chName = channelId ? (CHANNELS[channelId] ?? ALERT_CHANNELS[channelId])!.name : extra!.name;
+      const chName = channelId ? (CHANNELS[channelId] ?? ALERT_CHANNELS[channelId])!.name : (extra?.name ?? id);
       // Only plain text is held: a post with files, a reply target, a copy message or an ask menu is sent as before
       // (the digest keeps text only, and the caller would not know that the rest was dropped).
       const plain = !checked.files.length && !replyTo && !copy && !/```ask\b/.test(text);
@@ -236,6 +238,7 @@ export function startHttp(deps: HttpDeps, port = HTTP_PORT) {
       try {
         res = await deps.post(id, text, checked.files, copy ? { copy: true } : replyTo ? { replyTo: replyTo.id } : undefined);
       } catch (e) {
+        if ((e as Error).message === "channel not sendable") return Response.json({ error: "unknown channel" }, { status: 400 });
         return Response.json({ error: `post failed: ${(e as Error).message}` }, { status: 502 });
       }
       return Response.json({ ok: true, channel: chName, ...(res ?? {}) });

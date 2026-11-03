@@ -76,3 +76,24 @@ restart gate (`scripts/ci-green.sh`) reads a GitLab pipeline when one is configu
 
 Not copied: the private hourly/daily cleanup units that run through the owner's separate harness (`tick-runner`,
 `unit-audit`). The standalone `omp-archive-purge` and `omp-stopped-cleanup` timers stay.
+
+## Sync 2026-11-03 (UX update)
+Source: the private repository's changes after the 2026-10-31 sync (77 commits, 73 files), copied with the same
+three-way merge (base = the private commit of the 2026-10-31 sync, sides = this tree and the private main branch).
+Seven files had merge conflicts; each was resolved to the new private code and then scrubbed. No private history
+was pushed. This repository gets one new commit.
+
+Replaced or removed in the new code and tests (same table as above):
+- Real Discord channel and message IDs in tests and comments: synthetic IDs `1000000000000003NN`, or removed.
+- A project name in stacks, caps, tests and a CI fixture: `webapp`; the fixture's GitHub owner is `example-org`.
+- The machine name in code and text: `main` / "the main host"; a remote server prefix: `remote:`.
+- Ticker, pair-trade and copy-service examples in the re-ask tests: neutral order and invoice examples.
+- Trading service names in `scripts/fm-freeze`: "finance services such as a budget monitor".
+- A fixed home path in `systemd/fm-freeze-check.service`: `%h`.
+- The symbol-link import (`tickerlinks.ts`) that the first scrub removed stays removed.
+- Private client project code: none found (name grep over files and history).
+
+Scan results (2026-11-03): real-ID scan (43 IDs from the private repository) over files and full history: **0 hits**.
+String scan over files and full history: **0 hits** (one existing redaction test fixture with fake order text is
+kept on purpose). `gitleaks dir` and `gitleaks git`: **no leaks found**. `bunx tsc --noEmit`, `bun test test/`,
+`bun test src/` and `lint:mentions`: pass.

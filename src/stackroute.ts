@@ -31,7 +31,12 @@ const QUIET = { flags: MessageFlags.SuppressNotifications as const, allowedMenti
 
 export const stackSessionKey = (name: string) => `stack-${name}`;
 
-export type Routed = { decision: RouteDecision; note?: Message; sourceUrl: string };
+export type Routed = { decision: RouteDecision; note?: Message; sourceUrl: string; copyUrl?: string };
+
+/** Link to one message in a channel or thread (owner 2026-11-02: "→ stack" links open the routed copy itself). */
+export function messageLink(guildId: string, channelId: string, messageId?: string): string {
+  return `https://discord.com/channels/${guildId}/${channelId}${messageId ? `/${messageId}` : ""}`;
+}
 
 /** Discord API codes that mean a saved stack thread can no longer be used: Unknown Channel, Missing Access. */
 const THREAD_GONE = new Set([10003, 50001]);
@@ -165,18 +170,13 @@ export class StackRouter {
    */
   async forward(msg: Message, parent: TextChannel, s: StackDef, d: RouteDecision, text: string): Promise<Message> {
     const t = await this.thread(parent, s);
-    const threadUrl = `https://discord.com/channels/${this.opts.guildId}/${t.id}`;
-    const note = await msg.reply({ content: routeNote(s, d, "queued", threadUrl), ...QUIET }).catch(() => null);
     const body = text.length > 1800 ? `${text.slice(0, 1800)}…` : text;
-    let copy: Message;
-    try {
-      copy = await t.send({ content: `📨 **From FIRSTMATE** · [source](<${msg.url}>)\n${body || "(attachment)"}`, ...QUIET });
-    } catch (e) {
-      await note?.delete().catch(() => {}); // FIRSTMATE keeps the message: no orphan "→ stack" note
-      throw e;
-    }
+    // The copy posts first so the FIRSTMATE note links the exact routed message, not the thread top.
+    const copy = await t.send({ content: `📨 **From FIRSTMATE** · [source](<${msg.url}>)\n${body || "(attachment)"}`, ...QUIET });
+    const copyUrl = messageLink(this.opts.guildId, t.id, copy.id);
+    const note = await msg.reply({ content: routeNote(s, d, "queued", copyUrl), ...QUIET }).catch(() => null);
     this.remember([msg.id, note?.id, copy.id], s.name);
-    this.routed.set(copy.id, { decision: d, note: note ?? undefined, sourceUrl: msg.url });
+    this.routed.set(copy.id, { decision: d, note: note ?? undefined, sourceUrl: msg.url, copyUrl });
     return copy;
   }
 
@@ -250,8 +250,8 @@ export class StackRouter {
     const s = r ? this.stack(r.decision.stack) : undefined;
     if (state !== "running") this.routed.delete(copyId);
     if (!r?.note || !s) return;
-    const threadUrl = `https://discord.com/channels/${this.opts.guildId}/${this.st.threads[s.name] ?? ""}`;
-    await r.note.edit({ content: routeNote(s, r.decision, state, threadUrl) }).catch((e) => this.opts.log(`router: note edit: ${(e as Error).message}`));
+    const url = r.copyUrl ?? messageLink(this.opts.guildId, this.st.threads[s.name] ?? "");
+    await r.note.edit({ content: routeNote(s, r.decision, state, url) }).catch((e) => this.opts.log(`router: note edit: ${(e as Error).message}`));
   }
 
   /**

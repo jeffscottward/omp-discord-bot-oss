@@ -16,6 +16,7 @@ Planned cards in `flow` are cards whose blockers are done; they are not a plan f
    Every task file MUST end with the receipt step (Orca #3, 2026-10-19): `fm receipt <id> done|failed|blocked "<summary>" [--evidence <commit/file/unit/URL>]...`, and long silent work runs `fm beat <id>` at least every 20 min. fm-autoclear applies the receipt (done -> done; failed -> partial "[needs check]"; blocked with `--q`/`--src` (owner ask) -> blocked; blocked without a link -> partial with the reason and `--blocked-by` cards). One long command needs the background beat loop from `task-template.md`. A card whose job ended, stopped, or stayed silent for 30 min without a receipt is flagged "no receipt; needs check": treat that as step 1 (check the real state).
 4. Blocked on the owner → `waiting` with the question or source link (`fm q <id> <discord url>` or `fm field <id> src <url>`). Only link a message that exists; never invent a link.
 5. Blocked on time or on another card → keep `partial`, set `fm field <id> blockedBy <card id>` (or tag the timer unit with `fm field <id> job <unit>`), and put the reason in the note.
+   Waits for the next reboot of this host (e.g. a boot-time check writes the receipt) → keep `partial`, run `fm field <id> bootGate now` and put the reason in the note. The card then leaves idle.json and audit.json `flow` until the next boot (receipts still apply; fm-autoclear R14 removes the gate after the reboot).
 
 ## Hard limits
 - At most 4 new side sessions per sweep. Respect Claude plan limits; no Codex/OpenAI models.

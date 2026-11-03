@@ -49,10 +49,18 @@ async function serveFixture(extra) {
     stop: () => { srv.kill(); fs.rmSync(dir, { recursive: true, force: true }); } };
 }
 
+// A temp folder for one test process (Chrome profile, Chrome TMPDIR), removed when the process exits.
+// Card test-tmp-leak (2026-11-01): before, every run left its Chrome profile in /tmp (tmpfs inodes).
+function runTmp(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  process.on("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
 // BASE set: the live dashboard (read-only). Else: the fixture copy.
 async function target(extra) {
   if (process.env.BASE) return { base: process.env.BASE.replace(/\/?$/, "/"), live: true, stop: () => {} };
   return serveFixture(extra);
 }
 
-module.exports = { puppeteer, chrome, serveFixture, target, WEB, FIX };
+module.exports = { puppeteer, chrome, serveFixture, target, runTmp, WEB, FIX };

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { autoCheckQuietMs, childProcs, formatCheck, procSummary, waitReason, type CheckInput } from "../src/diagnose.ts";
 import { SessionTail, type HeartbeatView } from "../src/heartbeat.ts";
@@ -87,7 +88,7 @@ test("procSummary groups by name and state", () => {
 });
 
 test("childProcs reads comm and state from /proc, skips the root", () => {
-  const dir = mkdtempSync("/tmp/diag-proc-");
+  const dir = mkdtempSync(join(tmpdir(), "diag-proc-"));
   for (const [pid, comm, st] of [[100, "omp", "S"], [101, "my tool)x", "D"]] as const) {
     mkdirSync(join(dir, String(pid)));
     writeFileSync(join(dir, String(pid), "stat"), `${pid} (${comm}) ${st} 1 1 1 0 -1 0 0 0 0 0 5 1 0`);

@@ -31,6 +31,16 @@ WEB_DIR="${REPORTS_WEB_DIR:-$HOME/.local/share/omp-discord/reports-web}"
 HERE="${FM_DIR:-$WEB_DIR/firstmate}"
 STATE="$HOME/.local/state/firstmate-tests"; mkdir -p "$STATE"
 LOG="$STATE/last.log"; : > "$LOG"
+# Card test-tmp-leak (2026-11-01): each run left Chrome profiles and Chrome temp files in /tmp (tmpfs inodes).
+# All tests of a run now write temp files into one folder (TMPDIR) that is removed when the run ends.
+# A later run removes a folder left by a killed run after 6 hours.
+TMP_BASE="${TMPDIR:-/tmp}"
+find "$TMP_BASE" -maxdepth 1 -type d -name 'firstmate-tests.*' -mmin +360 -exec rm -rf {} + 2>/dev/null
+RUN_TMP=$(mktemp -d "$TMP_BASE/firstmate-tests.XXXXXX") || exit 2
+export TMPDIR="$RUN_TMP"
+trap 'rm -rf "$RUN_TMP"' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 ALERT=0; LIVE="${FM_TESTS_LIVE:-0}"
 for a in "$@"; do
   case "$a" in

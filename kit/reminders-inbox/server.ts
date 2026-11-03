@@ -34,7 +34,7 @@ Bun.serve({
     const left = queue().filter((t) => titles.has(t));
     save(QUEUE, left.join("\n"));
     // Added on the phone -> no longer pending.
-    save(ADDQ, lines(ADDQ).filter((l) => !titles.has(l.split(" | ")[0]!.trim())).join("\n"));
+    save(ADDQ, lines(ADDQ).filter((l) => !titles.has(l.split(" | ")[0]!.trim())).map((l) => `${l}\n`).join("")); // trailing newline so later appends do not glue onto the last line
     return new Response(`ok ${titles.size} reminders, ${left.length} still queued for deletion\n`);
   },
 });

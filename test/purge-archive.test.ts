@@ -1,7 +1,19 @@
-import { expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { afterAll, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// Card test-tmp-leak (2026-11-01): the temp HOME was never removed and /tmp (tmpfs) ran out of inodes.
+// Every dir made here is removed after the file, also when a test fails.
+const dirs: string[] = [];
+const tempDir = (prefix: string): string => {
+  const d = mkdtempSync(join(tmpdir(), prefix));
+  dirs.push(d);
+  return d;
+};
+afterAll(() => {
+  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+});
 
 // purge-archive.py crashed the whole run on a 404 DELETE (category already gone, 2026-10-23).
 test("purge-archive: DELETE 404 is skipped, other errors still raise", () => {
@@ -96,19 +108,19 @@ print("OK")
 // (2026-10-25: this test, run against the old script that accepted --drop-empty, did a real purge of 4 channels).
 test("purge-archive: unknown options exit non-zero", () => {
   const script = join(import.meta.dir, "..", "scripts", "purge-archive.py");
-  const home = mkdtempSync(join(tmpdir(), "purge-archive-home-"));
+  const home = tempDir("purge-archive-home-");
   for (const bad of ["--drop-empty", "--empty-dupe", "--dryrun"]) {
     const r = Bun.spawnSync(["python3", "-B", script, "--dry-run", bad], { env: { ...process.env, HOME: home } });
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr.toString()).toContain("unknown option(s): " + bad);
   }
-});
+}, 20_000); // 3 python starts; over 5 s at load ~48 (restart gate 2026-11-01: bun killed the child at the timeout)
 
 // Review 2026-10-25: the mirror can revive an archived entry (pane/tab/name match) during a run; deleting that
 // channel would make the bot close the live pane's tab. The delete step re-reads agents.json.
 test("purge-archive: live_again holds a channel whose entry was revived, or when agents.json is unreadable", () => {
   const script = join(import.meta.dir, "..", "scripts", "purge-archive.py");
-  const dir = mkdtempSync(join(tmpdir(), "purge-archive-agents-"));
+  const dir = tempDir("purge-archive-agents-");
   const py = `
 import importlib.util, json
 spec = importlib.util.spec_from_file_location("pa", ${JSON.stringify(script)})

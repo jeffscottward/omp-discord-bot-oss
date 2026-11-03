@@ -95,3 +95,13 @@ describe("MasterQueueBoard pause button", () => {
     expect(list[0]!.components).toEqual([maintButton(true)]);
   });
 });
+
+import { showMaintButton } from "../src/maintpause.ts";
+import { test as t3, expect as e3 } from "bun:test";
+t3("master-queue button: hidden when idle, shown for running card, bot job, or pause (owner 2026-11-01)", () => {
+  const idle = { updated: 1, items: [{ id: "a", s: "done" }, { id: "b", s: "partial" }] };
+  e3(showMaintButton(false, 0, idle)).toBe(false);
+  e3(showMaintButton(false, 0, { updated: 1, items: [{ id: "c", s: "running", job: "wB:p1" }] })).toBe(true); // side job, empty bot queue
+  e3(showMaintButton(false, 2, idle)).toBe(true);
+  e3(showMaintButton(true, 0, idle)).toBe(true); // paused, nothing runs: Resume all stays
+});

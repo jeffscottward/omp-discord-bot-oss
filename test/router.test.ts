@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JobQueue } from "../src/queue.ts";
 import { DEFAULT_ROUTER, forcedStack, GENERAL, jevJudge, routeMessage, routerConfig, ruleRoute, StackTracker, type Judge } from "../src/router.ts";
-import { StackRouter } from "../src/stackroute.ts";
+import { messageLink, StackRouter } from "../src/stackroute.ts";
 
 const cfg = routerConfig({ stacks: [{ name: "finance", channelIds: ["T1"] }] });
 const judgeSays = (stack: string, confidence: number): Judge & { calls: string[] } => {
@@ -217,6 +217,10 @@ describe("status reporting", () => {
     expect(r.stackByThread("T1")?.name).toBe("finance");
     expect(threads.get("T1")!.sent[0]).toContain("📨 **From FIRSTMATE**");
     expect(notes[0]).toContain("🧭 → stack: 💹 **finance** (keyword) · ⏳ queued");
+    // Owner 2026-11-02: the note links the exact routed copy in the thread, not the thread top.
+    expect(notes[0]).toContain(`https://discord.com/channels/G/T1/${copy1.id}`);
+    expect(messageLink("G", "T1", "M2")).toBe("https://discord.com/channels/G/T1/M2");
+    expect(messageLink("G", "T1")).toBe("https://discord.com/channels/G/T1");
     // Owner replies to the original or the router note: same stack.
     expect(r.inherited(["o1"])).toBe("finance");
     expect(r.inherited(["No1"])).toBe("finance");
@@ -230,6 +234,7 @@ describe("status reporting", () => {
     r.ended(10, true);
     await Promise.resolve();
     expect(notes.at(-1)).toContain("✅ done");
+    expect(notes.at(-1)).toContain(`/T1/${copy1.id}`);
     expect(r.tracker.status().find((s) => s.stack === "finance")).toMatchObject({ done: 1, running: [], queued: [] });
     // Owner 2026-10-23: an empty stack's thread is archived after the grace time.
     expect(threads.get("T1")!.archived).toBe(false);

@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clearPause, holdAlert, MAX_PAUSE_MS, restoreHeld, parseDuration, pauseLine, pauseTransition, readPause, resumeDigest, setPause, takeHeld } from "../src/alertpause.ts";
 import { startHttp } from "../src/http.ts";
 import { renderMaster } from "../src/masterqueue.ts";
 import { renderNeedsYou } from "../src/needsyou.ts";
 
-const dir = mkdtempSync("/tmp/alertpause-");
+const dir = mkdtempSync(join(tmpdir(), "alertpause-"));
 const pf = join(dir, "alerts-pause.json");
 const hf = join(dir, "alerts-held.jsonl");
 const T = 1_800_000_000_000;

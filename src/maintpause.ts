@@ -37,3 +37,10 @@ export function maintLine(p: MaintPause | null): string {
 export function maintButton(paused: boolean): { customId: string; label: string; emoji: string } {
   return paused ? { customId: `${MAINT_PREFIX}resume`, label: "Resume all", emoji: "▶️" } : { customId: `${MAINT_PREFIX}pause`, label: "Pause all", emoji: "⏸️" };
 }
+
+/** Owner 2026-11-01: show the master-queue button only while paused (▶️ Resume all) or while work runs (⏸️ Pause all). */
+export function showMaintButton(paused: boolean, botJobs: number, tracker: unknown): boolean {
+  if (paused || botJobs > 0) return true;
+  const items = Array.isArray(tracker) ? tracker : ((tracker as { items?: unknown[] } | null)?.items ?? []);
+  return items.some((c) => (c as { s?: string } | null)?.s === "running");
+}

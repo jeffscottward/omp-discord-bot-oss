@@ -318,12 +318,25 @@ q.addEventListener("input",f);f();
 
 const CHROME = process.env.OMP_TABLES_CHROME ?? "google-chrome-stable";
 
-async function chrome(args: string[], timeoutMs = 20_000): Promise<{ code: number; out: string }> {
+// Chrome puts its lock socket at $TMPDIR/.org.chromium.Chromium.XXXXXX/SingletonSocket (Google Chrome: the shorter
+// .com.google.Chrome.XXXXXX). A unix socket path has at most 107 bytes; Chrome aborts on a longer one.
+const CHROME_SOCKET_TAIL = "/.org.chromium.Chromium.XXXXXX/SingletonSocket".length;
+
+/** The render folder as Chrome's TMPDIR, or null when its socket path would be too long (Chrome's default then). */
+export function chromeTmpDir(tmp: string): string | null {
+  return Buffer.byteLength(tmp) + CHROME_SOCKET_TAIL <= 107 ? tmp : null;
+}
+
+async function chrome(args: string[], tmp: string, timeoutMs = 20_000): Promise<{ code: number; out: string }> {
   // setsid: Chrome leads its own process group, so a timeout kills its child processes too.
   // Children can inherit stdout; without the group kill and the race below, the read could never end.
+  // TMPDIR = the render folder: Chrome's own temp files (.com.google.Chrome.*, *_url_fetcher_*) are removed with it.
+  // Before (card test-tmp-leak, 2026-11-01) every render left them in /tmp.
+  const chromeTmp = chromeTmpDir(tmp);
   const p = Bun.spawn(["setsid", CHROME, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--hide-scrollbars", ...args], {
     stdout: "pipe",
     stderr: "ignore",
+    ...(chromeTmp ? { env: { ...process.env, TMPDIR: chromeTmp } } : {}),
   });
   const timeout = Promise.withResolvers<never>();
   const timer = setTimeout(() => {
@@ -338,8 +351,8 @@ async function chrome(args: string[], timeoutMs = 20_000): Promise<{ code: numbe
 }
 
 /** Render the table PNG (two Chrome passes: measure, then screenshot at the measured size). */
-async function measure(src: string, prof: string, width: number): Promise<{ w: number; h: number }> {
-  const m = await chrome([prof, `--window-size=${width},800`, "--dump-dom", `file://${src}`]);
+async function measure(tmp: string, src: string, prof: string, width: number): Promise<{ w: number; h: number }> {
+  const m = await chrome([prof, `--window-size=${width},800`, "--dump-dom", `file://${src}`], tmp);
   const title = m.out.match(/<title>([^<]*)<\/title>/)?.[1]?.replace(/&quot;/g, '"');
   if (m.code !== 0 || !title) throw new Error(`chrome measure failed (exit ${m.code})`);
   return JSON.parse(title) as { w: number; h: number };
@@ -355,16 +368,16 @@ export async function renderPng(t: Table, pngPath: string): Promise<void> {
     const src = join(tmp, "t.html");
     const prof = `--user-data-dir=${join(tmp, "chrome")}`;
     writeFileSync(src, pngHtml(t, "grid"));
-    let size = await measure(src, prof, 1100);
+    let size = await measure(tmp, src, prof, 1100);
     let scale = 3;
     if (size.w > PNG_GRID_MAX_W && t.header.length > 1) {
       writeFileSync(src, pngHtml(t, "cards"));
-      size = await measure(src, prof, PNG_CARD_W + 40);
+      size = await measure(tmp, src, prof, PNG_CARD_W + 40);
       scale = 3;
     }
     const w = Math.min(Math.max(size.w, 200), 2400);
     const h = Math.min(Math.max(size.h, 40), 12_000);
-    const s = await chrome([prof, `--force-device-scale-factor=${scale}`, `--window-size=${w},${h}`, `--screenshot=${pngPath}`, `file://${src}`]);
+    const s = await chrome([prof, `--force-device-scale-factor=${scale}`, `--window-size=${w},${h}`, `--screenshot=${pngPath}`, `file://${src}`], tmp);
     if (s.code !== 0 || !existsSync(pngPath) || statSync(pngPath).size < 100) throw new Error(`chrome screenshot failed (exit ${s.code})`);
   } finally {
     rmSync(tmp, { recursive: true, force: true });

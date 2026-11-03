@@ -157,6 +157,26 @@ restart loads only the commit the gate checked: a dirty checkout or a moved HEAD
 job runs and the owner is not in a voice call. After 10 min it drains: new jobs stay queued (saved, run after the
 restart) while running jobs finish. After 2 h of a busy bot it gives up and posts one notice.
 
+### What is new (2026-11-03)
+- Rate limits: a 429, rate-limit or overloaded error retries by itself after a growing cool-down. The failure
+  message also has a 🔁 Force retry button that retries at once (`src/failcause.ts`).
+- Overflow categories: when every pane category is full (Discord allows 50 channels per category), the mirror
+  creates the next category and posts one alert that asks you to mute it once. Bots cannot mute a category.
+- Thread fallback: when no channel can be created for a pane, the pane gets a thread in its stack channel with a
+  ❌ Stop button.
+- ▶️ Resume buttons on stopped runs. ⏸️ Pause all shows only while work runs (bot jobs or running cards); while
+  paused it shows ▶️ Resume all (`src/maintpause.ts`).
+- The master queue posts its own silent message. Later pages have no "(continued)" title; an invisible mark lets
+  the bot find its own pages.
+- Stacks hand off a message that belongs to another domain to the correct stack (`src/router.ts`).
+- Follow-up messages about a running job go to that job's channel instead of a new job (`src/jobmatch.ts`).
+- Closed channels are archived only when their category holds 40 or more channels (10 below the limit of 50),
+  oldest first and only enough to get under 40 (`src/archivelimit.ts`).
+- Also new: a context-meter line for live sessions (`src/ctxmeter.ts`), a compaction baseline line
+  (`src/compactbase.ts`), a notice when a run used a per-token API fallback (`src/apifallback.ts`), Stop in Discord
+  also stops the cards of that pane (`src/stopsync.ts`), and fewer false "already answered" matches for new
+  questions (`src/reask.ts`).
+
 ### Loopback API
 Other local services post through `127.0.0.1:47821` (`/post`, `/messages`, `/asks`, `/health`, `/drain`,
 `/secret-drop`, `/incident`, `/stack-job`). Requests must use the loopback host, carry no browser `Origin` and be

@@ -2,6 +2,8 @@
 // sets stay open 7 days, expired sets wait for the "⌛ Expired · 🔁 Ask again" edit.
 import { describe, expect, jest, test } from "bun:test";
 import { mkdtempSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ASK_TTL_MS, AskStore, CLOSED_KEEP_MS, lateHeader, menuTotal, recoverAnswer, setIdTime, TapBatcher, type AskQuestion } from "../src/ask.ts";
 import { askedAgainOpen } from "../src/cardsweep.ts";
 
@@ -55,7 +57,7 @@ describe("store expiry", () => {
     expect(s.closedSet(set.setId)).toBeNull();
   });
   test("closed sets persist (0600) and are dropped after 30 days", () => {
-    const dir = mkdtempSync("/tmp/askexp-");
+    const dir = mkdtempSync(join(tmpdir(), "askexp-"));
     const t0 = Date.now();
     const s = new AskStore(dir, t0);
     const set = s.create("c", Q, t0);

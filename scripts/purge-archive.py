@@ -53,6 +53,22 @@ def snowflake_ms(i):
     return (int(i) >> 22) + DISCORD_EPOCH if i else 0
 
 
+CATEGORY_LIMIT = 50
+ARCHIVE_AT = CATEGORY_LIMIT - 10  # owner 2026-11-01: delete only in a category with >= 40 of 50 channels
+
+
+def pick_to_archive(cands, count):
+    """Owner rule 2026-11-01 (card discord-archive-near-limit): per category, only when it holds >= 40 channels,
+    the oldest candidates first (smallest 'oldest' key), only enough to bring it under 40. cands: [{key, cat, oldest}]."""
+    out, by_cat = set(), {}
+    for c in cands: by_cat.setdefault(c["cat"], []).append(c)
+    for cat, lst in by_cat.items():
+        n = count(cat)
+        if n < ARCHIVE_AT: continue
+        out.update(c["key"] for c in sorted(lst, key=lambda c: c["oldest"])[: n - (ARCHIVE_AT - 1)])
+    return out
+
+
 def learner_markers():
     """Per-session markers: {session file path or id: newest window end (epoch ms) of a completed daily-skill-bot run
     that sent this session to the model (runs/<day>/batch-*.json; only the sampled sessions, max 40 per run)."""
@@ -255,11 +271,31 @@ def main():
         ok, why = decide(c, e, marks, prot)
         results.append({"id": c["id"], "name": c["name"], "delete": ok, "reason": why})
 
+    # Owner 2026-11-01: never delete in a category under 40 channels; near the limit only the oldest, until under 40.
+    per_cat = {}
+    for c in chans:
+        if c.get("type") != 4: per_cat[c.get("parent_id") or ""] = per_cat.get(c.get("parent_id") or "", 0) + 1
+    by_id = {c["id"]: c for c in cands}
+    ok_ids = pick_to_archive([{"key": r["id"], "cat": by_id[r["id"]].get("parent_id") or "",
+                               "oldest": int(by_id[r["id"]].get("last_message_id") or r["id"])} for r in results if r["delete"]],
+                             lambda cat: per_cat.get(cat, 0))
+    # Real run: every eligible candidate stays in the list (oldest first); the delete loop stops per category once it is
+    # under 40, so a candidate held at delete time is replaced by the next oldest one (review 2026-11-01).
+    eligible = sorted((r for r in results if r["delete"]), key=lambda r: int(by_id[r["id"]].get("last_message_id") or r["id"]))
+    need = {cat: n - (ARCHIVE_AT - 1) for cat, n in per_cat.items() if n >= ARCHIVE_AT}
+    for r in results:
+        if r["delete"] and r["id"] not in ok_ids and (DRY or (by_id[r["id"]].get("parent_id") or "") not in need):
+            n = per_cat.get(by_id[r["id"]].get("parent_id") or "", 0)
+            r["delete"], r["reason"] = False, (f"category has {n} channels (below {ARCHIVE_AT})" if n < ARCHIVE_AT else f"category back under {ARCHIVE_AT} after older deletes")
+
     deleted = []
     if not DRY and any(r["delete"] for r in results):
         os.makedirs(OUT, mode=0o700, exist_ok=True)
         active = api(f"/guilds/{guild}/threads/active").get("threads", [])
-        for r in [r for r in results if r["delete"]]:
+        for r in eligible:
+            cat = by_id[r["id"]].get("parent_id") or ""
+            if need.get(cat, 0) <= 0:
+                r["delete"], r["reason"] = False, f"category back under {ARCHIVE_AT} after older deletes"; continue
             try: copy = safety_copy(api, r["id"], r["name"], active)
             except urllib.error.HTTPError as e:
                 r["delete"], r["reason"] = False, f"safety copy failed (HTTP {e.code} reading messages or threads)"; continue
@@ -273,7 +309,7 @@ def main():
             with open(path, "w") as f:
                 json.dump(copy, f)
             if os.path.getsize(path) < 10: r["delete"], r["reason"] = False, "safety copy failed"; continue
-            if delete_gone_ok(api, f"/channels/{r['id']}"): deleted.append(r["name"])
+            if delete_gone_ok(api, f"/channels/{r['id']}"): deleted.append(r["name"]); need[cat] -= 1
     dropped = []
     if DROP_CATS and not DRY:
         all_ch = api(f"/guilds/{guild}/channels")

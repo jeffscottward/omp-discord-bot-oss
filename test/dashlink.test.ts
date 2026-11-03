@@ -41,7 +41,7 @@ describe("reply dashboard deep link", () => {
     const src = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
     const done = src.slice(src.indexOf("onDone: async (res, err)"), src.indexOf("jobKeys.set(id, target.id);"));
     // The success path has one sendText call; with late audio it gets audio=undefined and the link ends the text.
-    expect(done).toContain('typeof ready === "string" && ready !== "late" ? ready : undefined, audioName(text), [], startedAt, fmRun, undefined, modelWithThinking(res.model ?? models.defaultModel(), lastThinking(res.sessionFile)));');
+    expect(done).toContain('typeof ready === "string" && ready !== "late" ? ready : undefined, audioName(text), [], startedAt, fmRun, undefined, modelWithThinking(withCtx(res.model ?? models.defaultModel(), res.sessionFile), lastThinking(res.sessionFile)));');
     expect(done.match(/sendText\(/g)?.length).toBe(5);
     expect(done.match(/\[\], startedAt, fmRun/g)?.length).toBe(5);
     expect(src).toContain("const dashLine = noDash ? \"\" : dashboardLine(text, runStartMs, runId);");
@@ -55,8 +55,10 @@ test("since link carries the run id as by=run:<id> (fm-autoclear edits stay out 
 });
 
 import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 test("card title labels the deep link", () => {
-  const f = "/tmp/dashlink-items-test.json";
+  const f = join(tmpdir(), "dashlink-items-test.json");
   writeFileSync(f, JSON.stringify({ items: [{ id: "abc", t: "File 2023 [and] 2025 returns" }] }));
   expect(dashboardLine("⚓ item:abc", 1, undefined, f).startsWith("⚓ [Card: File 2023 and 2025 returns ↗](<")).toBe(true);
 });

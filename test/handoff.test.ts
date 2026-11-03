@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backLink, excerpt, handoffCard, handoffPrompt, sourceLogs } from "../src/handoff.ts";
 
 test("sourceLogs: pane session first, then the newest log of each matching session dir", () => {
-  const dir = mkdtempSync("/tmp/handoff-");
+  const dir = mkdtempSync(join(tmpdir(), "handoff-"));
   for (const k of ["side-1", "1", "dm-1"]) mkdirSync(join(dir, k));
   writeFileSync(join(dir, "side-1", "old.jsonl"), "");
   utimesSync(join(dir, "side-1", "old.jsonl"), 1, 1);
@@ -49,7 +50,7 @@ test("card and prompt", () => {
 
 import { logExcerpt } from "../src/handoff.ts";
 test("logExcerpt: the bot reads the newest log itself (sandboxed runs cannot), prompt carries it", () => {
-  const dir = mkdtempSync("/tmp/handoff-x-");
+  const dir = mkdtempSync(join(tmpdir(), "handoff-x-"));
   const line = (role: string, text: string) => JSON.stringify({ type: "message", message: { role, stopReason: "stop", content: [{ type: "text", text }] } });
   const old = join(dir, "old.jsonl");
   const cur = join(dir, "cur.jsonl");

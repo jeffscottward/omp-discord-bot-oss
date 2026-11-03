@@ -517,11 +517,11 @@ export function saveRouterState(file: string, st: RouterState, now = Date.now())
 }
 
 /** The router reply's text in the FIRSTMATE channel (edited in place as the job moves). */
-export function routeNote(s: StackDef, d: RouteDecision, state: StackJobState | "cancelled", threadUrl: string): string {
+export function routeNote(s: StackDef, d: RouteDecision, state: StackJobState | "cancelled", messageUrl: string): string {
   const icon = { queued: "⏳", running: "⚙️", done: "✅", failed: "❌", cancelled: "🛑" }[state];
   const why = d.by === "judge" ? `judge ${Math.round(d.confidence * 100)}%` : d.by === "fallback" ? "fallback" : d.by;
   const word = { queued: "queued", running: "running", done: "done", failed: "failed", cancelled: "cancelled" }[state];
-  return `🧭 → stack: ${s.emoji} **${s.name}** (${why}) · ${icon} ${word} · [open the ${s.name} thread](<${threadUrl}>)`;
+  return `🧭 → stack: ${s.emoji} **${s.name}** (${why}) · ${icon} ${word} · [open the routed message](<${messageUrl}>)`;
 }
 
 /** Header the stack's run gets in front of the owner's text. */
@@ -530,7 +530,7 @@ export function stackPreamble(s: StackDef, d: RouteDecision, sourceUrl: string):
     `[FIRSTMATE router] You are the ${s.emoji} ${s.title} stack (sub-orchestrator "${s.name}") under FIRSTMATE.`,
     `The router sent you this owner message from the FIRSTMATE channel (${d.by}: ${d.detail}). Source: ${sourceUrl}`,
     "Work only on this domain; related work stays in this stack. Report up to FIRSTMATE: keep the FIRSTMATE tracker current (fm find/fm set; set `fm field <id> stack " + s.name + "` on cards you create or work), and end with a short result.",
-    "If the message belongs to another domain, never drop it (owner 2026-10-30): hand it off yourself. Create a card (fm add <id> running <area> <title> --src <owner message link>), write a task file, start it with `fm-spawn --label <tab> --cwd <folder> --task <file> --card <id> --stack <right stack>`, and reply in one line with the stack and card id.",
+    "If the message belongs to another domain, never drop it (owner 2026-10-30): hand it off yourself. Create a card (fm add <id> running <area> <title> --src <owner message link>), write a task file from ~/Documents/reports/web/firstmate/task-template.md (it must have a `Flow: full|short` line and a `## Acceptance check` section, see flow.md; fm-spawn refuses it otherwise), start it with `fm-spawn --label <tab> --cwd <folder> --task <file> --card <id> --stack <right stack>`, and reply in one line with the stack and card id.",
     "",
   ].join("\n");
 }

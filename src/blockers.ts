@@ -35,7 +35,7 @@ export function leafClass(it: BItem, now = Date.now()): RootClass {
 }
 
 /** Blocker refs per card, resolved like the dashboard: id or card title (case-insensitive), plus reverse `blocks` edges. */
-function edges(items: BItem[]): Map<string, string[]> {
+export function edges(items: BItem[]): Map<string, string[]> {
   const byTitle = new Map(items.filter((i) => i.t).map((i) => [i.t!.toLowerCase(), i.id]));
   const ids = new Set(items.map((i) => i.id));
   const resolve = (r: string) => (ids.has(r) ? r : byTitle.get(r.toLowerCase()) ?? r);

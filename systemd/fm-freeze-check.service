@@ -1,0 +1,7 @@
+[Unit]
+Description=fm-freeze check: stop regular-stack jobs while the dev freeze flag is set (card dev-freeze-gate)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/Github/tools/omp-discord-bot/scripts/fm-freeze check
+TimeoutStartSec=120

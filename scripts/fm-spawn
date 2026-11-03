@@ -24,8 +24,34 @@ Start a side session:
     Refuses (exit 5, nothing created) while agent work is paused (omp-maintenance pause; card omp-pause-button).
     Refuses (exit 4, nothing created) when the workspace already has more than 30 tabs (auth-loop-guard,
     owner 2026-10-19), and prints the tabs that fm-tabwatch closes automatically or that look finished.
+    Queues (exit 6, nothing created) when the job's stack is at its cap (owner 2026-11-01, card fm-job-cap-ci-wait):
+    webapp = 3 live jobs; other stacks no cap unless ~/.config/omp-discord/stack-caps.json names one ({"kb": 2};
+    0/null removes a cap). Live job = a live Herdr pane working for a card of the stack (one tab = one slot): the
+    running card's `job`, or the pane fm-spawn started for it while its agent works or is blocked, or while the card's
+    latest receipt waits on CI ("waiting on CI: ..."). A done/idle spawned pane of a card that is not running frees
+    the slot (card fm-spawn-dead-slots); for a spawned pane, so do a done card and a done/failed/other blocked
+    receipt. Prints one JSON line
+    {queued: true, position, stack, cap, used, live, id}; the card goes to planned with a 📥 note. A card that is
+    already queued keeps its place (no second entry). --dry-run reports the same and writes nothing.
+    Queue: ~/.local/state/fm-spawn/queued.jsonl.
     Every spawned tab is recorded in ~/.local/state/fm-spawn/spawned.jsonl; fm-tabwatch closes it after
     the card's done/failed receipt once its panes are idle.
+
+Start queued jobs (fm-tick step spawnq, every minute after fm-autoclear):
+  fm-spawn --drain-queue [--dry-run]
+    Oldest first per stack, as many as the stack has free slots. Each starts as `fm-spawn ... --workspace WS` in its
+    own transient --user unit (systemd-run -p KillMode=process), so its channel waiter survives. While agent work is
+    paused or the workspace is over 30 tabs the queue stays as it is; a start that does not happen goes back to the
+    head (after 3 failed starts it leaves the queue and the card gets a "needs check" note). Entries whose card is
+    done, backlog or running leave the queue. An entry waiting more than 2 h gets one #omp-alerts line.
+    CI waits (card fm-ci-wait-no-resume, 2026-11-02): first it reads the PR checks (gh pr view) of every open card
+    whose receipt is a blocked "waiting on CI: PR #N ..." receipt (< 7 days old). When all checks finished (or the PR
+    was merged/closed), the wait ends (ledger ~/.local/state/fm-spawn/ci-wait.json): its slot frees, and the card's
+    resume goes to the head of the queue (its queued entry, else a new --no-worktree entry in the same folder with a
+    resume task file in ~/.local/state/fm-spawn/resume/), so the same tick starts it. A card that runs again is not
+    resumed. A card whose only slot is its own idle CI wait takes that slot over (its resume never waits behind its
+    own wait). A finished CI whose job has not started again 15 min later gets one #omp-alerts line (not while
+    paused); so does a wait it cannot watch (no PR, or no repo URL and no job folder; gh failing or no checks: 1 h).
 
 Adopt live terminal jobs (owner 2026-10-24 addendum: terminal jobs that so far had no channel):
   fm-spawn --adopt PANE [--card ID] [--stack NAME] [--label TEXT] [--dry-run]
@@ -64,8 +90,11 @@ Env (tests): FM_SPAWN_HERDR, FM_SPAWN_FM, FM_SPAWN_TABWATCH (binaries), FM_SPAWN
 FM_SPAWN_FAST, FM_SPAWN_MAX_TABS, FM_SPAWN_AGENTS (bot agents.json), FM_SPAWN_POST_URL (bot /post),
 FM_SPAWN_CHANNEL_WAIT_S (channel wait; 0 = no waiter), FM_SPAWN_STACKJOB_URL (bot /stack-job),
 FM_SPAWN_FALLBACK_DELAYS (retry delays, s), FM_SPAWN_NOTIFY (omp-notify), OMP_BOT_STACKS (stack catalog).
+FM_SPAWN_CAPS (stack-caps.json), FM_SPAWN_RUNNING / FM_SPAWN_RECEIPTS (default: next to FM_SPAWN_ITEMS),
+FM_SPAWN_LAUNCHER (runs a drained spawn instead of systemd-run), FM_SPAWN_GH (gh binary), FM_SPAWN_CI_ALERT_S,
+FM_SPAWN_CI_MAX_AGE_S, FM_SPAWN_CI_BUDGET_S (CI-wait alert delay / max receipt age / gh time budget per tick, s).
 """
-import argparse, fcntl, json, os, re, subprocess, sys, time
+import argparse, atexit, contextlib, fcntl, json, os, re, subprocess, sys, time
 FIN_RE = re.compile(r"[$€£]\s?\d|\b\d{1,3}(?:,\d{3})+|\b\d+(?:\.\d+)?\s?[kmb]\b|\b\d[\d,.]*\s?(?:shares?|contracts?|usd|dollars?)\b|\b(?:sell|buy|short|cover)\s+\d|\b[Uu]\d{6,}\b|\bacct\b|\baccount\b", re.I)
 
 HOME = os.path.expanduser("~")
@@ -361,7 +390,11 @@ def merge_steps(repo, wt, branch, base):
             f"if either fails, rebase again and retry); "
             f"4) if the repo's service must restart, do that inside the same flock; "
             f"never force-push, never rewrite other commits, and do not push to a remote unless the task says so; "
-            f"5) leave the worktree in place: `fm-spawn --cleanup` removes it after it is merged, clean and idle.")
+            f"5) leave the worktree in place: `fm-spawn --cleanup` removes it after it is merged, clean and idle. "
+            f"PRs (owner 2026-11-01, card fm-job-cap-ci-wait): open a PR as a draft (`gh pr create --draft`) and run "
+            f"`gh pr ready <PR>` only when the work is finished (the full CI lane runs then); wait for CI at most 1 h "
+            f"(`timeout 3600 gh pr checks <PR> --watch`; on timeout write `fm receipt <card> blocked \"waiting on CI: PR #N, "
+            f"run <url>, <X> jobs queued ahead since HH:MMZ\"`); re-run CI at most once per commit.")
 
 def default_base(repo):
     """origin/<default branch> after a fetch; never the main checkout's current HEAD (bug 2026-10-19).
@@ -447,16 +480,865 @@ def brief_gaps(text):
     return [name for name, rx in BRIEF_PARTS if not rx.search(text or "")]
 
 
+# ---------- per-stack job cap + queue (owner 2026-11-01, card fm-job-cap-ci-wait) ----------
+# 2026-11-01: 9 Webapp jobs ran at once and jammed CI (card webapp-ci-jam-1101). A stack with a cap runs at most `cap`
+# jobs; a further spawn is queued (exit 6, nothing created) and `fm-spawn --drain-queue` (fm-tick step spawnq, after
+# fm-autoclear) starts it when a slot frees. A slot = a live Herdr pane that works for a card of the stack: the card's
+# `job` while it is running, or the pane fm-spawn started for it while that pane's agent works or is blocked (Herdr
+# status or spinner, like fm-tabwatch looks_finished) or the card's receipt since the spawn waits on CI ("waiting on
+# CI: ...", task-template.md). A done card, a done/failed/other blocked receipt, a gone pane, or a done/idle pane of a
+# card that is not running (e.g. paused, card fm-spawn-dead-slots 2026-11-01) frees it.
+EXIT_QUEUED = 6
+DEFAULT_CAPS = {"webapp": 3}  # other stacks: no cap unless stack-caps.json names one
+CAPS_FILE = os.environ.get("FM_SPAWN_CAPS") or os.path.join(os.path.dirname(STACKS_FILE), "stack-caps.json")
+QUEUE = os.path.join(STATE, "queued.jsonl")
+SLOTS_LOCK = os.path.join(STATE, "slots.lock")  # guards queued.jsonl and reserved.json
+RESERVED = os.path.join(STATE, "reserved.json")  # slots of spawns that have not written spawned.jsonl yet
+RESERVE_MAX_S = 20 * 60
+LAUNCHER = os.environ.get("FM_SPAWN_LAUNCHER")  # tests: run a drained spawn with this program, not systemd-run
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def _json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def read_jsonl(path):
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict):
+                    rows.append(r)
+    except OSError:
+        pass
+    return rows
+
+
+def write_jsonl(path, rows):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def slots_lock():
+    os.makedirs(STATE, exist_ok=True)
+    with open(SLOTS_LOCK, "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        yield
+
+
+def stack_caps():
+    """DEFAULT_CAPS, then stack-caps.json ({"webapp": 3, "kb": 2}; 0 or null removes a cap)."""
+    caps = dict(DEFAULT_CAPS)
+    d = _json(CAPS_FILE, None)
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                caps[str(k)] = v
+            elif v in (None, 0, False):
+                caps.pop(str(k), None)
+    elif d is not None or os.path.exists(CAPS_FILE):
+        log(f"caps: {CAPS_FILE} is not a JSON object; using the defaults")
+    return caps
+
+
+def card_list():
+    d = _json(ITEMS, {})
+    items = d.get("items") if isinstance(d, dict) else d
+    return [c for c in (items or []) if isinstance(c, dict) and c.get("id")]
+
+
+def _tags(v):
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return [x.strip() for x in str(v or "").split(",") if x.strip()]
+
+
+def card_stack(c):
+    return c.get("stack") or resolve_stack(None, c.get("area"), c.get("t"), create=False)
+
+
+CI_WAIT = re.compile(r"waiting on CI", re.I)
+QUEUE_MAX_ATTEMPTS = 3  # a queued start that fails this often leaves the queue; the card gets a "needs check" note
+QUEUE_ALERT_S = int(os.environ.get("FM_SPAWN_QUEUE_ALERT_S") or 2 * 3600)  # one #omp-alerts line per entry waiting longer
+LAUNCH_HOLD_S = 180  # a drained start's reservation (until the started fm-spawn reserves its own slot), and a new
+# spawned pane's grace in live_slots before its agent shows working
+
+
+def _receipt(card):
+    r = _json(os.path.join(os.environ.get("FM_SPAWN_RECEIPTS") or os.path.join(os.path.dirname(ITEMS), "receipts"),
+                           f"{card}.json"), {})
+    return r if isinstance(r, dict) else {}
+
+
+def slot_freed_ms(card):
+    """tsMs of the card's receipt when it frees the slot, else 0. done/failed free it; a blocked receipt frees it
+    unless it waits on CI ("waiting on CI: PR #N ..." keeps the slot, owner 2026-11-01)."""
+    r = _receipt(card)
+    res = r.get("result")
+    if res in ("done", "failed") or (res == "blocked" and not CI_WAIT.search(str(r.get("summary") or ""))):
+        return int(r.get("tsMs") or 0)
+    return 0
+
+
+def ci_wait_ms(card):
+    """tsMs of the card's receipt when it is a blocked receipt that waits on CI (0 when it has no tsMs), else None."""
+    r = _receipt(card)
+    if r.get("result") == "blocked" and CI_WAIT.search(str(r.get("summary") or "")):
+        return int(r.get("tsMs") or 0)
+    return None
+
+
+# ---------- CI-wait resume (card fm-ci-wait-no-resume, 2026-11-02) ----------
+# 2026-11-01 (webapp-phases): a "waiting on CI" receipt kept its stack slot after CI had finished, nothing resumed the
+# card, and the card's own queued resume waited behind that slot. fm-spawn --drain-queue (fm-tick spawnq) now runs
+# ci_watch first: for each open card whose latest receipt waits on CI it reads the PR's checks (gh pr view). When all
+# checks finished (green, failed, merged or closed) the wait ends: the ledger marks it done (live_slots then frees the
+# slot) and the card's resume goes to the head of its stack queue (an existing queue entry of the card moves there;
+# else a new entry with a resume task file in the same cwd/worktree). The same tick's drain then starts it.
+# A green CI whose job has not started again 15 min later gets one #omp-alerts line.
+CI_LEDGER = os.path.join(STATE, "ci-wait.json")
+CI_ALERT_S = int(os.environ.get("FM_SPAWN_CI_ALERT_S") or 15 * 60)
+CI_MAX_AGE_S = int(os.environ.get("FM_SPAWN_CI_MAX_AGE_S") or 7 * 86400)  # older CI-wait receipts are not watched
+# Time budget for all gh lookups of one tick: a slow GitHub must never use up the spawnq step (150 s) before the drain.
+CI_BUDGET_S = float(os.environ.get("FM_SPAWN_CI_BUDGET_S") or 45)
+GH_TIMEOUT_S = 10
+GH = os.environ.get("FM_SPAWN_GH") or "gh"
+RESUME_DIR = os.path.join(STATE, "resume")
+PR_RE = re.compile(r"(?:\bPR\s*#|/pull/)(\d+)", re.I)
+REPO_RE = re.compile(r"github\.com/([\w.-]+/[\w.-]+?)/(?:pull|actions|commit)/")
+ORIG_TASK_RE = re.compile(r"^Original task file: `([^`]+)`", re.M)
+CI_RUNNING = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED", "EXPECTED"}
+CI_BAD = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR", "STALE"}
+
+
+def ci_ledger():
+    d = _json(CI_LEDGER, {})
+    return d if isinstance(d, dict) else {}
+
+
+def _save_ci_ledger(d):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = CI_LEDGER + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, CI_LEDGER)
+
+
+CI_DONE_EXTRA = set()  # dry run: waits ci_watch would mark done (nothing is written)
+
+
+def ci_key(card, r):
+    """Ledger key of a CI-wait receipt: card:tsMs; without tsMs card:0:<hash of summary + evidence>."""
+    ts = int(r.get("tsMs") or 0)
+    if ts:
+        return f"{card}:{ts}"
+    import hashlib
+    h = hashlib.sha1(json.dumps([r.get("summary"), r.get("evidence")], sort_keys=True, default=str).encode()).hexdigest()
+    return f"{card}:0:{h[:10]}"
+
+
+def ci_wait_done(card, ts, ledger=None):
+    """The CI wait of the card's current receipt has ended (ci_watch saw every check finish)."""
+    key = f"{card}:{ts}" if ts else ci_key(card, _receipt(card))
+    return key in CI_DONE_EXTRA or bool((ledger if ledger is not None else ci_ledger()).get(key, {}).get("ciDone"))
+
+
+def ci_target(r):
+    """(PR number, owner/repo or None) named by a CI-wait receipt's summary/evidence; (None, None) when it names none."""
+    text = " ".join([str(r.get("summary") or "")] + [str(x) for x in (r.get("evidence") or []) if x])
+    pr = PR_RE.search(text)
+    repo = REPO_RE.search(text)
+    return (int(pr.group(1)) if pr else None), (repo.group(1) if repo else None)
+
+
+def ci_state(pr, repo, cwd):
+    """("pending"|"green"|"failed"|"merged"|"closed"|"unknown", detail) for the PR's checks (gh pr view)."""
+    cmd = [GH, "pr", "view", str(pr), "--json", "state,statusCheckRollup"] + (["-R", repo] if repo else [])
+    try:
+        p = subprocess.run(cmd, cwd=cwd if cwd and os.path.isdir(cwd) else None, capture_output=True, text=True,
+                           timeout=GH_TIMEOUT_S)
+        d = json.loads(p.stdout) if p.returncode == 0 else None
+    except Exception as e:
+        return "unknown", str(e)[:200]
+    if not isinstance(d, dict):
+        return "unknown", (p.stderr or p.stdout).strip()[:200]
+    if d.get("state") == "MERGED":
+        return "merged", "PR merged"
+    if d.get("state") == "CLOSED":
+        return "closed", "PR closed without merge"
+    return rollup_state(d.get("statusCheckRollup") or [])
+
+
+RUN_ID_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
+
+
+def current_checks(checks):
+    """Checks without superseded runs: for an Actions workflow with several runs on the head, drop an older run
+    that was cancelled (any CANCELLED check) when a newer run of the same workflow exists."""
+    runs = {}
+    for c in checks:
+        m = RUN_ID_RE.search(str(c.get("detailsUrl") or "")) if c.get("workflowName") else None
+        if m:
+            runs.setdefault(c["workflowName"], {}).setdefault(int(m.group(1)), []).append(c)
+    drop = set()
+    for byrun in runs.values():
+        newest = max(byrun)
+        for rid, cs in byrun.items():
+            if rid != newest and any(str(x.get("conclusion") or "").upper() == "CANCELLED" for x in cs):
+                drop.update(id(x) for x in cs)
+    return [c for c in checks if id(c) not in drop]
+
+
+def rollup_state(checks):
+    """(state, detail) for a statusCheckRollup list; superseded cancelled runs are ignored."""
+    checks = current_checks(checks)
+    if not checks:
+        return "pending", "no checks yet"
+    running = [c for c in checks if str(c.get("status") or c.get("state") or "").upper() in CI_RUNNING]
+    if running:
+        return "pending", f"{len(running)} of {len(checks)} checks not finished"
+    bad = [c.get("name") or c.get("context") or "?" for c in checks
+           if str(c.get("conclusion") or c.get("state") or "").upper() in CI_BAD]
+    if bad:
+        return "failed", f"{len(bad)} of {len(checks)} checks failed: {', '.join(bad[:5])}"
+    return "green", f"{len(checks)} checks passed"
+
+
+def _orig_task(task):
+    """The first task file of a job: a resume task file names it on its "Original task file:" line."""
+    for _ in range(5):
+        if not task or not os.path.isfile(task) or not inside(task, RESUME_DIR):
+            return task
+        try:
+            m = ORIG_TASK_RE.search(open(task, encoding="utf-8").read(20_000))
+        except OSError:
+            return task
+        if not m:
+            return task
+        task = m.group(1)
+    return task
+
+
+def resume_task(card, r, state, detail, pr, repo, ctx):
+    """Text of the resume task file for a card whose CI wait ended."""
+    orig = ctx.get("task")
+    flow = "full"
+    try:
+        m = re.search(r"(?im)^\s*Flow:\s*(full|short)\b", open(orig, encoding="utf-8").read(200_000)) if orig else None
+        flow = m.group(1).lower() if m else flow
+    except OSError:
+        pass
+    wt = ctx.get("wt") or {}
+    lines = [f"# Resume card {card}: CI wait ended ({state})", "", f"Flow: {flow}", "",
+             f"Original task file: `{orig}`" if orig else "Original task file: none recorded (read the card).", "",
+             "## Target",
+             f"- CI for PR #{pr}{f' ({repo})' if repo else ''} finished: {state} ({detail}).",
+             f"- The previous session (pane {r.get('pane') or '?'}) stopped with this receipt: blocked \"{r.get('summary')}\".",
+             f"- Continue the job of card {card} in {ctx['cwd']}: the same folder"
+             + (f", worktree and branch {wt.get('branch')}" if wt.get("branch") else "") + ". Do not make a new worktree.",
+             f"- Read the card (`fm get {card}`) and the original task file first.",
+             ("- CI is green or the PR is merged: continue with the next flow step (review, merge, deploy, verify live)."
+              if state in ("green", "merged") else
+              "- CI did not pass: read the failed checks (`gh pr checks <PR>`), fix the cause or hand it to its owning card. "
+              "Re-run CI at most once per commit."), ""]
+    if wt.get("repo") and wt.get("path") and wt.get("branch") and wt.get("base"):
+        lines += ["## Merge back", merge_steps(wt["repo"], wt["path"], wt["branch"], wt["base"]), ""]
+    lines += ["## Acceptance check", "- The acceptance check of the original task file applies.", ""]
+    return "\n".join(lines)
+
+
+def _job_ctx(card, r, all_panes):
+    """Where the card's job ran: {cwd, task, label, workspace, stack, wt} from spawned.jsonl (the receipt's pane first),
+    worktrees.json and the live pane list."""
+    rows = [e for e in read_jsonl(SPAWNED) if e.get("card") == card]
+    e = next((x for x in reversed(rows) if r.get("pane") and x.get("pane") == r.get("pane")), None) or (rows[-1] if rows else {})
+    pane = next((p for p in all_panes if p.get("pane_id") == (r.get("pane") or e.get("pane"))), {})
+    cwd = e.get("cwd") or pane.get("cwd")
+    wt = next((w for w in reversed(reg_read()) if (e.get("worktree") and w.get("path") == e.get("worktree"))
+               or (cwd and w.get("path") and inside(cwd, w["path"]))), {})
+    return {"cwd": cwd, "task": _orig_task(e.get("task") or wt.get("task")), "label": e.get("label") or wt.get("label"),
+            "workspace": e.get("workspace") or pane.get("workspace_id"), "stack": e.get("stack"), "wt": wt}
+
+
+def pane_busy(p):
+    """The pane's agent works or waits for input: Herdr agent_status working/blocked, or OMP's spinner in the
+    terminal title (the same test as fm-tabwatch looks_finished)."""
+    return p.get("agent_status") in ("working", "blocked") or bool(SPINNER.search(p.get("terminal_title") or ""))
+
+
+def live_slots(stack, all_panes, cards, why=None):
+    """{card id (or pane id): tab id} for the jobs that hold a slot of `stack` now. One Herdr tab = one job session =
+    one slot, also when several cards name it (count with len(set(held.values()))).
+    A slot is held by (1) a running card whose `job` names a live pane/tab, or (2) a live pane from spawned.jsonl
+    whose card is not done and has no done/failed/non-CI blocked receipt since the spawn, while one of these is
+    true: a pane in its tab works or is blocked (pane_busy); the card's receipt since the spawn waits on CI; the
+    spawn is younger than LAUNCH_HOLD_S (the agent has not started yet). A done/idle pane of a paused or partial card
+    frees the slot (card fm-spawn-dead-slots, 2026-11-01: 6 finished Webapp tabs held 3 slots for hours).
+    A CI wait that ci_watch saw end (every check finished) no longer holds the slot (card fm-ci-wait-no-resume).
+    `why` (a dict) gets the reason per key: running, busy, ci or launch."""
+    tab_of = {p.get("pane_id"): p.get("tab_id") or p.get("pane_id") for p in all_panes if p.get("pane_id")}
+    live_tabs = set(tab_of.values())
+    running = _json(os.environ.get("FM_SPAWN_RUNNING") or os.path.join(os.path.dirname(ITEMS), "running.json"), {})
+    item_jobs = (running.get("itemJobs") if isinstance(running, dict) else None) or {}
+    by_id = {c["id"]: c for c in cards}
+    held = {}
+    for c in cards:  # running cards whose job pane/tab is live (labels and codes resolved by running.json)
+        if c.get("s") != "running" or not c.get("job") or card_stack(c) != stack:
+            continue
+        hit = next((tab_of.get(t, t) for t in _tags(c["job"]) if t in tab_of or t in live_tabs), None) or \
+            next((tab_of[p] for p in _tags(item_jobs.get(c["id"])) if p in tab_of), None)
+        if hit:
+            held[c["id"]] = hit
+            if why is not None:
+                why[c["id"]] = "running"
+    busy_tabs = {tab_of[p["pane_id"]] for p in all_panes if p.get("pane_id") and pane_busy(p)}
+    now, ledger = _now_ms(), ci_ledger()
+    for e in read_jsonl(SPAWNED):  # panes fm-spawn started: a CI wait keeps the slot after R11 unlinks the job
+        pane, cid = e.get("pane"), e.get("card")
+        if pane not in tab_of or (cid or pane) in held:
+            continue
+        c = by_id.get(cid) if cid else None
+        if (e.get("stack") or (card_stack(c) if c else None)) != stack:
+            continue
+        ts = int(e.get("tsMs") or 0)
+        if c and (c.get("s") == "done" or slot_freed_ms(cid) >= ts):
+            continue
+        ci_ts = ci_wait_ms(cid) if cid else None  # a CI-wait receipt without tsMs counts as written after the spawn
+        ci_hold = ci_ts is not None and (ci_ts == 0 or ci_ts >= ts) and not ci_wait_done(cid, ci_ts, ledger)
+        busy = tab_of[pane] in busy_tabs
+        if not (busy or ci_hold or now - ts < LAUNCH_HOLD_S * 1000):
+            continue  # finished pane (done/idle) of a card that does not run and does not wait on CI
+        held[cid or pane] = tab_of[pane]
+        if why is not None:
+            why[cid or pane] = "busy" if busy else "ci" if ci_hold else "launch"
+    return held
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def reservations(stack=None, skip_qid=None):
+    """Live reservations (caller holds slots_lock): a spawn between its cap check and its spawned.jsonl record
+    (kept while its pid lives), or a drained start (`qid`, kept LAUNCH_HOLD_S until the started spawn takes over).
+    With `stack` (counting): an `own` reservation (a card that takes over its own CI-wait slot) is not counted."""
+    now = _now_ms()
+    rs = _json(RESERVED, [])
+    rs = [r for r in (rs if isinstance(rs, list) else []) if isinstance(r, dict) and (
+        now - int(r.get("tsMs") or 0) < LAUNCH_HOLD_S * 1000 if r.get("qid")
+        else _pid_alive(r.get("pid")) and now - int(r.get("tsMs") or 0) < RESERVE_MAX_S * 1000)]
+    return [r for r in rs if (stack is None or (r.get("stack") == stack and not r.get("own")))
+            and not (skip_qid and r.get("qid") == skip_qid)]
+
+
+def own_ci_slot(card, why, cards, res):
+    """The card holds a slot only through its own idle CI wait (and is not running): its new job (a resume) takes
+    over that slot instead of queueing behind it (card fm-ci-wait-no-resume). Only one start per card: a live
+    reservation of the card (`res`, a start in flight) means the slot is already taken."""
+    if not card or why.get(card) != "ci" or any(r.get("card") == card for r in res):
+        return False
+    return next((c.get("s") for c in cards if c.get("id") == card), None) != "running"
+
+
+def _write_reserved(rs):
+    tmp = RESERVED + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rs, f)
+    os.replace(tmp, RESERVED)
+
+
+def release_slot():
+    with slots_lock():
+        rs = reservations()
+        mine = [r for r in rs if r.get("pid") == os.getpid() and not r.get("qid")]
+        if mine:
+            _write_reserved([r for r in rs if not (r.get("pid") == os.getpid() and not r.get("qid"))])
+
+
+def queue_entry(args, stack, ws, attempts=0):
+    return {"id": args.queue_id or f"q{_now_ms()}-{os.getpid()}", "tsMs": int(args.queue_ts or 0) or _now_ms(),
+            "stack": stack, "label": args.label, "cwd": real(args.cwd), "task": real(args.task), "card": args.card,
+            "slug": args.slug, "base": args.base, "workspace": ws, "no_worktree": bool(args.no_worktree),
+            "attempts": attempts, **({"alerted": args.queue_alerted} if getattr(args, "queue_alerted", 0) else {})}
+
+
+def cap_check(args, stack, ws):
+    """None when the spawn may start (a capped stack then has a slot reserved for this process); else the queued result.
+    A new spawn never jumps the queue: while the stack has queued jobs it queues behind them. A card that is already
+    queued keeps its place (no second entry)."""
+    fz = dev_freeze()
+    if fz is not None and stack not in FREEZE_ALLOWED:
+        # Card dev-freeze-gate: hold the spawn in the queue; drain_queue keeps it until the freeze flag is cleared.
+        entry = queue_entry(args, stack, ws, int(args.queue_attempts or 0))
+        if not args.dry_run:
+            with slots_lock():
+                rows = [r for r in read_jsonl(QUEUE) if r.get("id") != entry["id"]]
+                same = next((r for r in rows if args.card and r.get("card") == args.card), None)
+                if same is None:
+                    write_jsonl(QUEUE, [entry] + rows if args.queue_id else rows + [entry])
+                if args.queue_id:
+                    _write_reserved(reservations(skip_qid=args.queue_id))
+        return {"queued": True, "frozen": fz, "position": 0, "stack": stack, "cap": 0, "used": 0, "live": [],
+                "id": entry["id"], "label": args.label, "card": args.card, "workspace": ws}
+    cap = stack_caps().get(stack)
+    if not cap:
+        return None
+    cards = card_list()
+    with slots_lock():
+        why = {}
+        held = live_slots(stack, panes(), cards, why)  # pane list read under the lock: a spawn that just made its tab counts
+        res = reservations(stack, skip_qid=args.queue_id)
+        rows = read_jsonl(QUEUE)
+        ahead = [r for r in rows if r.get("stack") == stack and r.get("id") != args.queue_id]
+        used = len(set(held.values())) + len(res)
+        live = sorted(held) + [f"starting: {r.get('label')}" for r in res]
+        if own_ci_slot(args.card, why, cards, reservations(skip_qid=args.queue_id)):  # its own CI-wait slot
+            if not args.dry_run:
+                rs = reservations(skip_qid=args.queue_id)
+                _write_reserved(rs + [{"stack": stack, "pid": os.getpid(), "tsMs": _now_ms(), "label": args.label,
+                                       "card": args.card, "own": True}])
+                OWN_START.append(args.card)  # spawn() drops the card's queued entry once spawned.jsonl records it
+                atexit.register(release_slot)
+                log(f"slot: {args.label} takes over the CI-wait slot of its card {args.card} ({held[args.card]})")
+            return None
+        same = next((i for i, r in enumerate(ahead) if args.card and r.get("card") == args.card), None)
+        if same is not None and not args.queue_id:
+            e = ahead[same]
+            return {"queued": True, "position": same + 1, "stack": stack, "cap": cap, "used": used, "live": live,
+                    "id": e.get("id"), "label": e.get("label"), "card": args.card, "workspace": e.get("workspace"),
+                    "already": True}
+        if used < cap and (args.queue_id or not ahead):
+            if not args.dry_run:
+                rs = reservations(skip_qid=args.queue_id)  # this start takes over the drain's reservation
+                _write_reserved(rs + [{"stack": stack, "pid": os.getpid(), "tsMs": _now_ms(), "label": args.label,
+                                       "card": args.card}])
+                atexit.register(release_slot)
+            return None
+        entry = queue_entry(args, stack, ws, int(args.queue_attempts or 0))
+        position = 1 if args.queue_id else len(ahead) + 1
+        if not args.dry_run:
+            rest = [r for r in rows if r.get("id") != entry["id"]]
+            write_jsonl(QUEUE, [entry] + rest if args.queue_id else rest + [entry])
+            if args.queue_id:
+                _write_reserved(reservations(skip_qid=args.queue_id))
+    return {"queued": True, "position": position, "stack": stack, "cap": cap, "used": used, "live": live,
+            "id": entry["id"], "label": args.label, "card": args.card, "workspace": ws}
+
+
+def report_queued(args, q):
+    print(json.dumps({"dry_run": True, **q} if args.dry_run else q, ensure_ascii=False))
+    if q.get("frozen") is not None:
+        print(f"fm-spawn: held: regular work is frozen ({q['frozen']}); stack {q['stack']} waits in the queue until "
+              "`fm-freeze off`. Nothing was created.", file=sys.stderr)
+        if not args.dry_run:
+            log(f"FROZEN-HELD {args.label}: stack {q['stack']} ({q['frozen']})")
+            if args.card and not args.queue_id:
+                run([FM, "set", args.card, "planned", f"⏸️ Held by dev-freeze-gate: regular work is frozen ({q['frozen']}); "
+                     "fm-tick starts it when the freeze ends."], check=False)
+        return EXIT_QUEUED
+    print(f"fm-spawn: queued: stack {q['stack']} is at its cap ({q['used']} live job tabs of {q['cap']}: "
+          f"{', '.join(q['live'])}). Position {q['position']}"
+          + (" (this card was already queued; no second entry)" if q.get("already") else "")
+          + "; fm-tick (spawnq) starts it when a slot frees. Nothing was created.", file=sys.stderr)
+    if args.dry_run or q.get("already"):
+        return EXIT_QUEUED
+    log(f"QUEUED {args.label}: stack {q['stack']} at cap {q['cap']} ({', '.join(q['live'])}); position {q['position']}")
+    if args.card and not args.queue_id:
+        run([FM, "set", args.card, "planned",
+             f"📥 Queued by fm-spawn: stack {q['stack']} is at its cap of {q['cap']} live jobs; position {q['position']}. "
+             f"fm-tick starts it when a slot frees (queue {QUEUE})."], check=False)
+    return EXIT_QUEUED
+
+
+def requeue_front(args, rc):
+    """A drained spawn that did not start goes back to the head of the queue. Tab cap (4) and pause (5 before the
+    start) wait without limit; other failures count, and after QUEUE_MAX_ATTEMPTS the entry leaves the queue and the
+    card gets a "needs check" note (never silent)."""
+    if args.dry_run:
+        return
+    attempts = int(args.queue_attempts or 0) + (0 if rc in (4, "pause") else 1)
+    entry = queue_entry(args, args.stack, args.workspace, attempts)
+    with slots_lock():
+        rows = [r for r in read_jsonl(QUEUE) if r.get("id") != args.queue_id]
+        if attempts < QUEUE_MAX_ATTEMPTS:
+            write_jsonl(QUEUE, [entry] + rows)
+        else:
+            write_jsonl(QUEUE, rows)
+        _write_reserved(reservations(skip_qid=args.queue_id))
+    if attempts < QUEUE_MAX_ATTEMPTS:
+        log(f"queue: {args.label} ({args.queue_id}) back at the head of the {args.stack} queue (exit {rc}, attempt {attempts})")
+        return
+    log(f"queue: DROPPED {args.label} ({args.queue_id}) after {attempts} failed starts (last exit {rc})")
+    if args.card:
+        run([FM, "set", args.card, "partial", f"📥 fm-spawn queue: the queued start failed {attempts} times (last exit {rc}; "
+             f"log {LOG}); left the queue; needs check"], check=False)
+
+
+STARTED = []  # set once the tab exists: a later failure must not start a second tab
+OWN_START = []  # the card of a start on its own CI-wait slot (cap_check)
+
+
+def run_queued(a):
+    """A drained spawn (--queue-id): every start that does not happen goes back to the queue (requeue_front)."""
+    pause = maint_pause()
+    if pause is not None:
+        print(f"fm-spawn: agent work is paused ({pause}); queued job kept", file=sys.stderr)
+        requeue_front(a, "pause")
+        return 5
+    try:
+        rc = spawn(a)
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else 1
+        if e.code and not isinstance(e.code, int):
+            print(e.code, file=sys.stderr)
+    except Exception as e:
+        print(f"fm-spawn: queued start failed: {e}", file=sys.stderr)
+        rc = 1
+    if rc not in (0, EXIT_QUEUED):
+        if STARTED:
+            log(f"queue: {a.label} ({a.queue_id}) failed after its tab {STARTED[0]} was made (exit {rc}); not requeued")
+        else:
+            requeue_front(a, rc)
+    return rc
+
+
+def queued_cmd(r):
+    cmd = [sys.executable, os.path.realpath(__file__), "--label", r["label"], "--cwd", r["cwd"], "--task", r["task"],
+           "--stack", r["stack"], "--workspace", r["workspace"], "--queue-id", r["id"],
+           "--queue-attempts", str(int(r.get("attempts") or 0)), "--queue-ts", str(int(r.get("tsMs") or 0)),
+           "--queue-alerted", str(int(r.get("alerted") or 0))]
+    for k in ("card", "slug", "base"):
+        if r.get(k):
+            cmd += [f"--{k}", str(r[k])]
+    return cmd + (["--no-worktree"] if r.get("no_worktree") else [])
+
+
+def launch_queued(r):
+    """Start a queued spawn in its own transient --user unit (KillMode=process): the fm-tick oneshot ends at once,
+    and the spawn's detached channel waiter must survive both."""
+    cmd = queued_cmd(r)
+    if LAUNCHER:
+        full = [LAUNCHER] + cmd
+    else:
+        unit = "fm-spawn-q-" + re.sub(r"[^A-Za-z0-9_.-]", "-", r["id"])
+        full = ["systemd-run", "--user", "--collect", "--quiet", "--unit", unit, "-p", "KillMode=process",
+                f"--setenv=PATH={os.environ.get('PATH', '')}", f"--setenv=HOME={HOME}"] + cmd
+    try:
+        p = subprocess.run(full, capture_output=True, text=True, timeout=20)
+        return p.returncode == 0, (p.stderr or p.stdout).strip()[:300]
+    except Exception as e:
+        return False, str(e)[:300]
+
+
+def ci_watch(dry_run=False):
+    """fm-tick spawnq, before the drain (card fm-ci-wait-no-resume): end finished CI waits and queue their resumes.
+    For every open card (not done/backlog/stopped) whose receipt is a blocked "waiting on CI" receipt younger than
+    CI_MAX_AGE_S: read the PR's checks. When all finished (green/failed) or the PR is merged/closed, mark the wait done
+    in ci-wait.json (live_slots frees its slot) and, unless the card already runs again, put the card's resume at the
+    head of the queue (its existing queue entry, else a new one with a resume task file, --no-worktree in the same
+    folder). A finished CI whose job has not started again CI_ALERT_S later gets one #omp-alerts line; so does a
+    wait fm-spawn cannot watch (no PR number; no repo URL and no job folder) and, after 4 x CI_ALERT_S, one whose gh
+    lookup keeps failing or whose PR shows no checks. A receipt without tsMs is keyed by a hash of its text (ci_key).
+    Returns the queue rows a dry run would leave (None when the queue would not change)."""
+    cards, now = card_list(), _now_ms()
+    ledger, changed, sim, cache = ci_ledger(), False, None, {"deadline": time.time() + CI_BUDGET_S, "skipped": []}
+    for c in cards:
+        cid = c["id"]
+        if c.get("s") in ("done", "backlog") or STOPNOTE.search(str(c.get("n") or "")):
+            continue
+        r = _receipt(cid)
+        if r.get("result") != "blocked" or not CI_WAIT.search(str(r.get("summary") or "")):
+            continue
+        ts = int(r.get("tsMs") or 0)
+        if ts and now - ts > CI_MAX_AGE_S * 1000:
+            continue
+        key = ci_key(cid, r)
+        L = dict(ledger.get(key) or {"card": cid, "first": now})
+        try:
+            sim = ci_watch_one(c, r, key, L, now, dry_run, sim, cache)
+        except Exception as e:  # one bad card never stops the others or the drain; its record is not saved (retry)
+            CI_DONE_EXTRA.discard(key)
+            print(f"{'DRY ' if dry_run else ''}CI wait {cid}: watch failed: {e}")
+            if not dry_run:
+                log(f"ci: {cid}: watch failed: {e!r}")
+            continue
+        if L != ledger.get(key):
+            ledger[key], changed = L, True
+    if cache["skipped"]:
+        print(f"{'DRY ' if dry_run else ''}CI watch: time budget ({CI_BUDGET_S:g} s) used up; next tick checks "
+              f"{', '.join(cache['skipped'])}")
+        if not dry_run:
+            log(f"ci: budget {CI_BUDGET_S:g} s used up; skipped {', '.join(cache['skipped'])}")
+    if changed and not dry_run:
+        keep = {k: v for k, v in ledger.items() if now - int(v.get("first") or now) < 14 * 86400 * 1000}
+        _save_ci_ledger(keep)
+    return sim
+
+
+def ci_watch_one(c, r, key, L, now, dry_run, sim, cache):
+    """ci_watch for one card's CI-wait receipt; updates the ledger record L in place. Returns the dry-run queue.
+    `cache` keeps the Herdr pane list for the whole watch (read once, only when needed)."""
+    cid, pre = c["id"], "DRY " if dry_run else ""
+    if "panes" not in cache:
+        cache["panes"] = None
+    if not L.get("ciDone"):
+        pr, repo = ci_target(r)
+        if pr and not repo:
+            cache["panes"] = cache["panes"] if cache["panes"] is not None else panes()
+            ctx = _job_ctx(cid, r, cache["panes"])
+            if not (ctx.get("cwd") and os.path.isdir(ctx["cwd"])):
+                pr = None  # gh would read PR #N of whatever repo fm-spawn runs in
+        if not pr:
+            if not L.get("cannot"):
+                L["cannot"] = now
+                print(f"{pre}CI wait {cid}: the receipt names no PR (or no repo URL and no job folder); cannot watch it")
+                if not dry_run:
+                    log(f"ci: {cid} receipt {r.get('tsMs')} cannot be watched (no PR, or no repo and no folder)")
+            ci_alert(cid, L, now, dry_run, "fm-spawn cannot watch its CI-wait receipt (no PR number, or no repo URL "
+                     "and no job folder), so nothing frees its slot or resumes it", since=int(L["cannot"]),
+                     flag="alertedStuck")
+            return sim
+        if time.time() > cache["deadline"]:  # budget used up: this card waits for the next tick
+            cache["skipped"].append(cid)
+            return sim
+        cache["panes"] = cache["panes"] if cache["panes"] is not None else panes()
+        ctx = _job_ctx(cid, r, cache["panes"])
+        state, detail = ci_state(pr, repo, ctx["cwd"])
+        L.update(pr=pr, repo=repo, ci=state, detail=detail, checked=now)
+        if state in ("pending", "unknown"):
+            if dry_run:
+                print(f"DRY CI wait {cid}: PR #{pr} {state} ({detail})")
+            if state == "unknown" or detail == "no checks yet":  # gh keeps failing, or the PR has no CI at all
+                L.setdefault("stuck", now)
+                ci_alert(cid, L, now, dry_run, f"the CI state of PR #{pr} cannot be read ({state}: {detail})",
+                         since=int(L["stuck"]), delay_s=4 * CI_ALERT_S, flag="alertedStuck")
+            else:
+                L.pop("stuck", None)
+            return sim
+        L["ciDone"] = now
+        if dry_run:
+            CI_DONE_EXTRA.add(key)
+        else:
+            log(f"ci: {cid} PR #{pr} {state} ({detail}); CI wait ended, slot freed")
+        if c.get("s") == "running":
+            L["resumed"] = "card already running"
+            print(f"{pre}CI wait {cid}: PR #{pr} {state} ({detail}); card already runs again")
+        else:
+            sim = ci_requeue(c, r, L, ctx, state, detail, dry_run, sim)
+    if not L.get("alerted"):
+        started = c.get("s") in ("running", "done") or any(
+            e.get("card") == cid and int(e.get("tsMs") or 0) >= int(L["ciDone"]) for e in read_jsonl(SPAWNED))
+        if not started:
+            why = L.get("resumed") or "not queued"
+            q = sim if sim is not None else read_jsonl(QUEUE)
+            pos = next((i + 1 for i, x in enumerate(q) if x.get("card") == cid), None)
+            if pos:
+                why = f"queue position {pos}" + (f"; dev freeze ({dev_freeze()})" if dev_freeze() is not None else "")
+            ci_alert(cid, L, now, dry_run, f"CI for PR #{L.get('pr')} went {L.get('ci')} and the job has not started "
+                     f"again ({why})", since=int(L["ciDone"]))
+    return sim
+
+
+def ci_alert(cid, L, now, dry_run, what, since, delay_s=None, flag="alerted"):
+    """One #omp-alerts line per CI wait and `flag` once `since` is CI_ALERT_S (or delay_s) old; never while paused."""
+    if L.get(flag) or now - since < (CI_ALERT_S if delay_s is None else delay_s) * 1000 or maint_pause() is not None:
+        return
+    text = (f"🔁 fm-spawn CI wait: `{cid}`: {what} for {round((now - since) / 60000)} min. Check the card and start "
+            f"its resume (fm-spawn --drain-queue --dry-run shows the queue). ⚓ item:{cid}")
+    print(("DRY " if dry_run else "") + text)
+    if dry_run:
+        return
+    ok, detail = post("omp-alerts", text, timeout=5)
+    log(f"ci: alert for {cid}: {'posted ' + detail if ok else 'FAILED ' + detail}")
+    if ok:  # once per CI wait; a failed post is tried again next tick
+        L[flag] = now
+
+
+def ci_requeue(c, r, L, ctx, state, detail, dry_run, sim):
+    """Put the card's resume at the head of the queue: its queued entry moves there, else a new entry with a resume
+    task file (same folder, no new worktree). Returns the simulated queue for a dry run."""
+    cid, pr = c["id"], L.get("pr")
+    st = ctx.get("stack") or card_stack(c)
+    with slots_lock():
+        rows = sim if sim is not None else read_jsonl(QUEUE)
+        mine = [x for x in rows if x.get("card") == cid]
+        others = [x for x in rows if x.get("card") != cid]
+        if mine:
+            head = {**mine[0], "resume": "ci"}
+            how = "moved its queued entry to the head of the queue"
+        elif ctx.get("cwd") and os.path.isdir(ctx["cwd"]):
+            path = os.path.join(RESUME_DIR, f"{re.sub(r'[^A-Za-z0-9_.-]', '-', cid)}-{int(r.get('tsMs') or 0)}.md")
+            if not dry_run:
+                os.makedirs(RESUME_DIR, exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(resume_task(cid, r, state, detail, pr, L.get("repo"), ctx))
+            label = "🔁 " + re.sub(r"^🔁\s*", "", ctx.get("label") or cid)
+            head = {"id": f"r{_now_ms()}-{os.getpid()}", "tsMs": _now_ms(), "stack": st, "label": label,
+                    "cwd": ctx["cwd"], "task": path, "card": cid, "slug": None, "base": None,
+                    "workspace": ctx.get("workspace"), "no_worktree": True, "attempts": 0, "resume": "ci"}
+            how = f"queued its resume at the head of the {st} queue ({path})"
+        else:
+            L["resumed"] = "no folder known for a resume"
+            print(f"{'DRY ' if dry_run else ''}CI wait {cid}: PR #{pr} {state} ({detail}); no folder known, cannot queue a resume")
+            if not dry_run:
+                log(f"ci: {cid} PR #{pr} {state}: no folder known for a resume")
+            return sim
+        new = [head] + others
+        if not dry_run:
+            write_jsonl(QUEUE, new)
+    L.update(resumed="queued", qid=head["id"])
+    print(f"{'DRY would have ' if dry_run else ''}CI wait {cid}: PR #{pr} {state} ({detail}); {how}")
+    if dry_run:
+        return new
+    log(f"ci: {cid}: {how}")
+    run([FM, "set", cid, "planned", f"🔁 CI wait ended: PR #{pr} {state} ({detail}). fm-spawn {how}; "
+         "fm-tick starts it as soon as its stack has a free slot (the ended wait holds none)."], check=False)
+    return sim
+
+
+def drain_queue(dry_run=False):
+    """fm-tick step spawnq: start queued spawns whose stack has a free slot, oldest first per stack.
+    Paused agent work (exit 5 rule) and a workspace over the tab cap (exit 4 rule) keep the queue as it is.
+    Entries whose card is done, parked (backlog) or already running elsewhere leave the queue (logged).
+    First ci_watch ends finished CI waits (frees their slots) and puts their resumes at the head of the queue.
+    A card whose only slot is its own idle CI wait takes that slot over (own_ci_slot) and does not wait for a free one."""
+    try:
+        sim = ci_watch(dry_run)
+    except Exception as e:  # the CI watch must never stop the queue
+        sim = None
+        print(f"fm-spawn --drain-queue: CI watch failed: {e}")
+        if not dry_run:
+            log(f"ci: watch failed: {e!r}")
+    if not (sim if sim is not None else read_jsonl(QUEUE)):
+        return 0
+    pause = maint_pause()
+    if pause is not None:
+        print(f"fm-spawn --drain-queue: agent work is paused ({pause}); queue kept")
+        return 0
+    cards, caps = card_list(), stack_caps()
+    state = {c["id"]: c.get("s") for c in cards}
+    # stop-sync (card dev-freeze-gate): a card stopped while its start was in flight must not come back from the queue
+    stopped = {c["id"] for c in cards if STOPNOTE.search(str(c.get("n") or ""))}
+    tabs_ok, start, drop, alert, holds = {}, [], [], [], {}
+    with slots_lock():
+        all_panes = panes()  # under the lock: a start from the last tick that just made its tab counts
+        rows, keep, free = (sim if sim is not None else read_jsonl(QUEUE)), [], {}
+        res_all = reservations()
+        fz = dev_freeze()
+        for r in rows:
+            st = r.get("stack") or "firstmate"
+            if fz is not None and st not in FREEZE_ALLOWED:
+                keep.append(r)  # card dev-freeze-gate: held while regular work is frozen
+                continue
+            s = state.get(r.get("card")) if r.get("card") else None
+            if r.get("card") in stopped:
+                drop.append((r, "card stopped"))
+                continue
+            if s in ("done", "backlog", "running") or not (r.get("label") and r.get("cwd") and r.get("task") and r.get("id")):
+                drop.append((r, s or "incomplete entry"))
+                continue
+            if st not in free:
+                cap = caps.get(st)
+                holds[st] = {}
+                free[st] = cap - len(set(live_slots(st, all_panes, cards, holds[st]).values())) - len(reservations(st)) if cap else len(rows)
+            ws = r.get("workspace") or pick_workspace(all_panes, None)
+            if ws not in tabs_ok:
+                tabs_ok[ws] = tab_cap(ws) is None
+                if not tabs_ok[ws]:
+                    print(f"fm-spawn --drain-queue: workspace {ws} is over {MAX_TABS} tabs; its queued jobs wait")
+            own = caps.get(st) and own_ci_slot(r.get("card"), holds[st], cards, res_all)
+            if (own or free[st] > 0) and tabs_ok[ws]:
+                if own:  # its own CI-wait slot; it never takes another job's slot
+                    holds[st].pop(r["card"], None)
+                else:
+                    free[st] -= 1
+                start.append({**{k: v for k, v in r.items() if k != "own"}, "stack": st, "workspace": ws,
+                              **({"own": True} if own else {})})
+                continue
+            if _now_ms() - int(r.get("tsMs") or 0) > QUEUE_ALERT_S * 1000 and not r.get("alerted"):
+                alert.append(r)
+            keep.append(r)
+        if not dry_run and (start or drop):
+            write_jsonl(QUEUE, keep)
+            if start:  # hold the slots until each started spawn reserves its own
+                _write_reserved(reservations() + [{"stack": r["stack"], "qid": r["id"], "tsMs": _now_ms(), "label": r["label"],
+                                                   "card": r.get("card"), **({"own": True} if r.get("own") else {})}
+                                                  for r in start])
+    for r, why in drop:
+        print(f"{'DRY would drop' if dry_run else 'dropped'} queued {r.get('label')} (card {r.get('card') or '-'}: {why})")
+        if not dry_run:
+            log(f"queue: dropped {r.get('label')} ({r.get('id')}) card {r.get('card') or '-'}: {why}")
+    for r in start:
+        if dry_run:
+            print(f"DRY would start queued {r['label']} (stack {r['stack']}, card {r.get('card') or '-'})")
+            continue
+        ok, detail = launch_queued(r)
+        if not ok:  # back to the head; the next tick tries again
+            with slots_lock():
+                r = {k: v for k, v in r.items() if k != "own"}
+                write_jsonl(QUEUE, [r] + [x for x in read_jsonl(QUEUE) if x.get("id") != r["id"]])
+                _write_reserved(reservations(skip_qid=r["id"]))
+        print(f"{'started' if ok else 'FAILED to start'} queued {r['label']} (stack {r['stack']}, card {r.get('card') or '-'})"
+              + (f": {detail}" if detail and not ok else ""))
+        log(f"queue: {'started' if ok else 'launch failed for'} {r['label']} ({r['id']}) stack {r['stack']}"
+            + (f": {detail}" if not ok else ""))
+    for r in alert:
+        h = round((_now_ms() - int(r.get("tsMs") or 0)) / 3.6e6, 1)
+        text = (f"📥 fm-spawn queue: `{r.get('card') or r.get('label')}` has waited {h} h for a {r.get('stack')} slot "
+                f"(cap {caps.get(r.get('stack'))}). Close finished {r.get('stack')} job tabs or raise the cap in "
+                f"{CAPS_FILE}. ⚓ item:{r.get('card') or '-'}")
+        print(("DRY " if dry_run else "") + text)
+        if not dry_run:
+            ok, detail = post("omp-alerts", text, timeout=5)
+            log(f"queue: stuck alert for {r.get('id')}: {'posted ' + detail if ok else 'FAILED ' + detail}")
+            if ok:  # once per entry; a failed post is tried again next tick
+                with slots_lock():
+                    write_jsonl(QUEUE, [{**x, "alerted": _now_ms()} if x.get("id") == r.get("id") else x
+                                        for x in read_jsonl(QUEUE)])
+    return 0
+
+
 def spawn(args):
     task = real(args.task)
     if not os.path.isfile(task):
         sys.exit(f"fm-spawn: task file not found: {task}")
     try:
-        gaps = brief_gaps(open(task, encoding="utf-8", errors="replace").read(200_000))
+        text = open(task, encoding="utf-8", errors="replace").read(200_000)
     except OSError:
-        gaps = []
+        text = ""
+    gaps = brief_gaps(text)
     if gaps:
         print(f"fm-spawn: warning: task file has no {', '.join(gaps)} (brief lint)", file=sys.stderr)
+    # Standard flow (owner 2026-10-31, card sdlc-standard-flow, firstmate/flow.md): refuse a task file without an
+    # `## Acceptance check` section and a `Flow: full|short` line.
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import fm_flow
+    flow_gaps = fm_flow.task_lint(text)
+    if flow_gaps:
+        print(f"fm-spawn: refused: task file {task} has no {' and no '.join(flow_gaps)} "
+              "(see ~/Documents/reports/web/firstmate/flow.md and task-template.md)", file=sys.stderr)
+        return 5
     if not os.path.isdir(real(args.cwd)):
         sys.exit(f"fm-spawn: --cwd is not a folder: {args.cwd}")
     all_panes = panes()
@@ -466,8 +1348,11 @@ def spawn(args):
         log(f"REFUSED {args.label}: workspace {ws} over {MAX_TABS} tabs")
         print(refusal, file=sys.stderr)
         return 4
-    p = plan(args, all_panes)
     stack = pick_stack(args, create=not args.dry_run)
+    queued = cap_check(args, stack, ws)
+    if queued:
+        return report_queued(args, queued)
+    p = plan(args, all_panes)
     out = {"label": args.label, "workspace": ws, **{k: p.get(k) for k in ("cwd", "worktree", "branch", "base", "reason")},
            "stack": stack}
     if args.dry_run:
@@ -496,11 +1381,19 @@ def spawn(args):
         log(f"FAILED tab create for {args.label}: {json.dumps(r)[:300]}")
         sys.exit(f"fm-spawn: tab create returned no tab/pane id (worktree kept: {p['worktree']})")
     out.update(tab=tab, pane=pane)
+    STARTED.append(tab)
     os.makedirs(STATE, exist_ok=True)
     with open(SPAWNED, "a") as f:
         f.write(json.dumps({"tsMs": int(time.time() * 1000), "label": args.label, "tab": tab, "pane": pane,
-                            "card": args.card, "cwd": p["cwd"], "worktree": p["worktree"], "workspace": ws},
-                           ensure_ascii=False) + "\n")
+                            "card": args.card, "cwd": p["cwd"], "worktree": p["worktree"], "workspace": ws,
+                            "stack": stack, "task": task}, ensure_ascii=False) + "\n")
+    release_slot()  # spawned.jsonl now holds the slot (live_slots)
+    if OWN_START and not args.queue_id:  # this start replaces the card's queued resume (card fm-ci-wait-no-resume)
+        with slots_lock():
+            rows = read_jsonl(QUEUE)
+            if any(r.get("card") == args.card for r in rows):
+                write_jsonl(QUEUE, [r for r in rows if r.get("card") != args.card])
+                log(f"queue: {args.card}: queued entry replaced by a direct start on its own CI-wait slot")
     if p["worktree"]:
         reg_update(lambda d: [w.update(tab=tab, pane=pane) for w in d["worktrees"] if w["path"] == p["worktree"]])
     ok, deadline = False, time.time() + OMP_WAIT_S
@@ -520,7 +1413,7 @@ def spawn(args):
     if args.card:
         msg += (f" Card: {args.card} (update it with fm set/fm field)."
                 f" Last step: write the worker-done receipt with fm receipt {args.card} done|failed|blocked"
-                f" \"<summary>\" --verified live|tests|typecheck|none --evidence <commit/file/URL>;"
+                f" \"<summary>\" --verified live|tests --evidence <commit/file/URL> (flow: ~/Documents/reports/web/firstmate/flow.md);"
                 f" run fm beat {args.card} during long silent work.")
     if gaps:
         msg += f" The task file names no {', '.join(gaps)}: write your own before you start and report against it."
@@ -528,6 +1421,13 @@ def spawn(args):
     if p["worktree"]:
         msg += " " + merge_steps(p["repo"], p["worktree"], p["branch"], p["base"])
     herdr("agent", "prompt", pane, msg)
+    if not prompt_started(pane, msg):
+        log(f"FAILED: prompt not submitted in {pane} ({args.label}); tab {tab} left open")
+        if args.card:
+            run([FM, "field", args.card, "job", pane], check=False)
+            run([FM, "set", args.card, "partial", f"[prompt not submitted; needs check] fm-spawn: tab {args.label} ({pane})"],
+                check=False)
+        sys.exit(f"fm-spawn: the agent in pane {pane} did not start the prompt (tab {tab} left open)")
     if args.card:
         run([FM, "field", args.card, "job", pane], check=False)
         run([FM, "field", args.card, "stack", stack], check=False)
@@ -537,6 +1437,46 @@ def spawn(args):
     log(f"spawned {args.label}: tab {tab} pane {pane} cwd {p['cwd']} card {args.card or '-'} stack {stack}")
     print(json.dumps(out))
     return 0
+
+
+PROMPT_WAIT_S = float(os.environ.get("FM_SPAWN_PROMPT_WAIT_S") or 60)
+
+
+def agent_started(pane):
+    """The pane's agent took the prompt: Herdr shows it working/blocked (or the OMP spinner), or its OMP session
+    .jsonl exists and is not empty (card fm-spawn-prompt-verify)."""
+    p = (herdr("pane", "get", pane, check=False).get("result") or {}).get("pane") or {}
+    if pane_busy(p):
+        return True
+    sess = (p.get("agent_session") or {}).get("value")
+    return bool(sess) and os.path.isfile(sess) and os.path.getsize(sess) > 0
+
+
+def wait_started(pane):
+    deadline = time.time() + PROMPT_WAIT_S
+    while True:
+        if agent_started(pane):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(2 * PAUSE)
+
+
+def prompt_started(pane, msg):
+    """Poll until the agent works on the prompt; else retry once: Enter only when the text still sits in the
+    editor (the 2026-11-02 loss: text typed, Enter lost), else send the prompt again. Then poll again."""
+    if wait_started(pane):
+        return True
+    screen = run([HERDR, "pane", "read", pane, "--source", "recent-unwrapped"], check=False).stdout or ""
+    probe = msg[:40]
+    # OMP shows a long paste (>1000 chars / >10 lines) only as a "[Paste #N, X chars]" placeholder
+    if (probe and probe in screen.replace("\n", "")) or re.search(r"\[Paste #\d+", screen):
+        log(f"prompt text still in the editor of {pane}; sending Enter")
+        herdr("pane", "send-keys", pane, "enter", check=False)
+    else:
+        log(f"agent in {pane} did not start; sending the prompt again")
+        herdr("agent", "prompt", pane, msg, check=False)
+    return wait_started(pane)
 
 
 # ---------- stack and Discord channel (owner 2026-10-24) ----------
@@ -565,13 +1505,13 @@ def pane_channel(pane):
                  and e.get("machine", "main") == "main"), None)  # Herdr ids are per host; fm-spawn runs on the main host
 
 
-def post(channel, text, url=None, body=None):
+def post(channel, text, url=None, body=None, timeout=30):
     """Bot loopback /post (or another loopback endpoint with its own body). Returns (ok, detail)."""
     import urllib.error, urllib.request
     req = urllib.request.Request(url or POST_URL, data=json.dumps(body or {"channel": channel, "text": text}).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return True, json.loads(r.read() or b"{}").get("url", "")
     except urllib.error.HTTPError as e:
         return False, f"{e.code} {e.read().decode(errors='replace')[:200]}"
@@ -1136,6 +2076,11 @@ def main():
     ap.add_argument("--root", default=os.path.join(HOME, "Github"))
     ap.add_argument("--no-install", action="store_true")
     ap.add_argument("--close-finished", action="store_true", help="close tabs that are idle and hold no live card job")
+    ap.add_argument("--drain-queue", action="store_true", help="start queued spawns whose stack has a free slot (fm-tick)")
+    ap.add_argument("--queue-id", help=argparse.SUPPRESS)  # set by --drain-queue for a queued spawn
+    ap.add_argument("--queue-attempts", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--queue-ts", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--queue-alerted", type=int, default=0, help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.await_channel:
         return await_channel(a)
@@ -1155,8 +2100,12 @@ def main():
         return cleanup(a)
     if a.close_finished:
         return close_finished(a)
+    if a.drain_queue:
+        return drain_queue(a.dry_run)
     if not (a.label and a.cwd and a.task):
         ap.error("--label, --cwd and --task are required (or use --cleanup)")
+    if a.queue_id:
+        return run_queued(a)
     pause = maint_pause()
     if pause is not None and not a.dry_run:
         print(f"fm-spawn: agent work is paused ({pause}); no job started. "
@@ -1164,6 +2113,23 @@ def main():
               file=sys.stderr)
         return 5
     return spawn(a)
+
+
+FREEZE_ALLOWED = ("firstmate", "infra")
+STOPNOTE = re.compile(r"⏹️ ?(Stopped|Paused)|⏸️ ?frozen|stopped by (the )?owner", re.I)  # same as fm-autoclear R13
+
+
+def dev_freeze():
+    """Card dev-freeze-gate: the freeze reason while ~/.local/state/dev-freeze/frozen.json exists, else None.
+    While set, only the firstmate and infra stacks may start jobs; other spawns wait in the queue."""
+    f = os.environ.get("FM_DEV_FREEZE") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "dev-freeze", "frozen.json")
+    if not os.path.exists(f):
+        return None
+    try:
+        return str(json.load(open(f)).get("reason") or "dev freeze")
+    except Exception:
+        return "dev freeze"
 
 
 def maint_pause():

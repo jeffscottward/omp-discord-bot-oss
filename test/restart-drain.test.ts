@@ -1,6 +1,7 @@
 // Plan P1: restart without starvation. Queue drain, saved queue, POST /drain and the restart waiter script.
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { startHttp } from "../src/http.ts";
 import { pendingLine } from "../src/pending.ts";
@@ -73,7 +74,7 @@ describe("JobQueue drain", () => {
 describe("saved queue (queue.json)", () => {
   const job = (id: number, at: number): SavedJob => ({ id, channelId: "123", messageId: String(900 + id), authorId: "7", text: `job ${id}`, enqueuedAt: at });
   test("round trip, sorted by time, mode 0600", () => {
-    const dir = mkdtempSync("/tmp/queuestate-");
+    const dir = mkdtempSync(join(tmpdir(), "queuestate-"));
     expect(saveQueueState(dir, { nextId: 9, jobs: [job(2, 20), job(1, 10)] })).toBe(true);
     expect(statSync(queueFile(dir)).mode & 0o777).toBe(0o600);
     const s = loadQueueState(dir);
@@ -81,7 +82,7 @@ describe("saved queue (queue.json)", () => {
     expect(s.jobs.map((j) => j.id)).toEqual([1, 2]);
   });
   test("missing or bad file: empty queue; bad records dropped", () => {
-    const dir = mkdtempSync("/tmp/queuestate-");
+    const dir = mkdtempSync(join(tmpdir(), "queuestate-"));
     expect(loadQueueState(dir)).toEqual({ nextId: 1, jobs: [] });
     writeFileSync(queueFile(dir), "{not json");
     expect(loadQueueState(dir)).toEqual({ nextId: 1, jobs: [] });
@@ -128,7 +129,7 @@ describe("POST /drain", () => {
 describe("restart-when-idle.sh", () => {
   const SCRIPT = resolve(import.meta.dir, "../scripts/restart-when-idle.sh");
   async function run(opts: { ciFails?: boolean; gateFails?: boolean; giveUpAfter?: number; headMoves?: boolean; health: (n: number, drained: boolean) => object }) {
-    const dir = mkdtempSync("/tmp/rwi-");
+    const dir = mkdtempSync(join(tmpdir(), "rwi-"));
     const notes = join(dir, "notes");
     const safeLog = join(dir, "safe.log");
     // The fake notify logs the channel and args and answers like notify-owner.ts ("posted <id>").
@@ -329,7 +330,7 @@ describe("restart-when-idle.sh", () => {
 describe("ci-green.sh", () => {
   const SCRIPT = resolve(import.meta.dir, "../scripts/ci-green.sh");
   async function ci(statuses: string[][], wait = 0) {
-    const dir = mkdtempSync("/tmp/cig-");
+    const dir = mkdtempSync(join(tmpdir(), "cig-"));
     writeFileSync(join(dir, "tok"), "t0k\n");
     let n = 0;
     const seen: string[] = [];

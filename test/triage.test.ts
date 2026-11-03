@@ -1,6 +1,7 @@
 // Plan P12: incident triage: body checks, fixed prompt, dedupe per key (6 h), one run at a time, POST /incident contract.
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startHttp } from "../src/http.ts";
 import { parseIncident, Triage, TRIAGE_DEDUPE_MS, triagePrompt, type Incident } from "../src/triage.ts";
@@ -49,7 +50,7 @@ describe("Triage limits", () => {
     expect(t.admit("a")).toEqual({ start: true });
   });
   test("keys and threads survive a restart (triage.json, 0600)", () => {
-    const dir = mkdtempSync("/tmp/triage-");
+    const dir = mkdtempSync(join(tmpdir(), "triage-"));
     const t = new Triage(dir, () => 5);
     t.admit("k");
     t.addThread("123");

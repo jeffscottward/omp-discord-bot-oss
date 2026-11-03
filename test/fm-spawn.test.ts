@@ -1,7 +1,7 @@
 // fm-spawn (scripts/fm-spawn, Orca #7): worktree decision, tab start, card update, safe cleanup.
 // Uses a scratch git repo under /tmp, a fake herdr and a fake fm, so no real tab or card changes.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DEFAULT_STACKS } from "../src/router.ts";
@@ -32,6 +32,8 @@ beforeEach(() => {
     FM_SPAWN_ITEMS: join(dir, "items.json"),
     // the maintenance pause flag (card omp-pause-button): a scratch path, so a real pause never blocks these tests
     OMP_MAINT_PAUSED: join(dir, "paused.json"),
+    // the dev freeze flag (card dev-freeze-gate): a scratch path, so a live freeze never blocks these tests
+    FM_DEV_FREEZE: join(dir, "frozen.json"),
     // the stack catalog (owner 2026-10-28): a scratch file, so auto-created stacks never reach the real catalog
     OMP_BOT_STACKS: join(dir, "stacks.json"),
     // stack fallback: 3 quick tries, then a fake omp-notify that logs (the default transport fails; ntfy works)
@@ -48,6 +50,12 @@ case "$1 $2" in
   "tab list") printf '{"result":{"tabs":%s}}' "$(cat ${dir}/tabs.json 2>/dev/null || echo '[]')";;
   "tab create") echo '{"result":{"tab":{"tab_id":"wT:t9"},"root_pane":{"pane_id":"wT:p9"}}}';;
   "pane process-info") echo '{"result":{"process_info":{"foreground_processes":[{"name":"omp"}]}}}';;
+  "pane get") m=$(cat ${dir}/agent-mode 2>/dev/null || echo ok); st=working
+    if [ "$m" = never ]; then st=idle; fi
+    if [ "$m" = enter ] && ! grep -q "send-keys" ${dir}/calls.log; then st=idle; fi
+    if [ "$m" = reprompt ] && [ "$(grep -c "agent prompt" ${dir}/calls.log)" -lt 2 ]; then st=idle; fi
+    printf '{"result":{"pane":{"pane_id":"%s","agent_status":"%s"}}}' "$3" "$st";;
+  "pane read") cat ${dir}/screen.txt 2>/dev/null;;
 esac
 `);
   // fake fm: logs every call; `fm get <id>` prints cards/<id>.json when present
@@ -59,7 +67,7 @@ esac
   chmodSync(join(dir, "omp-notify"), 0o755);
   chmodSync(join(dir, "herdr"), 0o755);
   chmodSync(join(dir, "fm"), 0o755);
-  writeFileSync(join(dir, "task.md"), "# task\n");
+  writeFileSync(join(dir, "task.md"), "# task\nFlow: short\n## Acceptance check\n");
   sh(["git", "init", "-q", "-b", "main", repo]);
   writeFileSync(join(repo, "a.txt"), "a\n");
   git("add", "a.txt");
@@ -98,24 +106,90 @@ describe("fm-spawn start", () => {
     expect(c).toMatch(/fm set c1 running fm-spawn: tab/);
   });
 
+  test("prompt check (card fm-spawn-prompt-verify): started first time -> one prompt, card running", () => {
+    setPanes(["/elsewhere"]);
+    expect(spawn("--card", "c1").code).toBe(0);
+    const c = calls();
+    expect(c.match(/agent prompt/g)!.length).toBe(1);
+    expect(c).not.toContain("send-keys");
+    expect(c).toMatch(/fm set c1 running/);
+  });
+
+  test("prompt check: text left in the editor -> one Enter retry, then running", () => {
+    setPanes(["/elsewhere"]);
+    writeFileSync(join(dir, "agent-mode"), "enter");
+    writeFileSync(join(dir, "screen.txt"), `> Read ${dir}/task.md and do the task. Owner questions`);
+    env.FM_SPAWN_PROMPT_WAIT_S = "0.3";
+    expect(spawn("--card", "c1").code).toBe(0);
+    const c = calls();
+    expect(c).toContain("pane send-keys wT:p9 enter");
+    expect(c.match(/agent prompt/g)!.length).toBe(1);
+    expect(c).toMatch(/fm set c1 running/);
+  });
+
+  test("prompt check: long paste shown as an OMP placeholder -> Enter retry, no second prompt", () => {
+    setPanes(["/elsewhere"]);
+    writeFileSync(join(dir, "agent-mode"), "enter");
+    writeFileSync(join(dir, "screen.txt"), "> [Paste #1, 2412 chars]");
+    env.FM_SPAWN_PROMPT_WAIT_S = "0.3";
+    expect(spawn("--card", "c1").code).toBe(0);
+    const c = calls();
+    expect(c).toContain("pane send-keys wT:p9 enter");
+    expect(c.match(/agent prompt/g)!.length).toBe(1);
+  });
+
+  test("prompt check: empty editor -> prompt sent again, then running", () => {
+    setPanes(["/elsewhere"]);
+    writeFileSync(join(dir, "agent-mode"), "reprompt");
+    env.FM_SPAWN_PROMPT_WAIT_S = "0.3";
+    expect(spawn("--card", "c1").code).toBe(0);
+    const c = calls();
+    expect(c.match(/agent prompt/g)!.length).toBe(2);
+    expect(c).toMatch(/fm set c1 running/);
+  });
+
+  test("prompt check: never started -> exit nonzero, card partial (not running), tab left open", () => {
+    setPanes(["/elsewhere"]);
+    writeFileSync(join(dir, "agent-mode"), "never");
+    env.FM_SPAWN_PROMPT_WAIT_S = "0.3";
+    const r = spawn("--card", "c1");
+    expect(r.code).not.toBe(0);
+    expect(r.err).toContain("did not start the prompt");
+    const c = calls();
+    expect(c).toContain("fm set c1 partial [prompt not submitted; needs check]");
+    expect(c).not.toMatch(/fm set c1 running/);
+    expect(c).not.toContain("tab close");
+  });
+
   test("brief lint (pstack): a bare task file warns and asks the session for its own done check and verify step", () => {
     setPanes(["/elsewhere"]);
     const r = spawn("--card", "c1");
     expect(r.code).toBe(0);
-    expect(r.err).toContain("warning: task file has no done check, verify step (brief lint)");
+    expect(r.err).toContain("warning: task file has no verify step (brief lint)");
     const c = calls();
-    expect(c).toContain("The task file names no done check, verify step: write your own before you start");
-    expect(c).toContain("--verified live|tests|typecheck|none --evidence <commit/file/URL>");
+    expect(c).toContain("The task file names no verify step: write your own before you start");
+    expect(c).toContain("--verified live|tests --evidence <commit/file/URL>");
     expect(c).toContain("For engineering work follow skill pstack (playbook + principles).");
   });
 
   test("brief lint: a task file with goal, acceptance and verify steps sends no gap note", () => {
     setPanes(["/elsewhere"]);
-    writeFileSync(join(dir, "task.md"), "# Task: fix it\n## Acceptance\n- the bug is gone\n## Verify\n- run bun test\n");
+    writeFileSync(join(dir, "task.md"), "# Task: fix it\nFlow: full\n## Acceptance check\n- the bug is gone\n## Verify\n- run bun test\n");
     const r = spawn("--card", "c1");
     expect(r.code).toBe(0);
     expect(r.err).not.toContain("brief lint");
     expect(calls()).not.toContain("The task file names no");
+  });
+
+  test("standard flow (card sdlc-standard-flow): a task file without Acceptance check or Flow line is refused", () => {
+    setPanes(["/elsewhere"]);
+    writeFileSync(join(dir, "task.md"), "# Task: fix it\n## Acceptance\n- the bug is gone\n");
+    const r = spawn("--card", "c1");
+    expect(r.code).toBe(5);
+    expect(r.err).toContain("refused");
+    expect(r.err).toContain("Acceptance check");
+    expect(r.err).toContain("Flow: full|short");
+    expect(calls()).not.toContain("agent prompt");
   });
 
   test("a live pane works in the repo: creates <repo>-wt-<slug> on ws/<slug> and sends merge-back steps", () => {
@@ -197,7 +271,7 @@ describe("fm-spawn start", () => {
     writeFileSync(join(dir, "cards", "c2.json"), JSON.stringify({ id: "c2", area: "Client Co: postal address" }));
     expect(JSON.parse(spawn("--card", "c2", "--dry-run").out).stack).toBe("realestate");
     expect(spawn("--stack", "Not A Name!").code).not.toBe(0);
-  });
+  }, 20_000); // runs fm-spawn several times; over 5 s under load (restart gate 2026-11-01)
 
   test("catalog (owner 2026-10-28): --stack accepts any name and adds an unknown one; a new area makes a new stack", () => {
     setPanes(["/elsewhere"]);
@@ -265,6 +339,594 @@ describe("fm-spawn start", () => {
     const a = areas();
     expect(a.infra!.length).toBe(DEFAULT_STACKS.find((s) => s.name === "infra")!.areas.length);
     expect(a.new).toEqual(["boats"]);
+  });
+});
+
+describe("fm-spawn per-stack cap + queue (owner 2026-11-01, card fm-job-cap-ci-wait)", () => {
+  const queue = () => {
+    const f = join(dir, "state", "queued.jsonl");
+    return existsSync(f) ? readFileSync(f, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
+  };
+  const cards = (list: Record<string, unknown>[]) => writeFileSync(join(dir, "items.json"), JSON.stringify({ items: list }));
+  const receipt = (card: string, result: string, tsMs: number, summary = "x") => {
+    mkdirSync(join(dir, "receipts"), { recursive: true });
+    writeFileSync(join(dir, "receipts", `${card}.json`), JSON.stringify({ card, result, tsMs, summary }));
+  };
+  const drain = (...extra: string[]) => sh(["python3", SCRIPT, "--drain-queue", ...extra]);
+  const launches = () => calls().split("\n").filter((l) => l.startsWith("launch "));
+  beforeEach(() => {
+    // three live webapp jobs: wT:p0..p2 (wT:p3 is a pane elsewhere)
+    setPanes(["/v0", "/v1", "/v2", "/elsewhere"]);
+    cards([0, 1, 2].map((i) => ({ id: `v${i}`, s: "running", stack: "webapp", job: `wT:p${i}`, t: `webapp job ${i}` })));
+    // the drained spawn runs through a fake launcher that only logs its argv
+    writeFileSync(join(dir, "launcher"), `#!/bin/bash\nprintf '%s\\n' "launch $*" >> ${dir}/calls.log\n`);
+    chmodSync(join(dir, "launcher"), 0o755);
+    env.FM_SPAWN_LAUNCHER = join(dir, "launcher");
+  });
+
+  test("dry run: a 4th webapp job reports queued at position 1 and creates nothing; another stack is not affected", () => {
+    const r = spawn("--stack", "webapp", "--card", "v4", "--dry-run");
+    expect(r.code).toBe(6);
+    expect(JSON.parse(r.out)).toMatchObject({ dry_run: true, queued: true, position: 1, stack: "webapp", cap: 3, live: ["v0", "v1", "v2"] });
+    expect(r.err).toContain("Nothing was created");
+    expect(queue()).toHaveLength(0);
+    expect(calls()).not.toContain("tab create");
+    expect(calls()).not.toContain("fm set");
+    const k = spawn("--stack", "kb", "--card", "k1", "--dry-run");
+    expect(k.code).toBe(0);
+    expect(JSON.parse(k.out).queued).toBeUndefined();
+  });
+
+  test("at the cap: queued (exit 6) in FIFO order, card planned with a note; under the cap it starts", () => {
+    const r = spawn("--stack", "webapp", "--card", "v4");
+    expect(r.code).toBe(6);
+    expect(JSON.parse(r.out)).toMatchObject({ queued: true, position: 1 });
+    expect(spawn("--stack", "webapp", "--card", "v5").code).toBe(6);
+    expect(queue().map((q) => [q.card, q.stack, q.workspace])).toEqual([["v4", "webapp", "wT"], ["v5", "webapp", "wT"]]);
+    expect(calls()).toContain("fm set v4 planned 📥 Queued by fm-spawn: stack webapp is at its cap of 3 live jobs; position 1.");
+    expect(calls()).not.toContain("tab create");
+    cards([0, 1].map((i) => ({ id: `v${i}`, s: "running", stack: "webapp", job: `wT:p${i}` })));
+    // a free slot, but v4/v5 wait: a new spawn may not jump the queue
+    expect(JSON.parse(spawn("--stack", "webapp", "--card", "v6").out).position).toBe(3);
+    rmSync(join(dir, "state", "queued.jsonl"));
+    expect(spawn("--stack", "webapp", "--card", "v6").code).toBe(0);
+    expect(calls()).toContain("tab create");
+    // the reservation ends with the spawned.jsonl record
+    expect(JSON.parse(readFileSync(join(dir, "state", "reserved.json"), "utf8"))).toEqual([]);
+    expect(readFileSync(join(dir, "state", "spawned.jsonl"), "utf8")).toContain('"stack": "webapp"');
+  }, 20_000);
+
+  test("a CI-wait blocked receipt keeps the slot; a done receipt or a gone pane frees it; the drain starts the oldest", () => {
+    // v1 wrote a blocked receipt: fm-autoclear made the card partial and unlinked the job; its pane still lives
+    cards([
+      { id: "v0", s: "running", stack: "webapp", job: "wT:p0" },
+      { id: "v1", s: "partial", stack: "webapp" },
+      { id: "v2", s: "running", stack: "webapp", job: "wT:p2" },
+    ]);
+    mkdirSync(join(dir, "state"), { recursive: true });
+    writeFileSync(join(dir, "state", "spawned.jsonl"), JSON.stringify({ tsMs: 1000, pane: "wT:p1", card: "v1", stack: "webapp" }) + "\n");
+    receipt("v1", "blocked", 2000, "waiting on CI: PR #12, run https://x/1, 40 jobs queued ahead since 14:05Z");
+    expect(spawn("--stack", "webapp", "--card", "v4").code).toBe(6);
+    expect(spawn("--stack", "webapp", "--card", "v5").code).toBe(6);
+    expect(drain().code).toBe(0);
+    expect(launches()).toHaveLength(0);
+    expect(queue()).toHaveLength(2);
+    receipt("v1", "done", 3000);
+    expect(drain("--dry-run").out).toContain("DRY would start queued 🧪 test job (stack webapp, card v4)");
+    expect(queue()).toHaveLength(2);
+    expect(drain().code).toBe(0);
+    expect(launches()).toHaveLength(1);
+    expect(launches()[0]).toContain("--stack webapp --workspace wT --queue-id");
+    expect(launches()[0]).toContain("--card v4");
+    expect(queue().map((q) => q.card)).toEqual(["v5"]);
+    // the pane of v2 is gone: one more slot
+    setPanes(["/v0", "/v1"]);
+    expect(drain().code).toBe(0);
+    expect(queue()).toHaveLength(0);
+    expect(launches().pop()).toContain("--card v5");
+  }, 20_000);
+
+  test("one job tab is one slot, also when several cards name it", () => {
+    cards([
+      { id: "v0", s: "running", stack: "webapp", job: "wT:p0" },
+      { id: "v1", s: "running", stack: "webapp", job: "wT:p0" },
+      { id: "v2", s: "running", stack: "webapp", job: "wT:p1" },
+    ]);
+    expect(spawn("--stack", "webapp", "--card", "v4", "--dry-run").code).toBe(0);
+  });
+
+  test("a blocked receipt that does not wait on CI frees the slot", () => {
+    cards([
+      { id: "v0", s: "running", stack: "webapp", job: "wT:p0" },
+      { id: "v1", s: "partial", stack: "webapp" },
+      { id: "v2", s: "running", stack: "webapp", job: "wT:p2" },
+    ]);
+    mkdirSync(join(dir, "state"), { recursive: true });
+    writeFileSync(join(dir, "state", "spawned.jsonl"), JSON.stringify({ tsMs: 1000, pane: "wT:p1", card: "v1", stack: "webapp" }) + "\n");
+    receipt("v1", "blocked", 2000, "needs the owner's pick");
+    expect(spawn("--stack", "webapp", "--card", "v4", "--dry-run").code).toBe(0);
+  });
+
+  test("finished spawned panes free the slot; working, blocked, CI-wait, new and running-card jobs hold it (card fm-spawn-dead-slots)", () => {
+    // tab per pane; Herdr agent_status per pane
+    const herdrPanes = (st: Record<string, { s?: string; title?: string }>) =>
+      writeFileSync(join(dir, "panes.json"), JSON.stringify(Object.entries(st).map(([p, v]) => ({
+        pane_id: `wT:${p}`, tab_id: `wT:t${p}`, workspace_id: "wT", cwd: `/${p}`, foreground_cwd: `/${p}`,
+        agent_status: v.s, terminal_title: v.title ?? "omp" }))));
+    cards([
+      { id: "v0", s: "running", stack: "webapp", job: "wT:p0" }, // (d) running card with job: held even when its pane is done
+      { id: "v1", s: "partial", stack: "webapp", n: "⏸️ Paused by owner" }, // (a) done pane, no receipt
+      { id: "v2", s: "partial", stack: "webapp" }, // (b) done pane, CI-wait blocked receipt
+      { id: "v3", s: "partial", stack: "webapp" }, // (c) working pane
+    ]);
+    mkdirSync(join(dir, "state"), { recursive: true });
+    writeFileSync(join(dir, "state", "spawned.jsonl"), ["p1", "p2", "p3"].map((p, i) =>
+      JSON.stringify({ tsMs: 1000, pane: `wT:${p}`, tab: `wT:t${p}`, card: `v${i + 1}`, stack: "webapp" })).join("\n") + "\n");
+    receipt("v2", "blocked", 2000, "waiting on CI: PR #3, run https://x/2, 12 jobs queued ahead since 13:00Z");
+    const live = () => {
+      const r = spawn("--stack", "webapp", "--card", "v4", "--dry-run");
+      return r.code === 6 ? JSON.parse(r.out).live : r.code === 0 ? "free" : `exit ${r.code}: ${r.err}`;
+    };
+    herdrPanes({ p0: { s: "done" }, p1: { s: "done" }, p2: { s: "done" }, p3: { s: "working" } });
+    expect(live()).toEqual(["v0", "v2", "v3"]); // (a) v1 is free; (b) (c) (d) hold
+    herdrPanes({ p0: { s: "done" }, p1: { s: "done" }, p2: { s: "done" }, p3: { s: "idle" } });
+    expect(live()).toBe("free"); // (c) the working pane finished: its slot frees
+    herdrPanes({ p0: { s: "done" }, p1: { s: "idle", title: "⠋ omp" }, p2: { s: "done" }, p3: { s: "blocked" } });
+    expect(live()).toEqual(["v0", "v1", "v2", "v3"]); // spinner in the title = working; blocked = waits for input
+    // a CI-wait receipt older than the spawn does not count
+    receipt("v2", "blocked", 500, "waiting on CI: PR #3");
+    herdrPanes({ p0: { s: "done" }, p1: { s: "done" }, p2: { s: "done" }, p3: { s: "done" } });
+    expect(live()).toBe("free");
+    // a CI-wait receipt without tsMs counts as written after the spawn (old behaviour kept); v3 works again
+    writeFileSync(join(dir, "receipts", "v2.json"), JSON.stringify({ card: "v2", result: "blocked", summary: "waiting on CI: PR #3" }));
+    herdrPanes({ p0: { s: "done" }, p1: { s: "done" }, p2: { s: "done" }, p3: { s: "working" } });
+    expect(live()).toEqual(["v0", "v2", "v3"]);
+    receipt("v2", "done", 3000);
+    // spawns without a card, panes without tab_id: a done pane frees, a working pane holds (key = pane id)
+    writeFileSync(join(dir, "state", "spawned.jsonl"), ["p5", "p6", "p7"].map((p) =>
+      JSON.stringify({ tsMs: 1000, pane: `wT:${p}`, stack: "webapp" })).join("\n") + "\n");
+    writeFileSync(join(dir, "panes.json"), JSON.stringify([
+      { pane_id: "wT:p0", tab_id: "wT:tp0", workspace_id: "wT", agent_status: "done" },
+      { pane_id: "wT:p5", workspace_id: "wT", agent_status: "done" },
+      { pane_id: "wT:p6", workspace_id: "wT", agent_status: "working" },
+      { pane_id: "wT:p7", workspace_id: "wT", agent_status: "blocked" },
+    ]));
+    expect(live()).toEqual(["v0", "wT:p6", "wT:p7"]);
+    // a spawn younger than LAUNCH_HOLD_S holds its slot before the agent starts
+    writeFileSync(join(dir, "state", "spawned.jsonl"), ["p1", "p2"].map((p, i) =>
+      JSON.stringify({ tsMs: Date.now(), pane: `wT:${p}`, card: `v${i + 1}`, stack: "webapp" })).join("\n") + "\n");
+    herdrPanes({ p0: { s: "done" }, p1: { s: "idle" }, p2: { s: "idle" } });
+    expect(live()).toEqual(["v0", "v1", "v2"]);
+  }, 20_000);
+
+  test("a card already in the queue keeps its place; no second entry", () => {
+    expect(spawn("--stack", "webapp", "--card", "v4").code).toBe(6);
+    expect(spawn("--stack", "webapp", "--card", "v5").code).toBe(6);
+    const again = spawn("--stack", "webapp", "--card", "v4");
+    expect(again.code).toBe(6);
+    expect(JSON.parse(again.out)).toMatchObject({ position: 1, already: true });
+    expect(queue().map((q) => q.card)).toEqual(["v4", "v5"]);
+    expect(calls().match(/fm set v4 planned/g)).toHaveLength(1);
+  });
+
+  test("the drain drops entries whose card is done, parked or running; a long wait gets one alert", async () => {
+    expect(spawn("--stack", "webapp", "--card", "v4").code).toBe(6);
+    expect(spawn("--stack", "webapp", "--card", "v5").code).toBe(6);
+    expect(spawn("--stack", "webapp", "--card", "v6").code).toBe(6);
+    cards([
+      ...[0, 1, 2].map((i) => ({ id: `v${i}`, s: "running", stack: "webapp", job: `wT:p${i}` })),
+      { id: "v4", s: "done" }, { id: "v5", s: "backlog" }, { id: "v6", s: "planned" },
+    ]);
+    env.FM_SPAWN_QUEUE_ALERT_S = "0";
+    const r = drain();
+    expect(r.out).toContain("dropped queued 🧪 test job (card v4: done)");
+    expect(r.out).toContain("dropped queued 🧪 test job (card v5: backlog)");
+    expect(r.out).toContain("📥 fm-spawn queue: `v6` has waited");
+    expect(queue().map((q) => q.card)).toEqual(["v6"]);
+    expect(queue()[0].alerted).toBeUndefined(); // the post failed (no bot): tried again next tick
+    const posts: { channel?: string; text: string }[] = [];
+    const srv = Bun.serve({ port: 0, fetch: async (req) => {
+      posts.push((await req.json()) as { channel?: string; text: string });
+      return Response.json({ ok: true, url: "https://discord/x/1" });
+    } });
+    env.FM_SPAWN_POST_URL = `http://127.0.0.1:${srv.port}/post`;
+    try {
+      const p = Bun.spawn(["python3", SCRIPT, "--drain-queue"], { env: { ...process.env, ...env }, stdout: "pipe" });
+      await p.exited;
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).toMatchObject({ channel: "omp-alerts" });
+      expect(typeof queue()[0].alerted).toBe("number");
+      const p2 = Bun.spawn(["python3", SCRIPT, "--drain-queue"], { env: { ...process.env, ...env }, stdout: "pipe" });
+      await p2.exited;
+      expect(posts).toHaveLength(1);
+    } finally {
+      srv.stop(true);
+    }
+    expect(launches()).toHaveLength(0);
+  }, 20_000);
+
+  test("a queued start that fails goes back to the head; after 3 failures it leaves the queue with a card note", () => {
+    const run = (n: number) => sh(["python3", SCRIPT, "--label", "🧪 test job", "--cwd", repo, "--task", join(dir, "gone.md"),
+      "--stack", "webapp", "--card", "v7", "--workspace", "wT", "--queue-id", "qF", "--queue-attempts", String(n)]);
+    expect(run(0).code).toBe(1);
+    expect(queue()).toMatchObject([{ id: "qF", attempts: 1, card: "v7" }]);
+    expect(run(2).code).toBe(1);
+    expect(queue()).toHaveLength(0);
+    expect(calls()).toContain("fm set v7 partial 📥 fm-spawn queue: the queued start failed 3 times");
+  });
+
+  test("a drained spawn that lost the race goes back to the head without a second card note", () => {
+    expect(spawn("--stack", "webapp", "--card", "v4").code).toBe(6);
+    const r = spawn("--stack", "webapp", "--card", "v9", "--queue-id", "qX", "--workspace", "wT");
+    expect(r.code).toBe(6);
+    expect(JSON.parse(r.out).position).toBe(1);
+    expect(queue().map((q) => q.card)).toEqual(["v9", "v4"]);
+    expect(queue()[0].id).toBe("qX");
+    expect(calls()).not.toContain("fm set v9");
+  });
+
+  test("pause and the 30-tab cap keep the queue; the cap config can lift or add caps", () => {
+    expect(spawn("--stack", "webapp", "--card", "v4").code).toBe(6);
+    setPanes(["/elsewhere"]);
+    writeFileSync(join(dir, "paused.json"), JSON.stringify({ reason: "kernel update" }));
+    expect(drain().out).toContain("paused (kernel update); queue kept");
+    rmSync(join(dir, "paused.json"));
+    writeFileSync(join(dir, "tabs.json"), JSON.stringify(Array.from({ length: 31 }, (_, i) => ({ tab_id: `wT:t${i}` }))));
+    expect(drain().out).toContain("over 30 tabs");
+    expect(launches()).toHaveLength(0);
+    expect(queue()).toHaveLength(1);
+    rmSync(join(dir, "tabs.json"));
+    // a drained spawn refused by the pause goes back to the head
+    writeFileSync(join(dir, "paused.json"), JSON.stringify({ reason: "p" }));
+    expect(spawn("--stack", "webapp", "--card", "v8", "--queue-id", "qP", "--workspace", "wT").code).toBe(5);
+    expect(queue()[0].id).toBe("qP");
+    rmSync(join(dir, "paused.json"));
+    // stack-caps.json: 0 lifts the webapp cap, a number caps another stack
+    setPanes(["/v0", "/v1", "/v2", "/k0"]);
+    rmSync(join(dir, "state", "queued.jsonl"));
+    writeFileSync(join(dir, "stack-caps.json"), JSON.stringify({ webapp: 0, kb: 1 }));
+    cards([...[0, 1, 2].map((i) => ({ id: `v${i}`, s: "running", stack: "webapp", job: `wT:p${i}` })), { id: "k0", s: "running", stack: "kb", job: "wT:p3" }]);
+    expect(spawn("--stack", "webapp", "--card", "v4", "--dry-run").code).toBe(0);
+    expect(spawn("--stack", "kb", "--card", "k1", "--dry-run").code).toBe(6);
+  }, 20_000);
+
+  test("dev freeze (card dev-freeze-gate): regular stacks wait in the queue; firstmate/infra start; the drain keeps them until the flag is gone", () => {
+    setPanes(["/elsewhere"]);
+    cards([]);
+    const flag = join(dir, "frozen.json");
+    writeFileSync(flag, JSON.stringify({ reason: "dev setup" }));
+    const r = spawn("--stack", "kb", "--card", "k1");
+    expect(r.code).toBe(6);
+    expect(JSON.parse(r.out)).toMatchObject({ queued: true, frozen: "dev setup", stack: "kb" });
+    expect(r.err).toContain("regular work is frozen (dev setup)");
+    expect(calls()).toContain("fm set k1 planned ⏸️ Held by dev-freeze-gate");
+    expect(calls()).not.toContain("tab create");
+    expect(spawn("--stack", "kb", "--card", "k1").code).toBe(6);
+    expect(queue().map((q) => q.card)).toEqual(["k1"]);
+    expect(spawn("--stack", "infra", "--card", "i1").code).toBe(0);
+    expect(calls()).toContain("tab create");
+    drain();
+    expect(launches()).toHaveLength(0);
+    expect(queue().map((q) => q.card)).toEqual(["k1"]);
+    // stop-sync: a card stopped while queued leaves the queue instead of starting
+    expect(spawn("--stack", "kb", "--card", "k2").code).toBe(6);
+    cards([{ id: "k2", s: "partial", n: "⏹️ Stopped: owner" }]);
+    rmSync(flag);
+    expect(drain().out).toContain("k2: card stopped");
+    expect(launches()).toHaveLength(1);
+    expect(queue()).toHaveLength(0);
+  }, 20_000);
+
+  describe("CI-wait resume (card fm-ci-wait-no-resume)", () => {
+    const GREEN = { state: "OPEN", statusCheckRollup: [{ name: "lint", status: "COMPLETED", conclusion: "SUCCESS" }, { context: "cf", state: "SUCCESS" }] };
+    const PENDING = { state: "OPEN", statusCheckRollup: [{ name: "lint", status: "COMPLETED", conclusion: "SUCCESS" }, { name: "core", status: "QUEUED", conclusion: "" }] };
+    const FAILED = { state: "OPEN", statusCheckRollup: [{ name: "core", status: "COMPLETED", conclusion: "FAILURE" }] };
+    const gh = (pr: number, d: unknown) => writeFileSync(join(dir, `gh-pr-${pr}.json`), JSON.stringify(d));
+    const ledger = () => {
+      const f = join(dir, "state", "ci-wait.json");
+      return existsSync(f) ? JSON.parse(readFileSync(f, "utf8")) : {};
+    };
+    const enqueue = (card: string) => writeFileSync(join(dir, "state", "queued.jsonl"), [...queue(), { id: `q-${card}`, tsMs: Date.now(),
+      stack: "webapp", label: `📈 ${card} resume`, cwd: repo, task: join(dir, "task.md"), card, workspace: "wT", no_worktree: false, attempts: 0 }]
+      .map((q) => JSON.stringify(q)).join("\n") + "\n");
+    let T = 0; // the receipt time: recent (receipts older than 7 days are not watched)
+    const CI_SUMMARY = "waiting on CI: PR #12, run https://github.com/o/r/actions/runs/1, 40 jobs queued ahead since 14:05Z";
+    beforeEach(() => {
+      // fake gh: `gh pr view N --json ... [-R repo]` prints gh-pr-N.json; logs every call
+      writeFileSync(join(dir, "gh"), `#!/bin/bash\nprintf '%s\\n' "gh $*" >> ${dir}/calls.log\ncat ${dir}/gh-pr-$3.json\n`);
+      chmodSync(join(dir, "gh"), 0o755);
+      env.FM_SPAWN_GH = join(dir, "gh");
+      // v1 wrote a CI-wait receipt; fm-autoclear made it partial; its idle pane wT:p1 still lives (webapp at cap 3)
+      cards([
+        { id: "v0", s: "running", stack: "webapp", job: "wT:p0" },
+        { id: "v1", s: "partial", stack: "webapp", t: "webapp job 1" },
+        { id: "v2", s: "running", stack: "webapp", job: "wT:p2" },
+      ]);
+      mkdirSync(join(dir, "state"), { recursive: true });
+      writeFileSync(join(dir, "task.md"), "# task\nFlow: full\n## Acceptance check\n- it works\n");
+      writeFileSync(join(dir, "state", "spawned.jsonl"), JSON.stringify({ tsMs: 1000, pane: "wT:p1", tab: "wT:t1", card: "v1",
+        stack: "webapp", cwd: repo, label: "📈 job one", workspace: "wT", task: join(dir, "task.md") }) + "\n");
+      T = Date.now() - 60_000;
+      receipt("v1", "blocked", T, CI_SUMMARY);
+    });
+
+    test("green CI: the wait ends, its slot frees and the resume starts in the same tick; other queued jobs keep waiting", () => {
+      expect(spawn("--stack", "webapp", "--card", "v4").code).toBe(6);
+      gh(12, PENDING);
+      const p = drain();
+      expect(p.code).toBe(0);
+      expect(calls()).toContain("gh pr view 12 --json state,statusCheckRollup -R o/r");
+      expect(launches()).toHaveLength(0);
+      expect(queue().map((q) => q.card)).toEqual(["v4"]);
+      expect(ledger()[`v1:${T}`]).toMatchObject({ pr: 12, repo: "o/r", ci: "pending" });
+      // dry run on green: reports the resume and the start, writes nothing
+      gh(12, GREEN);
+      const d = drain("--dry-run");
+      expect(d.out).toContain("DRY would have CI wait v1: PR #12 green (2 checks passed); queued its resume at the head of the webapp queue");
+      expect(d.out).toContain("DRY would start queued 🔁 📈 job one (stack webapp, card v1)");
+      expect(queue().map((q) => q.card)).toEqual(["v4"]);
+      expect(ledger()[`v1:${T}`].ciDone).toBeUndefined();
+      // one real tick
+      const r = drain();
+      expect(r.out).toContain("CI wait v1: PR #12 green (2 checks passed); queued its resume at the head of the webapp queue");
+      expect(launches()).toHaveLength(1);
+      const l = launches()[0]!;
+      expect(l).toContain("--label 🔁 📈 job one");
+      expect(l).toContain(`--cwd ${repo}`);
+      expect(l).toContain("--card v1");
+      expect(l).toContain("--no-worktree");
+      expect(queue().map((q) => q.card)).toEqual(["v4"]);
+      expect(typeof ledger()[`v1:${T}`].ciDone).toBe("number");
+      expect(calls()).toContain("fm set v1 planned 🔁 CI wait ended: PR #12 green (2 checks passed).");
+      const task = l.match(/--task (\S+)/)![1]!;
+      const text = readFileSync(task, "utf8");
+      expect(text).toContain("Flow: full");
+      expect(text).toContain(`Original task file: \`${join(dir, "task.md")}\``);
+      expect(text).toContain("## Acceptance check");
+      expect(text).toContain(CI_SUMMARY);
+      // the ended wait holds no slot: a second resume entry would not be needed; v4 needs a slot of its own
+      const live = spawn("--stack", "webapp", "--card", "v9", "--dry-run");
+      expect(JSON.parse(live.out).live).not.toContain("v1");
+      // no second resume and no second gh call for the same receipt
+      const n = calls().split("\n").filter((x) => x.startsWith("gh ")).length;
+      drain();
+      expect(launches()).toHaveLength(1);
+      expect(calls().split("\n").filter((x) => x.startsWith("gh ")).length).toBe(n);
+    }, 30_000);
+
+    test("a resume task chain keeps the first task file; the resume task names the merge-back steps of its worktree", () => {
+      const wt = join(dir, "scratch-wt-x");
+      git("worktree", "add", "-q", "-b", "ws/x", wt);
+      writeFileSync(join(dir, "state", "worktrees.json"), JSON.stringify({ worktrees: [{ repo, path: wt, branch: "ws/x", base: "origin/main", task: join(dir, "task.md"), card: "v1" }] }));
+      mkdirSync(join(dir, "state", "resume"), { recursive: true });
+      const older = join(dir, "state", "resume", "v1-1.md");
+      writeFileSync(older, `# Resume\nFlow: full\nOriginal task file: \`${join(dir, "task.md")}\`\n## Acceptance check\n`);
+      writeFileSync(join(dir, "state", "spawned.jsonl"), JSON.stringify({ tsMs: 1000, pane: "wT:p1", card: "v1", stack: "webapp",
+        cwd: wt, worktree: wt, workspace: "wT", task: older }) + "\n");
+      gh(12, FAILED);
+      expect(drain().out).toContain("CI wait v1: PR #12 failed (1 of 1 checks failed: core)");
+      const text = readFileSync(launches()[0]!.match(/--task (\S+)/)![1]!, "utf8");
+      expect(text).toContain(`Original task file: \`${join(dir, "task.md")}\``);
+      expect(text).toContain("CI did not pass");
+      expect(text).toContain(`flock /tmp/scratch-integrate.lock git -C ${repo} merge --ff-only ws/x`);
+      expect(launches()[0]).toContain(`--cwd ${wt}`);
+    }, 30_000);
+
+    test("the card's own queued resume takes over its CI-wait slot while CI still runs (does not wait behind it)", () => {
+      expect(spawn("--stack", "webapp", "--card", "v4").code).toBe(6);
+      enqueue("v1"); // FIRSTMATE queued the resume while the old job still worked
+      expect(queue().map((q) => q.card)).toEqual(["v4", "v1"]);
+      gh(12, PENDING);
+      drain();
+      expect(launches()).toHaveLength(1);
+      expect(launches()[0]).toContain("--card v1");
+      expect(queue().map((q) => q.card)).toEqual(["v4"]);
+      const res = JSON.parse(readFileSync(join(dir, "state", "reserved.json"), "utf8"));
+      expect(res).toMatchObject([{ stack: "webapp", own: true }]);
+      // the started spawn (drained, --queue-id) passes the cap check on the same slot
+      const s = spawn("--stack", "webapp", "--card", "v1", "--queue-id", res[0].qid, "--workspace", "wT");
+      expect(s.code).toBe(0);
+      expect(calls()).toContain("tab create");
+      // a fresh spawn of the card itself also starts on its own CI-wait slot (no queue)
+      expect(spawn("--stack", "webapp", "--card", "v1", "--dry-run").code).toBe(0);
+      // another card does not get that slot: still at the cap
+      expect(spawn("--stack", "webapp", "--card", "v8", "--dry-run").code).toBe(6);
+    }, 30_000);
+
+    test("CI green and the job does not start again within 15 min: one #omp-alerts line", async () => {
+      enqueue("v1"); // its queued entry ...
+      writeFileSync(join(dir, "tabs.json"), JSON.stringify(Array.from({ length: 31 }, (_, i) => ({ tab_id: `wT:t${i}` }))));
+      gh(12, GREEN);
+      env.FM_SPAWN_CI_ALERT_S = "0";
+      const posts: { channel?: string; text: string }[] = [];
+      const srv = Bun.serve({ port: 0, fetch: async (req) => {
+        posts.push((await req.json()) as { channel?: string; text: string });
+        return Response.json({ ok: true, url: "https://discord/x/2" });
+      } });
+      env.FM_SPAWN_POST_URL = `http://127.0.0.1:${srv.port}/post`;
+      try {
+        for (let i = 0; i < 2; i++) {
+          const p = Bun.spawn(["python3", SCRIPT, "--drain-queue"], { env: { ...process.env, ...env }, stdout: "pipe" });
+          await p.exited;
+        }
+      } finally {
+        srv.stop(true);
+      }
+      // ... cannot start (workspace over 30 tabs): moved to the head, one alert, no launch
+      expect(launches()).toHaveLength(0);
+      expect(queue()[0]).toMatchObject({ card: "v1", resume: "ci" });
+      const alerts = posts.filter((p) => p.channel === "omp-alerts");
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0]!.text).toContain("`v1`: CI for PR #12 went green and the job has not started again (queue position 1)");
+      expect(typeof ledger()[`v1:${T}`].alerted).toBe("number");
+    }, 30_000);
+
+    test("a running card is not resumed again; a receipt without a PR is not watched; old and done cards are skipped", () => {
+      cards([
+        { id: "v0", s: "running", stack: "webapp", job: "wT:p0" },
+        { id: "v1", s: "running", stack: "webapp", job: "unit-x.service" },
+        { id: "v2", s: "partial", stack: "webapp" },
+        { id: "v3", s: "done", stack: "webapp" },
+        { id: "v5", s: "partial", stack: "webapp" },
+      ]);
+      receipt("v2", "blocked", T, "waiting on CI: the pipeline");
+      receipt("v3", "blocked", T, "waiting on CI: PR #13");
+      receipt("v5", "blocked", Date.now() - 8 * 86400_000, "waiting on CI: PR #15");
+      gh(12, GREEN);
+      const r = drain();
+      expect(r.out).toContain("CI wait v1: PR #12 green (2 checks passed); card already runs again");
+      expect(r.out).toContain("CI wait v2: the receipt names no PR");
+      expect(launches()).toHaveLength(0);
+      expect(calls()).not.toContain("gh pr view 13");
+      expect(calls()).not.toContain("gh pr view 15");
+      expect(calls()).not.toContain("fm set v1");
+      // the ended wait of the running card frees the idle pane's slot
+      expect(JSON.parse(spawn("--stack", "webapp", "--card", "v9", "--dry-run").out).queued).toBeUndefined();
+    }, 30_000);
+
+    const rawReceipt = (card: string, r: Record<string, unknown>) =>
+      writeFileSync(join(dir, "receipts", `${card}.json`), JSON.stringify({ card, result: "blocked", ...r }));
+
+    test("PR from a /pull/N evidence link; merged PR ends the wait; no repo URL and no folder is not looked up", () => {
+      rawReceipt("v1", { tsMs: T, summary: "waiting on CI: the deploy lane", evidence: ["https://github.com/o/r/pull/12"] });
+      gh(12, { state: "MERGED", statusCheckRollup: [] });
+      const r = drain();
+      expect(calls()).toContain("gh pr view 12 --json state,statusCheckRollup -R o/r");
+      expect(r.out).toContain("CI wait v1: PR #12 merged (PR merged); queued its resume");
+      expect(launches()).toHaveLength(1);
+      cards([{ id: "v0", s: "running", stack: "webapp", job: "wT:p0" }, { id: "v4", s: "partial", stack: "webapp" }]);
+      // PR without a repo URL and no job folder: gh would read another repo's PR, so it is not looked up
+      rawReceipt("v4", { tsMs: T, summary: "waiting on CI: PR #14" });
+      const s2 = drain();
+      expect(calls()).not.toContain("gh pr view 14");
+      expect(s2.out).toContain("CI wait v4: the receipt names no PR (or no repo URL and no job folder); cannot watch it");
+    }, 30_000);
+
+    test("gh keeps failing: no slot change, one alert after the delay; a dry run writes nothing", async () => {
+      // no gh-pr-12.json: the fake gh fails
+      writeFileSync(join(dir, "gh"), `#!/bin/bash\nprintf '%s\\n' "gh $*" >> ${dir}/calls.log\necho 'HTTP 502' >&2\nexit 1\n`);
+      env.FM_SPAWN_CI_ALERT_S = "0";
+      const d = drain("--dry-run");
+      expect(d.out).toContain("DRY CI wait v1: PR #12 unknown (HTTP 502)");
+      expect(d.out).toContain("DRY 🔁 fm-spawn CI wait: `v1`: the CI state of PR #12 cannot be read");
+      expect(existsSync(join(dir, "state", "ci-wait.json"))).toBe(false);
+      const posts: { channel?: string; text: string }[] = [];
+      const srv = Bun.serve({ port: 0, fetch: async (req) => {
+        posts.push((await req.json()) as { channel?: string; text: string });
+        return Response.json({ ok: true, url: "https://discord/x/3" });
+      } });
+      env.FM_SPAWN_POST_URL = `http://127.0.0.1:${srv.port}/post`;
+      try {
+        for (let i = 0; i < 2; i++) {
+          const p = Bun.spawn(["python3", SCRIPT, "--drain-queue"], { env: { ...process.env, ...env }, stdout: "pipe" });
+          await p.exited;
+        }
+      } finally {
+        srv.stop(true);
+      }
+      expect(posts.filter((p) => p.channel === "omp-alerts")).toHaveLength(1);
+      expect(ledger()[`v1:${T}`]).toMatchObject({ ci: "unknown" });
+      expect(ledger()[`v1:${T}`].ciDone).toBeUndefined();
+      expect(JSON.parse(spawn("--stack", "webapp", "--card", "v9", "--dry-run").out).live).toContain("v1");
+    }, 30_000);
+
+    test("own slot: a direct spawn of the card replaces its queued entry; a failed own launch goes back without the own mark", () => {
+      enqueue("v1");
+      gh(12, PENDING);
+      expect(spawn("--stack", "webapp", "--card", "v1").code).toBe(0);
+      expect(queue()).toHaveLength(0);
+      // a drained own start whose launch fails returns to the head as a plain entry
+      rmSync(join(dir, "state", "spawned.jsonl"));
+      writeFileSync(join(dir, "state", "spawned.jsonl"), JSON.stringify({ tsMs: 1000, pane: "wT:p1", tab: "wT:t1", card: "v1",
+        stack: "webapp", cwd: repo, workspace: "wT", task: join(dir, "task.md") }) + "\n");
+      writeFileSync(join(dir, "state", "reserved.json"), "[]");
+      enqueue("v1");
+      writeFileSync(join(dir, "launcher"), `#!/bin/bash\nprintf '%s\\n' "launch $*" >> ${dir}/calls.log\nexit 1\n`);
+      const r = drain();
+      expect(r.out).toContain("FAILED to start queued 📈 v1 resume");
+      expect(queue()).toHaveLength(1);
+      expect(queue()[0].own).toBeUndefined();
+      expect(queue()[0].card).toBe("v1");
+    }, 30_000);
+
+    test("a slow gh never stalls the drain: the CI watch stops at its time budget and the queue still starts", () => {
+      writeFileSync(join(dir, "gh"), `#!/bin/bash\nprintf '%s\\n' "gh $*" >> ${dir}/calls.log\nsleep 2\ncat ${dir}/gh-pr-$3.json\n`);
+      gh(12, PENDING);
+      gh(15, PENDING);
+      cards([
+        { id: "v0", s: "running", stack: "webapp", job: "wT:p0" },
+        { id: "v1", s: "partial", stack: "webapp" },
+        { id: "v5", s: "partial", stack: "webapp" },
+      ]);
+      receipt("v5", "blocked", T, "waiting on CI: PR #15, run https://github.com/o/r/actions/runs/5");
+      expect(spawn("--stack", "kb", "--card", "k1").code).toBe(0); // kb has no cap: starts at once
+      writeFileSync(join(dir, "state", "queued.jsonl"), JSON.stringify({ id: "qK", tsMs: Date.now(), stack: "kb", label: "kb job",
+        cwd: repo, task: join(dir, "task.md"), card: "k2", workspace: "wT", attempts: 0 }) + "\n");
+      env.FM_SPAWN_CI_BUDGET_S = "1";
+      const r = drain();
+      expect(r.out).toContain("CI watch: time budget (1 s) used up; next tick checks v5");
+      expect(calls().split("\n").filter((x) => x.startsWith("gh ")).length).toBe(1);
+      expect(launches().pop()).toContain("--card k2");
+    }, 30_000);
+
+    const liveOf = () => {
+      const r = spawn("--stack", "webapp", "--card", "v9", "--dry-run");
+      return r.code === 6 ? JSON.parse(r.out).live : [];
+    };
+
+    test("an error while queueing the resume leaves the wait open; the next tick retries", () => {
+      writeFileSync(join(dir, "state", "resume"), "not a folder"); // the resume task file cannot be written
+      gh(12, GREEN);
+      expect(drain().out).toContain("CI wait v1: watch failed");
+      expect(launches()).toHaveLength(0);
+      expect(ledger()[`v1:${T}`]).toBeUndefined();
+      expect(liveOf()).toContain("v1");
+      rmSync(join(dir, "state", "resume"));
+      drain();
+      expect(launches()).toHaveLength(1);
+      expect(launches()[0]).toContain("--card v1");
+    }, 30_000);
+
+    test("a CI-wait receipt without tsMs is watched under a hash key: it holds the slot while pending, then resumes", () => {
+      rawReceipt("v1", { summary: CI_SUMMARY });
+      gh(12, PENDING);
+      drain();
+      expect(Object.keys(ledger())).toEqual([expect.stringMatching(/^v1:0:[0-9a-f]{10}$/)]);
+      expect(liveOf()).toContain("v1");
+      gh(12, GREEN);
+      drain();
+      expect(launches()).toHaveLength(1);
+      expect(liveOf()).not.toContain("v1");
+    }, 30_000);
+
+    test("the stuck alert and the not-started alert of one wait are posted once each", async () => {
+      writeFileSync(join(dir, "gh"), `#!/bin/bash\n[ -f ${dir}/gh-pr-$3.json ] || exit 1\ncat ${dir}/gh-pr-$3.json\n`);
+      writeFileSync(join(dir, "tabs.json"), JSON.stringify(Array.from({ length: 31 }, (_, i) => ({ tab_id: `wT:t${i}` }))));
+      env.FM_SPAWN_CI_ALERT_S = "0";
+      const posts: { channel?: string; text: string }[] = [];
+      const srv = Bun.serve({ port: 0, fetch: async (req) => {
+        posts.push((await req.json()) as { channel?: string; text: string });
+        return Response.json({ ok: true, url: "https://discord/x/4" });
+      } });
+      env.FM_SPAWN_POST_URL = `http://127.0.0.1:${srv.port}/post`;
+      const tick = async () => {
+        const p = Bun.spawn(["python3", SCRIPT, "--drain-queue"], { env: { ...process.env, ...env }, stdout: "pipe" });
+        await p.exited;
+      };
+      try {
+        await tick();
+        await tick();
+        gh(12, GREEN);
+        await tick();
+        await tick();
+      } finally {
+        srv.stop(true);
+      }
+      const texts = posts.filter((p) => p.channel === "omp-alerts").map((p) => p.text);
+      expect(texts).toHaveLength(2);
+      expect(texts[0]).toContain("the CI state of PR #12 cannot be read");
+      expect(texts[1]).toContain("CI for PR #12 went green and the job has not started again (queue position 1)");
+    }, 30_000);
   });
 });
 
@@ -656,5 +1318,38 @@ describe("fm-spawn default base (card webapp-ws-branches-unrelated-history)", ()
     sh(["git", "clone", "-q", remote, clone]);
     rmSync(remote, { recursive: true, force: true });
     expect(defaultBase(clone).out.trim()).toBe("origin/live");
+  });
+});
+
+describe("ci_state rollup: superseded cancelled runs (card fm-ci-superseded-runs)", () => {
+  const SCRIPT_P = join(import.meta.dir, "..", "scripts", "fm-spawn");
+  const state = (checks: unknown[]) => {
+    const code = `import runpy,json,sys;g=runpy.run_path(${JSON.stringify(SCRIPT_P)},run_name="x");print(json.dumps(g["rollup_state"](json.load(sys.stdin))))`;
+    const r = Bun.spawnSync(["python3", "-c", code], { stdin: Buffer.from(JSON.stringify(checks)) });
+    return JSON.parse(r.stdout.toString());
+  };
+  const run = (wf: string, id: number, name: string, conclusion: string, status = "COMPLETED") =>
+    ({ __typename: "CheckRun", workflowName: wf, name, status, conclusion, detailsUrl: `https://github.com/o/r/actions/runs/${id}/job/1` });
+  test("PR #156 fixture: cancelled draft run + green newest run -> green", () => {
+    const fx = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "pr156-rollup.json"), "utf8"));
+    expect(state(fx)).toEqual(["green", "18 checks passed"]); // all 18 newest-run checks kept, 5 draft-run checks dropped
+  });
+  test("superseded cancelled run + green newest -> green", () => {
+    expect(state([run("CI", 1, "core", "CANCELLED"), run("CI", 1, "gate", "FAILURE"), run("CI", 2, "core", "SUCCESS")])[0]).toBe("green");
+  });
+  test("single cancelled run -> failed", () => {
+    expect(state([run("CI", 1, "core", "CANCELLED")])[0]).toBe("failed");
+  });
+  test("newest run failing -> failed", () => {
+    expect(state([run("CI", 1, "core", "CANCELLED"), run("CI", 2, "core", "FAILURE")])[0]).toBe("failed");
+  });
+  test("push + pull_request runs, older failed not cancelled -> counted", () => {
+    expect(state([run("CI", 1, "core", "FAILURE"), run("CI", 2, "core", "SUCCESS")])[0]).toBe("failed");
+  });
+  test("newest run running -> pending", () => {
+    expect(state([run("CI", 1, "core", "CANCELLED"), run("CI", 2, "core", "", "IN_PROGRESS")])[0]).toBe("pending");
+  });
+  test("StatusContext kept", () => {
+    expect(state([run("CI", 2, "core", "SUCCESS"), { __typename: "StatusContext", context: "x", state: "FAILURE" }])[0]).toBe("failed");
   });
 });

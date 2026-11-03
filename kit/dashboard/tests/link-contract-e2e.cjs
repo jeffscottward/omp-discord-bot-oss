@@ -5,10 +5,11 @@
 const lib = require("./lib.cjs");
 const puppeteer = lib.puppeteer();
 const DISCORD = /^https:\/\/discord\.com\/channels\//;
+const RUN = lib.runTmp("fm-contract-"); // Chrome profile + Chrome temp files; removed at exit (card test-tmp-leak)
 (async () => {
   const tg = process.argv[2] ? { base: process.argv[2].replace(/\?.*$/, ""), stop: () => {} } : await lib.target();
   const URL = process.argv[2] || tg.base + "?tab=all";
-  const b = await puppeteer.launch({ executablePath: lib.chrome(), headless: true, args: ["--no-sandbox", `--user-data-dir=/tmp/fm-contract-${process.pid}`] });
+  const b = await puppeteer.launch({ executablePath: lib.chrome(), headless: true, env: { ...process.env, TMPDIR: RUN }, args: ["--no-sandbox", `--user-data-dir=${RUN}/prof`] });
   const p = await b.newPage(); const errs = [];
   p.on("pageerror", e => errs.push(String(e)));
   await p.setViewport({ width: 390, height: 844 });

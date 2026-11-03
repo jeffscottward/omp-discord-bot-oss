@@ -4,6 +4,9 @@ A card whose PR is MERGED becomes done ("✅ PR merged <sha> at <time>"); a PR C
 becomes partial "PR closed without merge; needs check". PR link sources: the card's `l` field first,
 then `src`, `q`, the note `n`. Finance cards are only logged. Writes go through `fm` (lock, `by`).
 Usage: fm-prwatch [--dry-run]
+Receipt guard (2026-11-01): a merged PR does not close a card whose receipt (receipts/<id>.json) says blocked/failed
+with tsMs after mergedAt; steps are left after the merge. A missing/unreadable receipt keeps the old behavior.
+Cards in waiting/open/blocked (owner step left) are not changed on merge.
 Settings: ~/.config/omp-discord/kit.env (FM_DIR, REPORTS_WEB_DIR, FM_SKIP_AREAS, FM_BIN). Needs a logged-in `gh`."""
 import json, os, re, subprocess, sys, time
 
@@ -62,6 +65,21 @@ def pr_of(item):
     return None
 
 
+def receipt_after_merge(iid, merged_at):
+    """The result when receipts/<iid>.json says blocked/failed and is newer than the PR merge, else None."""
+    try:
+        from datetime import datetime
+        with open(os.path.join(FM_DIR, "receipts", f"{iid}.json")) as f:
+            rc = json.load(f)
+        res = str(rc.get("result") or "").lower()
+        if res not in ("blocked", "failed"):
+            return None
+        merged_ms = datetime.fromisoformat(str(merged_at).replace("Z", "+00:00")).timestamp() * 1000
+        return res if float(rc.get("tsMs")) > merged_ms else None
+    except Exception:
+        return None
+
+
 def main():
     items = json.load(open(ITEMS)).get("items", [])
     for it in items:
@@ -95,10 +113,20 @@ def main():
         if field == "n":
             log(f"{it['id']}: PR only in note, not changed: {note}")
             continue
+        # A card waiting on an owner step (waiting/open/blocked) keeps that step after the merge.
+        if it.get("s") in ("waiting", "open", "blocked"):
+            log(f"{it['id']}: {it.get('s')} card (owner step left), not changed: {note}")
+            continue
         # A live job may still have steps after the merge (deploy, verify): never close it here.
         if it.get("s") == "running" or it.get("job"):
             log(f"{it['id']}: running/job card, not changed: {note}")
             continue
+        # A blocked/failed receipt newer than the merge means steps are left (deploy, migration): keep the card.
+        if st == "MERGED":
+            res = receipt_after_merge(it["id"], d.get("mergedAt"))
+            if res:
+                log(f"{it['id']}: receipt {res} after merge (steps left), not changed: {note}")
+                continue
         # Do not rewrite the same result every minute.
         if str(it.get("n") or "").startswith(note.split(" (fm-prwatch)")[0].replace("✅ ", "✅ ")) or (target == "partial" and "closed without merge" in str(it.get("n") or "")):
             continue

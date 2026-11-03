@@ -5,6 +5,7 @@
 const lib = require("./lib.cjs");
 const puppeteer = lib.puppeteer();
 const fs = require("fs"), path = require("path"), os = require("os");
+const RUN = lib.runTmp("fm-queued-run-"); // Chrome profile + Chrome temp files; removed at exit (card test-tmp-leak)
 const results = [];
 const ok = (name, cond, info) => results.push({ name, pass: !!cond, info });
 
@@ -28,7 +29,7 @@ const fixture = { updated: "fixture", items: [
   else if (process.env.BASE) base = process.env.BASE;
   else { srv = await lib.serveFixture({ "items.json": fixture }); base = srv.base; }
   const shot = path.join(os.tmpdir(), "queued-state-needs.png");
-  const b = await puppeteer.launch({ executablePath: lib.chrome(), headless: "new", userDataDir: fs.mkdtempSync(path.join(os.tmpdir(), "fm-queued-prof-")), args: ["--no-first-run", "--no-default-browser-check"] });
+  const b = await puppeteer.launch({ executablePath: lib.chrome(), headless: "new", userDataDir: path.join(RUN, "prof"), env: { ...process.env, TMPDIR: RUN }, args: ["--no-first-run", "--no-default-browser-check"] });
   try {
     const p = await b.newPage(); await p.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
     if (process.env.BASE) { await p.setRequestInterception(true); p.on("request", (r) => /\/items\.json(\?|$)/.test(r.url()) ? r.respond({ status: 200, contentType: "application/json", body: JSON.stringify(fixture) }) : r.continue()); }

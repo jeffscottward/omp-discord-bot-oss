@@ -21,6 +21,10 @@ Findings:
                   or a loop (a held card counts as the owner's step) -> ✍️ Needs you: ONE ask menu in FIRSTMATE for all new ones (max 5),
                   card q = its menu, state waiting with an action. fm-needs-ntfy sends the ntfy push.
  F6 answered      partial card the owner answered (📨 queued) more than 30 min ago and still no job -> flow.
+Boot gate (card fm-boot-gate, 2026-11-02): a card whose `bootGate` field equals the current boot id
+(/proc/sys/kernel/random/boot_id; `fm field <id> bootGate now`) waits for the next reboot: no finding, never in `flow`,
+leaf class external, listed in audit.json `external` with "waits for next boot". fm-autoclear R14 removes the gate after a
+reboot (a new boot younger than 30 min still counts as waiting, like R14).
 
 Flow: audit.json `flow` lists the cards; firstmate-sweep reads them next to idle.json. When a flow or idle card was not
 in a sweep in the last 6 h, fm-audit starts firstmate-sweep.service (at most every 20 min; one sweep at a time).
@@ -59,6 +63,9 @@ STALE_RUN_S = 300
 NEEDS_CHECK = re.compile(r"needs check", re.I)
 SKIP_AREAS = {x.strip().lower() for x in (os.environ.get("FM_SKIP_AREAS") or "").split(",") if x.strip()}  # opt-in; default none
 HOLD = os.path.join(HERE, "hold.json")
+BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
+BOOT_GRACE_S = 30 * 60  # same as fm-autoclear R14
+BOOT_WHY = "waits for next boot"
 
 
 # ---------- pure helpers ----------
@@ -86,6 +93,38 @@ def holds():
         return dict(json.load(open(HOLD)).get("cards") or {})
     except Exception:
         return {}
+
+
+def boot_id():
+    try:
+        with open(BOOT_ID_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def boot_age():
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def boot_held(it, ctx):
+    """Same rule as fm-autoclear R14: True while the card's bootGate is the current boot (or the boot is unknown, or the
+    new boot is younger than BOOT_GRACE_S)."""
+    g = str(it.get("bootGate") or "").strip()
+    if not g:
+        return False
+    cur = str(ctx.get("boot_id") or "")
+    return not cur or cur == g or float(ctx.get("boot_age") or 0) < BOOT_GRACE_S
+
+
+def boot_waits(items, ctx):
+    """audit.json `external`: unfinished cards that wait for the next boot."""
+    return [{"id": i["id"], "t": str(i.get("t", ""))[:120], "class": "external", "why": BOOT_WHY}
+            for i in items if i.get("id") and i.get("s") != "done" and boot_held(i, ctx)]
 
 
 def protected(it, held=()):
@@ -213,8 +252,8 @@ def audit(items, ctx):
 
     for iid, it in by.items():
         s = it.get("s")
-        if s == "done" or protected(it, held):
-            continue
+        if s == "done" or protected(it, held) or boot_held(it, ctx):
+            continue  # a boot-gated card waits for the next boot (class external); nothing to fix
         j, refs = J[iid], edges.get(iid, [])
         open_bb = [r for r in refs if r not in by or not cleared(by[r], now)]
         quiet = now - last_touch(it) > GRACE_S  # fm-autoclear/fm-audit writes do not count
@@ -244,7 +283,7 @@ def audit(items, ctx):
         if x.get("queued") and x.get("s") != "done":
             return "bot"
         g = iso_ts(x.get("until")) if x.get("until") else 0
-        if x.get("ext") or g > now:
+        if x.get("ext") or g > now or boot_held(x, ctx):
             return "external"
         if x.get("s") == "running" or x.get("id") in flow or (x.get("id") in J and working(x["id"])):
             return "bot"
@@ -256,7 +295,7 @@ def audit(items, ctx):
 
     BAD = ("parked", "unknown", "missing", "loop")
     for iid, it in by.items():
-        if it.get("s") not in ("partial", "blocked") or protected(it, held) or iid in flow or it.get("queued"):
+        if it.get("s") not in ("partial", "blocked") or protected(it, held) or boot_held(it, ctx) or iid in flow or it.get("queued"):
             continue
         if it.get("s") == "blocked" and (it.get("q") or it.get("src")):
             continue  # an owner step with a question/message link (fm-autoclear R11 sets no action): already asked
@@ -456,7 +495,8 @@ def main(dry, rep):
         print("fm-audit: running.json is stale or has no job list; nothing checked")
         return 0
     ctx = {"now": now, "jobs": run.get("jobs") or [], "item_jobs": run.get("itemJobs") or {},
-           "item_units": run.get("itemUnits") or {}, "services": run.get("services") or [], "holds": holds()}
+           "item_units": run.get("itemUnits") or {}, "services": run.get("services") or [], "holds": holds(),
+           "boot_id": boot_id(), "boot_age": boot_age()}
     found = audit(items, ctx)
     if rep:
         report(found, items)
@@ -512,12 +552,14 @@ def main(dry, rep):
         idle_ids = [i["id"] for i in json.load(open(IDLE)).get("items") or []]
     except Exception:
         idle_ids = []
-    cand = [x["id"] for x in flow] + [i for i in idle_ids if i not in {x["id"] for x in flow} and i not in ctx["holds"]]
+    external = boot_waits(items, ctx)
+    gated = {x["id"] for x in external}
+    cand = [x["id"] for x in flow] + [i for i in idle_ids if i not in {x["id"] for x in flow} and i not in ctx["holds"] and i not in gated]
     due = [i for i in cand if now - st["swept"].get(i, 0) > RESWEEP_S]
     st["swept"] = {k: v for k, v in st["swept"].items() if now - v < 2 * RESWEEP_S}
     out = {"generated": datetime.now().astimezone().isoformat(timespec="seconds"), "flow": flow,
            "owner": [{"id": f["id"], "why": f["why"], "root": f.get("root")} for f in found if f["fix"] == "ask"],
-           "findings": [{k: f[k] for k in ("id", "kind", "why", "fix")} for f in found],
+           "findings": [{k: f[k] for k in ("id", "kind", "why", "fix")} for f in found], "external": external,
            "lastSweep": st.get("lastSweep") or None, "sweepStarted": None}
     if not dry:
         write_json(OUT, out)  # before the sweep starts: firstmate-sweep reads the flow list at once
@@ -563,8 +605,10 @@ def main(dry, rep):
 # ---------- self-test ----------
 def test():
     global LOG
-    import tempfile
-    LOG = os.path.join(tempfile.mkdtemp(prefix="fm-audit-test-"), "audit.log")  # never the real log
+    import atexit, shutil, tempfile
+    tmp = tempfile.mkdtemp(prefix="fm-audit-test-")
+    atexit.register(shutil.rmtree, tmp, True)  # card test-tmp-leak: removed also when a check fails (sys.exit)
+    LOG = os.path.join(tmp, "audit.log")  # never the real log
     n = [0]
 
     def ok(cond, msg=""):
@@ -604,11 +648,18 @@ def test():
         mk("waits-own", "partial", blockedBy="own"),                        # owner leaf: fine
         mk("idle", "partial"),                                               # plain idle: R10's job, not ours
         mk("unb-auto", "partial", blockedBy=["a-done"], cts=int(now * 1000)),  # only fm-autoclear wrote it just now
+        # boot gate (card fm-boot-gate): bootGate == current boot -> waits for next boot (external), no finding
+        mk("boot-chk", "partial", n="x [job ended; no receipt; needs check]", bootGate="BOOT-1"),
+        mk("boot-unb", "partial", blockedBy=["a-done"], bootGate="BOOT-1"),
+        mk("boot-park", "planned", bootGate="BOOT-1"),
+        mk("waits-boot", "partial", blockedBy="boot-park"),                 # waits on an external leaf: not unclear
+        mk("boot-old", "partial", n="x [job ended; no receipt; needs check]", bootGate="BOOT-0"),  # rebooted: flows
     ]
     ctx = {"now": now, "holds": {"held": "owner review"}, "jobs": [{"id": "wB:p1", "status": "working", "active": datetime.fromtimestamp(now - 60).isoformat()}],
            "item_jobs": {}, "item_units": {"daemon": ["main:omp-discord-bot.service"]},
            "services": [{"host": "main", "unit": "omp-discord-bot.service", "state": "running", "oneShot": False, "timer": None},
-                        {"host": "main", "unit": "x-check.service", "state": "waiting", "oneShot": True, "timer": "x-check.timer"}]}
+                        {"host": "main", "unit": "x-check.service", "state": "waiting", "oneShot": True, "timer": "x-check.timer"}],
+           "boot_id": "BOOT-1", "boot_age": 7200.0}
     found = audit(items, ctx)
     k = {f["id"]: f for f in found}
     ok(k.get("unb", {}).get("kind") == "unblocked", k.get("unb"))
@@ -653,6 +704,14 @@ def test():
         raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
     asked3 = {}
     ok(post_asks(todo, {}, asked3, by, now, False, refused, lambda a, w: (True, "")) == [] and not asked3, "bot down: retry later")
+    # boot gate
+    ok(not {"boot-chk", "boot-unb", "boot-park", "waits-boot"} & set(k), f"boot-gated cards (and cards behind one) have no finding: {sorted(k)}")
+    ok(k.get("boot-old", {}).get("kind") == "needs-check", "after a reboot the card flows again")
+    bw = boot_waits(items, ctx)
+    ok({x["id"] for x in bw} == {"boot-chk", "boot-unb", "boot-park"} and all(x["class"] == "external" and x["why"] == BOOT_WHY for x in bw), bw)
+    young = {**ctx, "boot_age": 60.0}
+    ok("boot-old" not in {f["id"] for f in audit(items, young)}, "a new boot younger than 30 min keeps the gate")
+    ok(boot_held({"bootGate": "BOOT-0"}, {**ctx, "boot_id": ""}) and not boot_held({}, ctx), "unknown boot keeps the gate; no gate, no hold")
     # no area is protected by default; time gates and held cards are
     ok(not protected({"id": "x", "area": "Finance"}) and protected({"id": "x", "until": "2030-01-01"}) and protected({"id": "h"}, {"h": "r"}))
     print(f"fm-audit self-test: {n[0]} checks passed")
