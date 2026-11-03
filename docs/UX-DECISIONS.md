@@ -76,7 +76,7 @@ decision, and record the new date.
 - Tools: `/usage` (AI provider limits, like `omp usage`), `/rgb` (toggle, or `state:on|off`), `/remind`, `/nest`,
   `/radio` (read-only).
 - `/restart` asks first (private confirm button). The bot restarts only through the idle restart. The Claude
-  broker and DarkFactory gateway cannot be picked.
+  broker and ExampleFactory gateway cannot be picked.
 - Commands that change state must report failure honestly: no "set" or "restarted" unless it really happened.
 
 ## Lofi Radio (2026-10-15)

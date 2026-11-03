@@ -1282,7 +1282,7 @@ describe("fm-spawn --close-finished (card tabclose-safe)", () => {
   });
 
   test("a tab the refusal marks [done] closes even with a backlog own card and a Terminal pane; owner tabs stay", () => {
-    setup([{ tab_id: "wT:t1", label: "📈 DS tables vx", agent_status: "done" },
+    setup([{ tab_id: "wT:t1", label: "📈 DS tables", agent_status: "done" },
            { tab_id: "wT:t2", label: "💬 webapp assistant stop", agent_status: "done" },
            { tab_id: "wT:t3", label: "FIRSTMATE", agent_status: "done" },
            { tab_id: "wT:t4", label: "owner notes", agent_status: "idle" }],
@@ -1309,9 +1309,9 @@ describe("fm-spawn --close-finished (card tabclose-safe)", () => {
   });
 
   test("Herdr done + own card running/waiting keeps the tab", () => {
-    setup([{ tab_id: "wT:t1", label: "💹 IWM hold", agent_status: "done" }, { tab_id: "wT:t2", label: "w", agent_status: "done" }],
+    setup([{ tab_id: "wT:t1", label: "💹 budget watch", agent_status: "done" }, { tab_id: "wT:t2", label: "w", agent_status: "done" }],
       [P("wT:p1", "wT:t1", "done"), P("wT:p2", "wT:t2", "done")],
-      [{ id: "iwm", s: "running" }, { id: "w", s: "waiting" }], [{ tab: "wT:t1", card: "iwm" }, { tab: "wT:t2", card: "w" }]);
+      [{ id: "watch", s: "running" }, { id: "w", s: "waiting" }], [{ tab: "wT:t1", card: "watch" }, { tab: "wT:t2", card: "w" }]);
     const r = run();
     expect(line(r.out, "wT:t1")).toContain("live job");
     expect(line(r.out, "wT:t2")).toContain("live job");

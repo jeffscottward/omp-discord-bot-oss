@@ -103,7 +103,7 @@ describe("rows", () => {
 
   test("blockedBy (card mq-blocked-reason-full): 'waits for <blocker title> (<state>)' instead of the receipt text", () => {
     const cards: FmCard[] = [
-      { id: "dep", t: "Stock page quant data", s: "partial", blockedBy: ["ci-prio"] },
+      { id: "dep", t: "Report page data", s: "partial", blockedBy: ["ci-prio"] },
       { id: "dep2", t: "Two blockers", s: "partial", blockedBy: ["ci-prio", "gone-card", "Finished blocker"] },
       // A reverse `blocks` edge counts too (same resolver as the dashboard and fm-audit).
       { id: "dep3", t: "Blocked via blocks", s: "partial" },

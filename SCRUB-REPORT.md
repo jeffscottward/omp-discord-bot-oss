@@ -116,3 +116,12 @@ Replaced or removed in the new code and tests (same table as above):
 - The symbol-link import stays removed.
 
 New: README sections Architecture and Prerequisites, and a dashboard screenshot rendered from fake sample data.
+
+Review fixes (fresh-context review, 2026-11-03): a ticker and position in an fm-spawn test fixture and a video-to-trade
+hint in an fm-tabwatch fixture replaced; the finance yield trigger now needs "in/at/my/our bank" (plain "bank" no
+longer pauses work); `remote:` unit prefix length fix; remaining private gateway/broker project names replaced with
+`example-gateway` / `example-broker`.
+
+Scan results (2026-11-03, second update): gitleaks dir/git and trufflehog filesystem/git: **0 findings**. Pattern
+grep over files and full history (finance, host, tailnet, home path, email, real Discord IDs): **0 hits**.
+`bunx tsc --noEmit`, `bun test test/` (1062 pass), `bun test src/` (84 pass), `kit/test.sh` (51 pass): pass.

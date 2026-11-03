@@ -119,7 +119,7 @@ export function jobPlace(raw: string | string[], r?: Resolvers): string {
   if (p?.tab) return `💻 ${p.tab}`;
   if (HERDR_ID.test(job)) return p?.gone ? "💻 closed tab" : p?.session ? "💻 terminal tab" : "💻 terminal tab (Herdr not reachable)"; // "closed" only when Herdr confirms it
   if (/\.(timer|service)$/.test(job)) return `background service ${job.replace(/\.(timer|service)$/, "")}`;
-  if (job.startsWith("remote:")) return `remote host service ${job.slice(9)}`;
+  if (job.startsWith("remote:")) return `remote host service ${job.slice("remote:".length)}`;
   return `💻 ${job}`;
 }
 

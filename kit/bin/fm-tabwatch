@@ -600,19 +600,19 @@ def selftest():
         check("T1 non-message entries after the final reply are skipped", ct()[0])
         check("T1 no card keeps", not ct(sp={**sp, "card": None})[0])
         check("T1 a done finance card closes like any card (owner 2026-10-31)", ct(items=[{"id": "c1", "s": "done", "area": "finance"}])[0])
-        check("T1 title words never keep a tab", ct(items=[{"id": "c1", "s": "done", "t": "IG reel to trade decision"}])[0])
+        check("T1 title words never keep a tab", ct(items=[{"id": "c1", "s": "done", "t": "video notes to finance decision"}])[0])
         check("T1 a time gate keeps", not ct(items=[{"id": "c1", "s": "done", "until": "2099-01-01T00:00:00Z"}])[0])
         # registry: legacy log + jsonl
         global SPAWN_STATE
         SPAWN_STATE = os.path.join(d, "spawn")
         os.makedirs(SPAWN_STATE)
         open(os.path.join(SPAWN_STATE, "fm-spawn.log"), "w").write(
-            "2026-10-19 11:18:29 spawned 📈 Trade reel ingest: tab wB:t5Q pane wB:pAX cwd /home/x/Github/finance card trade-reel\n"
+            "2026-10-19 11:18:29 spawned 📈 Video notes ingest: tab wB:t5Q pane wB:pAX cwd /home/x/Github/finance card video-notes\n"
             "2026-10-19 11:02:10 spawned 🧪 a: tab wB:t5M pane wB:pAQ cwd /tmp/s card -\n"
             "2026-10-19 11:02:38 cleanup removed /tmp/x (ws/x)\n")
         open(os.path.join(SPAWN_STATE, "spawned.jsonl"), "w").write(json.dumps({"tsMs": 1, "label": "n", "tab": "wB:t9", "pane": "wB:p9", "card": "k"}) + "\n")
         s = spawns()
-        check("registry: jsonl + legacy log lines", {(x["tab"], x["card"]) for x in s} == {("wB:t9", "k"), ("wB:t5Q", "trade-reel"), ("wB:t5M", None)}, s)
+        check("registry: jsonl + legacy log lines", {(x["tab"], x["card"]) for x in s} == {("wB:t9", "k"), ("wB:t5Q", "video-notes"), ("wB:t5M", None)}, s)
         # A1 / A2
         ws = [{"workspace_id": "wT", "label": "Github", "tab_count": 26, "active_tab_id": "wT:t0"}]
         tabs26 = [{"tab_id": f"wT:t{i}", "workspace_id": "wT", "label": f"t{i}"} for i in range(26)]

@@ -4,7 +4,7 @@ import type { FmCard } from "./masterqueue.ts";
 
 const cards: FmCard[] = [
   { id: "webapp-adx-filter", t: "Webapp: test ADX as strategy filter + add Relative Volume at Time", s: "running", stack: "webapp", job: "wB:pYK" },
-  { id: "ci-speed-audit", t: "CI speed audit: DarkFactory, Webapp, Client Co", s: "partial", stack: "webapp", job: "CI audit" },
+  { id: "ci-speed-audit", t: "CI speed audit: ExampleFactory, Webapp, Client Co", s: "partial", stack: "webapp", job: "CI audit" },
   { id: "webapp-done", t: "Webapp old job", s: "done", stack: "webapp", job: "wB:p1" },
   { id: "webapp-nochan", t: "Webapp no channel", s: "running", stack: "webapp", job: "gone" },
   { id: "infra-x", t: "Infra job", s: "running", stack: "infra", job: "wB:p2" },

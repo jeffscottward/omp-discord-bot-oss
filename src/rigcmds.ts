@@ -35,12 +35,12 @@ export const SERVICES: Record<string, string> = {
   streamsrv: "stream-server.service",
   tts: "omp-tts.service",
   whisper: "omp-whisper.service",
-  "claude-broker": "omp-procedura-broker.service",
-  darkfactory: "darkfactory-omp-gateway.service",
+  "claude-broker": "example-broker.service",
+  examplefactory: "example-gateway.service",
   reminders: "reminders-inbox.service",
   "kb-chat": "kb-chat.service",
 };
-/** /restart targets. The Claude broker and DarkFactory gateway are excluded on purpose (AGENTS.md: ask first). */
+/** /restart targets. The Claude broker and ExampleFactory gateway are excluded on purpose (AGENTS.md: ask first). */
 export const RESTARTABLE = ["bot", "radio", "statusmon", "tts", "whisper", "reminders", "kb-chat"] as const;
 
 export async function services(): Promise<string> {

@@ -50,7 +50,7 @@ export function panesForJob(job: string, panes: Pane[], tabs: Tab[]): Pane[] {
 
 const isWorkingOmp = (p: Pane) => p.agent === "omp" && p.agent_status === "working";
 
-/** Finance cards never yield to an bank request (they may be the request). */
+/** Finance cards never yield to a bank request (they may be the request). */
 export function isFinanceCard(c: Card): boolean {
   const k = `${c.area ?? ""} ${c.stack ?? ""}`.toLowerCase();
   return /financ|bank|budget|\bmarkets?\b|\boptions?\b|portfolio/.test(k);
@@ -60,7 +60,7 @@ export function isFinanceCard(c: Card): boolean {
 export function isFinanceInstruction(text: string): boolean {
   const t = text.toLowerCase();
   const verb = /\b(close|sell|buy|roll|hedge|trim|add|check|show|protect|order|exit|reduce)\b/.test(t);
-  if (/\bbank\b|online banking/.test(t)) return verb && !/\b(card|bug|yield|test|code|pr|mr)\b/.test(t);
+  if (/\b(?:in|at|my|our)\s+(?:the\s+)?bank\b|online banking/.test(t)) return verb && !/\b(card|bug|yield|test|code|pr|mr)\b/.test(t);
   return verb && /\b(my|our)\s+(positions?|portfolio|book)\b|\bthe\s+(positions?|portfolio)\b/.test(t);
 }
 
@@ -194,7 +194,7 @@ async function pauseNow(o: PauseOpts): Promise<PauseResult> {
   return { panes: ids, stopped: ids.filter((i) => !still.includes(i)), stillWorking: still, cards: paused, errors };
 }
 
-export const CONTINUE_MSG = "Work was paused (pause-all or an bank priority request) and is resumed now. Continue your task from where you stopped.";
+export const CONTINUE_MSG = "Work was paused (pause-all or a bank priority request) and is resumed now. Continue your task from where you stopped.";
 
 /** Restore the saved cards to running with their job; optionally prompt the paused panes to continue. */
 type ResumeOpts = { herdr: Herdr; fm: Fm; stateFile: string; prompt?: boolean };

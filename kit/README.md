@@ -86,7 +86,7 @@ Data written at run time (never in the repo): `FM_DIR/{items,running,reports,cha
 | Piece | Reason |
 |---|---|
 | `firstmate-dbsync.{service,timer,path}`, `firstmate-trailbase.service`, `firstmate-front-preview.service` | Dashboard v4 (Vike + TrailBase) from a separate, experimental repo; the v3 dashboard in this kit does not need it. |
-| `darkfactory-*`, `omp-procedura-*`, `ex-remote-*`, `github-discord-feed`, `omp-postboot.service` | Owner-only services. |
+| `example-gateway-*`, `example-broker-*`, `ex-remote-*`, `github-discord-feed`, `omp-postboot.service` | Owner-only services. |
 | Finance pieces (example watch, status monitors, peer finance host) | Owner-only. The peer-host view in `build-running.py` is generic (`FM_PEER_*`); the owner's values live only in his own kit.env. |
 | `omp-lofi-radio.service`, `omp-discord-bot.service`, `omp-tts.service`, `omp-whisper.service`, `channel-cleanup.*` | Already in the repo (`scripts/omp-lofi-radio.service`, `systemd/`); installed by `scripts/bootstrap.sh`. |
 | `omp-notify` (owner's ntfy/Discord alert sender) | Owner-specific; `bin/fm-notify` replaces it. Point `OMP_NOTIFY` at your own sender if you have one. |
