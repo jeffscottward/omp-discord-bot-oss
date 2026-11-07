@@ -1,0 +1,7 @@
+[Unit]
+Description=Delete 🛑 Stopped replies + their requests older than 24 h in Discord (owner 2026-10-21; JSON copy kept)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1200
+ExecStart=/usr/bin/python3 $HOME/Github/tools/omp-discord-bot/scripts/stopped-cleanup.py --min-age-hours 24

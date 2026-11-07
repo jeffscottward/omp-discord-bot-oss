@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""fm-prwatch (owner 2026-10-19): every minute, check GitHub for PRs linked from open FIRSTMATE cards.
+A card whose PR is MERGED becomes done ("✅ PR merged <sha> at <time>"); a PR CLOSED without merge
+becomes partial "PR closed without merge; needs check". PR link sources: the card's `l` field first,
+then `src`, `q`, the note `n`. All areas are treated the same (owner 2026-10-31: finance cards flow like all others; FM_SKIP_AREAS is an opt-in log-only list, default empty). Writes go through `fm` (lock, `by`).
+Usage: fm-prwatch [--dry-run]
+Env (tests): FM_ITEMS, FM_PRWATCH_RUNNING, FM_PRWATCH_LOG, FM_PRWATCH_STATE, FM_PRWATCH_GH_TIMEOUT.
+Audit 2026-10-25 (card pstack-integration): a gh timeout no longer crashes the run; merged PRs are cached (no gh call
+again); "not changed" lines are logged once per card and message; unblock keeps the dependent's note; list `job` works.
+PR state (pstack watch-pr tiers, 2026-10-25): for OPEN PRs the same gh call also reads draft/mergeable/review/check
+fields, and prstate.json (next to items.json; one writer, never items.json) gets {card: {pr, state, detail, at}} with
+state = conflicts | ci-failing | changes-requested | review-required | draft | ci-pending | no-ci | ready. The dashboard shows
+it as a badge. It never changes a card's state or note.
+Receipt guard (2026-11-01, card fm-prwatch-blocked-receipt): a merged PR does not close a card whose receipt (receipts/<id>.json
+next to items.json) says blocked/failed with tsMs after mergedAt; steps are left after the merge. Missing/unreadable receipt: unchanged.
+Card state `blocked` (owner step left) is kept on merge like waiting/open (2026-11-01)."""
+import json, os, re, subprocess, sys, time
+
+# Kit settings (card sma-fm-set-cas, 2026-11-03): one source in git (kit/bin); ~/.local/bin links here.
+def _kit_env():
+    """Read the kit settings file (KEY=VALUE lines; the shell kit scripts read the same file).
+    File: $OMP_KIT_ENV, else ~/.config/omp-discord/kit.env. A variable that is already set in the environment wins."""
+    path = os.environ.get("OMP_KIT_ENV") or os.path.expanduser("~/.config/omp-discord/kit.env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or line.startswith("#") or not key.isidentifier() or key in os.environ:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] == "'":
+            val = val[1:-1]
+        else:
+            if len(val) >= 2 and val[0] == val[-1] == '"':
+                val = val[1:-1]
+            val = os.path.expanduser(os.path.expandvars(val))
+        os.environ[key] = val
+
+
+_kit_env()
+_FM_DIR = os.environ.get("FM_DIR") or os.path.join(os.environ.get("REPORTS_WEB_DIR") or os.path.expanduser("~/Documents/reports/web"), "firstmate")
+_FM_BIN = os.environ.get("FM_BIN") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "fm")
+SKIP_AREAS = {a.strip().lower() for a in (os.environ.get("FM_SKIP_AREAS") or "").split(",") if a.strip()}  # owner 2026-10-31: none by default
+OWNER_PREFIX = (os.environ.get("FM_OWNER_REPO_PREFIX") or "owner/").lower()  # PRs in your own repos (owner/...)
+try:
+    HELD = set((json.load(open(os.path.join(os.path.dirname(os.environ.get("FM_ITEMS") or os.path.join(_FM_DIR, "items.json")), "hold.json"))).get("cards") or {}))
+except Exception:
+    HELD = set()
+
+ITEMS = os.environ.get("FM_ITEMS") or os.path.join(_FM_DIR, "items.json")
+RUNNING = os.environ.get("FM_PRWATCH_RUNNING") or os.path.join(_FM_DIR, "running.json")
+LOG = os.environ.get("FM_PRWATCH_LOG") or os.path.join(_FM_DIR, "prwatch.log")
+PRSTATE = os.environ.get("FM_PRWATCH_PRSTATE") or os.path.join(os.path.dirname(ITEMS), "prstate.json")
+STATE = os.environ.get("FM_PRWATCH_STATE") or os.path.expanduser("~/.cache/fm-prwatch/state.json")
+# 2026-11-03 (card fm-prwatch-foreign-pr): only PRs in repos the owner controls change cards.
+OWNERS = {o.strip().lower() for o in (os.environ.get("FM_PR_OWNERS") or "owner,example-org").split(",") if o.strip()}
+# Opt-in: ~/Github also holds clones of upstream repos (tools/*), so a checkout alone does not prove ownership.
+CHECKOUT_ROOT = os.environ.get("FM_PR_CHECKOUT_ROOT") or ""
+_LOCAL = None
+
+
+def local_repos():
+    """owner/name (lower) of every git origin under CHECKOUT_ROOT (depth <= 3)."""
+    global _LOCAL
+    if _LOCAL is None:
+        _LOCAL = set()
+        if not CHECKOUT_ROOT:
+            return _LOCAL
+        rx = re.compile(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$", re.M)
+        for root, dirs, files in os.walk(CHECKOUT_ROOT):
+            depth = root[len(CHECKOUT_ROOT):].count(os.sep)
+            if ".git" in dirs or ".git" in files:
+                try:
+                    cfg = os.path.join(root, ".git", "config")
+                    for m in rx.finditer(open(cfg).read() if os.path.isfile(cfg) else ""):
+                        _LOCAL.add(m.group(1).lower())
+                except OSError:
+                    pass
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "node_modules"] if depth < 3 else []
+    return _LOCAL
+
+
+def own_repo(repo):
+    return repo.split("/")[0].lower() in OWNERS or repo.lower() in local_repos()
+
+
+GH_TIMEOUT = float(os.environ.get("FM_PRWATCH_GH_TIMEOUT") or 30)
+PR = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
+DRY = "--dry-run" in sys.argv
+GH_FIELDS = "state,mergedAt,mergeCommit,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup"
+CHECK_FAIL = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
+
+
+def pr_tier(d):
+    """(state, detail) of an OPEN PR, in watch-pr's blocker order: conflicts, failing checks, review gates, draft,
+    running checks, then ready. Review threads are not read (they need GraphQL)."""
+    checks = [c for c in (d.get("statusCheckRollup") or []) if isinstance(c, dict)]
+    fail = pend = 0
+    for c in checks:
+        if c.get("__typename") == "StatusContext" or ("state" in c and "conclusion" not in c):
+            st = str(c.get("state") or "").upper()
+            fail += st in CHECK_FAIL
+            pend += st in ("PENDING", "EXPECTED")
+        elif str(c.get("status") or "").upper() != "COMPLETED":
+            pend += 1
+        else:
+            fail += str(c.get("conclusion") or "").upper() in CHECK_FAIL
+    n = len(checks)
+    if d.get("mergeable") == "CONFLICTING" or d.get("mergeStateStatus") == "DIRTY":
+        return "conflicts", ""
+    if fail:
+        return "ci-failing", f"{fail} of {n} checks"
+    if d.get("reviewDecision") == "CHANGES_REQUESTED":
+        return "changes-requested", ""
+    if d.get("isDraft"):
+        return "draft", ""
+    if pend:
+        return "ci-pending", f"{pend} of {n} checks"
+    if d.get("reviewDecision") == "REVIEW_REQUIRED":
+        return "review-required", ""
+    if not n:  # repos migrated to a self-hosted GitLab have GitHub Actions off: no checks is not "ready"
+        return "no-ci", ""
+    return "ready", f"{n} check{'s' if n != 1 else ''} green"
+
+
+def save_prstate(cards):
+    if DRY:
+        return
+    tmp = f"{PRSTATE}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump({"generated": int(time.time() * 1000), "cards": cards}, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, PRSTATE)
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    if DRY:
+        return
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = f"{STATE}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, STATE)
+
+
+def log_once(st, card, msg):
+    """A decision that repeats every minute ("not changed") is logged once per card and message."""
+    quiet = st.setdefault("quiet", {})
+    if quiet.get(card) == msg:
+        return
+    quiet[card] = msg
+    log(f"{card}: {msg}")
+
+
+def gh_pr(repo, num, st):
+    """PR state dict, or None after a logged error. A MERGED result is final and cached (no gh call again)."""
+    key = f"{repo}#{num}"
+    cached = st.setdefault("merged", {}).get(key)
+    if cached:
+        return cached
+    try:
+        r = subprocess.run(["gh", "pr", "view", num, "-R", repo, "--json", GH_FIELDS],
+                           capture_output=True, text=True, timeout=GH_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return {"error": f"gh failed for {key}: {type(e).__name__}"}
+    if r.returncode != 0:
+        return {"error": f"gh error for {key}: {r.stderr.strip()[:120]}"}
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return {"error": f"gh returned no JSON for {key}"}
+    if d.get("state") == "MERGED":
+        st["merged"][key] = d
+    return d
+
+
+def log(msg):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+    print(line)
+    if not DRY:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+
+
+def pr_of(item):
+    for k in ("l", "src", "q", "n"):
+        m = PR.search(str(item.get(k) or ""))
+        if m:
+            return m.group(1), m.group(2), k
+    return None
+
+
+def receipt_after_merge(iid, merged_at):
+    """(result) when receipts/<iid>.json says blocked/failed and is newer than the PR merge, else None."""
+    try:
+        from datetime import datetime
+        with open(os.path.join(os.path.dirname(ITEMS), "receipts", f"{iid}.json")) as f:
+            rc = json.load(f)
+        res = str(rc.get("result") or "").lower()
+        if res not in ("blocked", "failed"):
+            return None
+        merged_ms = datetime.fromisoformat(str(merged_at).replace("Z", "+00:00")).timestamp() * 1000
+        return res if float(rc.get("tsMs")) > merged_ms else None
+    except Exception:
+        return None
+
+
+def main():
+    items = json.load(open(ITEMS)).get("items", [])
+    st_all = load_state()
+    try:
+        old = json.load(open(PRSTATE)).get("cards", {})
+        old = old if isinstance(old, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        old = {}
+    cards = {}
+    try:
+        _main(items, st_all, cards, old)
+    finally:
+        save_state(st_all)
+        save_prstate(cards)
+
+
+def _main(items, sta, cards=None, old=None):
+    cards = {} if cards is None else cards
+    old = old or {}
+    for it in items:
+        if it.get("s") == "done" or not it.get("id"):
+            continue
+        if it["id"] in HELD:
+            continue  # owner hold list (hold.json, owner 2026-10-31): never changed
+        pr = pr_of(it)
+        if not pr:
+            continue
+        repo, num, field = pr
+        if not own_repo(repo):
+            log_once(sta, it["id"], f"foreign PR {repo}#{num} (not an owner repo), not changed (fm-prwatch)")
+            continue
+        finance = str(it.get("area", "")).lower() in SKIP_AREAS  # opt-in log-only areas (default none)
+        d = gh_pr(repo, num, sta)
+        if d.get("error"):
+            log_once(sta, it["id"], d["error"])
+            if it["id"] in old:
+                cards[it["id"]] = old[it["id"]]  # unknown this run: keep the last badge
+            continue
+        st = d.get("state")
+        if st == "OPEN":
+            if field != "n" and not finance:  # only the card's own PR; finance cards stay log-only
+                tier, detail = pr_tier(d)
+                prev = old.get(it["id"]) or {}
+                same = prev.get("state") == tier and prev.get("detail") == detail
+                cards[it["id"]] = {"pr": f"https://github.com/{repo}/pull/{num}", "state": tier, "detail": detail,
+                                   "at": prev.get("at") if same else int(time.time() * 1000)}
+            continue
+        if st == "MERGED":
+            sha = ((d.get("mergeCommit") or {}).get("oid") or "")[:7]
+            note = f"✅ PR {repo}#{num} merged {sha} at {d.get('mergedAt','')} (fm-prwatch)"
+            target = "done"
+        else:
+            note = f"PR {repo}#{num} closed without merge; needs check (fm-prwatch)"
+            target = "partial"
+        # Owner 2026-10-23: finance cards close on a merged PR in his own repos; upstream PRs stay log-only.
+        if finance and not (st == "MERGED" and repo.lower().startswith(OWNER_PREFIX)):
+            log_once(sta, it["id"], f"finance card, not changed: {note}")
+            continue
+        # A PR found only in the note may not be the card's own deliverable: log only.
+        if field == "n":
+            log_once(sta, it["id"], f"PR only in note, not changed: {note}")
+            continue
+        # Owner 2026-10-23: a card waiting on an owner step keeps that step after the merge.
+        # 2026-11-01: `blocked` too (fm-autoclear sets it from a blocked receipt with --q; owner step left).
+        if it.get("s") in ("waiting", "open", "blocked"):
+            log_once(sta, it["id"], f"{'blocked' if it.get('s') == 'blocked' else 'waiting'} card (owner step left), not changed: {note}")
+            continue
+        # Owner 2026-10-23: a live worker closes its own card; an ended/idle worker no longer blocks closing on merge.
+        if (it.get("s") == "running" or it.get("job")) and job_live(it):
+            log_once(sta, it["id"], f"live job, not changed: {note}")
+            continue
+        # 2026-11-01: a blocked/failed receipt newer than the merge means steps are left; keep the card.
+        if st == "MERGED":
+            res = receipt_after_merge(it["id"], d.get("mergedAt"))
+            if res:
+                log_once(sta, it["id"], f"receipt {res} after merge (steps left), not changed: {note}")
+                continue
+        # Do not rewrite the same result every minute.
+        if str(it.get("n") or "").startswith(note.split(" (fm-prwatch)")[0]) or (target == "partial" and "closed without merge" in str(it.get("n") or "")):
+            continue
+        sta.setdefault("quiet", {}).pop(it["id"], None)
+        log(f"{it['id']}: {it.get('s')} -> {target}: {note}")
+        if not DRY:
+            r = fm_set(it["id"], target, note, it.get("s"))
+            if r.returncode == MOVED:
+                log(f"{it['id']}: card moved since the read ({(r.stderr or '').strip()[:160]}); skipped")
+                continue
+            if r.returncode != 0:
+                log(f"{it['id']}: fm set FAILED: {(r.stderr or '').strip()[:160]}")
+                continue
+            if target == "done":
+                it["s"] = "done"  # a second blocker merged in this run sees the first as done
+                unblock(items, it["id"])
+
+
+MOVED = 3  # fm set --from: the card left the expected state; nothing was written (card sma-fm-set-cas)
+
+
+def fm_set(iid, target, note, frm=None):
+    """fm set with compare-and-set: frm = the state this run read; fm writes only if the card is still in it."""
+    try:
+        return subprocess.run([_FM_BIN, "set", iid, target, note, *(["--from", frm] if frm else [])], env={**os.environ, "FM_AUTO": "fm-prwatch", "FM_BY": "fm-prwatch"},
+                              capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return subprocess.CompletedProcess([], 1, "", f"{type(e).__name__}")
+
+
+def job_live(item):
+    """True when the card's `job` matches a working Herdr job in running.json (unknown -> True)."""
+    raw = item.get("job")
+    jobs = [str(x).strip() for x in (raw if isinstance(raw, list) else re.split(r"[,\n]", str(raw or ""))) if str(x).strip()]
+    if not jobs:
+        return item.get("s") == "running"
+    if any(re.search(r"\.(timer|service)$|^remote:", x) for x in jobs):
+        return True  # unit jobs are not tracked here
+    try:
+        rj = json.load(open(RUNNING))
+        from datetime import datetime, timezone
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(rj["generated"])).total_seconds()
+        if age > 300:
+            return True  # stale running.json: unknown, do not close
+        live = rj.get("jobs", [])
+    except Exception:
+        return True
+    for j in live:
+        if j.get("status") not in ("working", "busy", "running"):
+            continue
+        keys = [str(j.get(k) or "") for k in ("id", "tab", "tabLabel", "code", "title")]
+        if any(x == k or (len(x) > 3 and x in k) for x in jobs for k in keys if k):
+            return True
+    return False
+
+
+def unblock(items, done_id):
+    """Owner 2026-10-23: when a blocker closes, dependents whose blockers are all done move to partial (never done)."""
+    state = {i.get("id"): i.get("s") for i in items}
+    state[done_id] = "done"
+    for d in items:
+        raw = d.get("blockedBy") or []
+        bb = [str(b).strip() for b in (raw if isinstance(raw, list) else re.split(r"[,\s]+", str(raw))) if str(b).strip()]
+        if done_id not in bb or d.get("s") != "partial" or str(d.get("area", "")).lower() in SKIP_AREAS or any(state.get(b) not in (None, "done") for b in bb):
+            continue
+        log(f"{d['id']}: unblocked by {done_id} -> partial")
+        if not DRY:
+            old = re.sub(r"\s*\[blocked by [^\]]*\]", "", str(d.get("n") or "")).strip()
+            note = (f"🔓 Unblocked: {done_id} done (fm-prwatch). " + old).strip()[:600]
+            r = fm_set(d["id"], "partial", note, "partial")
+            if r.returncode == MOVED:
+                log(f"{d['id']}: card moved since the read; unblock skipped")
+            elif r.returncode != 0:
+                log(f"{d['id']}: unblock fm set FAILED: {(r.stderr or '').strip()[:160]}")
+
+
+if __name__ == "__main__":
+    main()

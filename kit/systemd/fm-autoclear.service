@@ -1,0 +1,8 @@
+[Unit]
+Description=FIRSTMATE tracker auto-clear (deterministic rules, fm-autoclear)
+
+[Service]
+Type=oneshot
+Nice=10
+Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+ExecStart=@KIT@/bin/fm-autoclear

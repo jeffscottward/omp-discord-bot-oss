@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+"""FIRSTMATE tracker CLI (main host). Small output so agents do not load the whole file.
+  fm find <keywords...>         id | status | title for matching items (max 10)
+  fm find [keywords...] --tag <tag>   only items with this theme tag (card fm-card-tags, owner 2026-11-05)
+  fm tag <id> +x -y [z]         add (+x or bare z) / remove (-y) theme tags: short slugs (a-z 0-9 -) that cut across
+                                stacks/areas, e.g. api-keys, macos, macos-manual, instagram. Many-to-many; stack/area stay.
+  fm tags                       every tag in use with its card count
+  fm get <id>                   one item as JSON
+  fm stop <id> [reason]         stop a job everywhere: partial "⏹️ Stopped: reason", job unlinked, spawn queue entry removed
+                                (also `fm set <id> stopped|paused [reason]`; card dev-freeze-gate, 2026-11-01)
+  fm set <id> <status> [note]   update status (open|waiting|blocked|partial|running|planned|backlog|done) and note
+  fm set <id> <status> [note] --from <state>[,<state>]   compare-and-set for automated writers: write only when the
+                                card is in one of these states (checked under the lock); else nothing is written and
+                                fm exits 3 ("card moved"). Without --from there is no check (card sma-fm-set-cas)
+  fm set <id> backlog [note]    parks the card (owner 2026-11-05, card mainblocker-backlog): it is no open blocker any
+                                more, so fm also removes <id> (or its title) from every other card's blockedBy and
+                                adds "[parked blocker removed: <id>]" to that card's note. A gate card (field gate, a
+                                title "Gate: …" or an id "gate-…") keeps its links: cards wait behind it on purpose.
+  fm add <id> <status> <area> <title> [--q url|--src url] [-- note]  add a new item
+Area and stack (owner 2026-10-30, card bot-upgrades-1030): every write (add/set/q/action/field/beat) stores the area
+lowercased and trimmed, and gives a card with no `stack` one: the same resolver as fm-spawn (catalog
+~/.config/omp-discord/stacks.json + code defaults) over the area, else keywords in the title, else firstmate.
+fm never adds a catalog stack: a derived name that is not in the catalog or defaults becomes firstmate.
+An existing stack is never changed; `fm field <id> stack -` derives it again.
+  fm set <id> waiting|open [note] --action "<step>[; step]"   owner states need --action (owner 2026-10-25)
+  fm action <id> "<steps>"|-    set/remove the owner action steps ("a; b" = numbered steps)
+  fm needs                      items that really need the owner (waiting/open/blocked + action + not queued)
+Needs-you admission (owner 2026-10-25, card needs-you-action-gate): a card shows under ✍️ Needs you ONLY with an open
+menu/Approve button (q) AND a non-empty `action` (concrete steps only the owner can do), and not queued (📨 answered).
+  fm q <id> <discord-url>       set the item's open-question link (q); "-" removes it
+  fm field <id> <key> <value|-> [--force]  set/remove one field. Keys: job, l, auto, src, task, owner, blockedBy, blocks, queued, queuedFrom, receipt, stack, bootGate, gate
+                                gate (card mainblocker-backlog): 1 = a gate card; it stays an open blocker in backlog
+                                bootGate (card fm-boot-gate, 2026-11-02): `now` = this host's current boot id; the card
+                                waits for the next reboot (fm-autoclear R14: not idle, not swept; receipts still apply;
+                                the gate is removed after a reboot)
+                                job/blockedBy/blocks take a comma list (job: Herdr tab label/code/pane id/tab id, or a unit
+                                name like ex-daily-retry.timer / remote:budget-watch-golive.service)
+                                Job check (card fm-job-tag-guard, 2026-11-01): each job tag must match running.json
+                                (jobs[].id/.tab/.tabLabel/.code, case-insensitive; services[].unit, also host:unit), a live
+                                Herdr pane/tab (`herdr pane list`/`tab list`), or be a unit name ending .service/.timer;
+                                else exit 2 with a hint (your own pane: fm field <id> job $HERDR_PANE_ID). --force writes a
+                                tag that will exist later. running.json missing/unreadable or jobsOk false: written with a warning.
+  fm receipt <id> <done|failed|blocked> <summary...> [--verified live|tests|typecheck|none] [--evidence TEXT]...
+                                [--q URL|--src URL] [--blocked-by CARD[,CARD]] [--decisions-none] [--flow full|short]
+                                Owner 2026-10-31 (card sdlc-standard-flow, flow.md): a done receipt needs --verified
+                                live|tests (none/typecheck refused) and at least one --evidence; a full-flow card (task
+                                file `Flow: full` or --flow full) also needs a CI/review evidence item. failed/blocked
+                                receipts may omit them.
+                                Owner 2026-10-28 (card decisions-to-firstmate): a done receipt is refused when its summary
+                                or an --evidence .md/.html file has an open "Decisions for you"/"Needs you"/"Owner decision"/
+                                "Open questions" section, unless --q links the ask menu (posted in the job channel; FIRSTMATE gets a link) or
+                                --decisions-none says nothing is open.
+                                worker-done receipt (Orca #3, 2026-10-19): writes receipts/<id>.json atomically
+                                {card, result, summary, evidence[], ts, pane, by[, verified, q, src, blockedBy]}. fm-autoclear applies
+                                it within a minute: done -> done; failed -> partial "needs check"; blocked + --q/--src (an
+                                owner question/message) -> blocked with that link; blocked without a link -> partial
+                                with the reason (and blockedBy when given). The job ends. --verified (pstack ledger
+                                verdict, 2026-10-25) says how the work was proven: live = run on the real surface,
+                                tests = automated tests, typecheck = compile/type check only, none = not verified.
+                                The card note shows it; a done receipt with no evidence is marked [unverified].
+  fm why <id>                   blockedBy chain to its root(s): owner|bot|external|unknown; a parked backlog card
+                                (not a gate) is no blocker and shows as "parked: <id>"
+                                blockedBy/blocks/--blocked-by refuse (exit 2) a self link, a cycle, or an id that is no
+                                card (--force on field; a receipt only warns on
+                                an unknown id). blockedBy = a card that must finish BEFORE this one; work this
+                                card does itself is not a blocker.
+  fm beat <id> [note]           heartbeat: sets `beat` (epoch ms) on the card. Does not change `changed`/`cts`/`by`.
+                                Pane activity (OMP session writes) also counts as a beat. A running card with no
+                                beat and no pane activity for 30 min and no receipt is flagged "needs check".
+                                A beat note is also the job's board status line (fm status), and a beat renews the
+                                card's claims.
+Live coordination (owner 2026-11-04, card agent-coordination-protocol; data in coord.json, see fm_coord.py):
+  fm claim <id> <resource>... [--pane P]   claim resources for the card's job (atomic; same card = renew). Resources:
+                                pr:<repo>#<n>, branch:<repo>:<name>, deploy:<target>, file:<repo>:<path-glob>,
+                                service:<unit>. A resource another live job holds -> exit 4, nothing claimed, the
+                                refusal names the holder card, its pane and its channel link. A claim ends with the
+                                card's receipt, `fm stop`, its pane closing, or 30 min after the card's last beat/status.
+  fm release <id> [resource...]          release the card's claims (all when none named)
+  fm claims [resource|prefix] [--stack S] [--json]   live claims
+  fm status <id> "<one line>"            the job's board status (also set by `fm beat <id> <note>`)
+  fm board [--stack S] [--tag T] [--json]        every running job: stack | card | status age | last status | claims (age)
+                                Rule: a job runs `fm board --stack <s>` before each new step and posts status every
+                                10-15 min. fm-coord (timer, 5 min) reads the board per stack.
+Queued (owner 2026-10-18): the bot sets `queued` (epoch ms) when the owner responds to a Needs-you/Open card, then
+`fm set <id> partial` records `queuedFrom` (the old state). Any set to another state removes both fields, and
+fm-autoclear (FM_AUTO) may never move a queued card to waiting/open/blocked.
+States (owner 2026-10-18): waiting = owner action (hoisted), open = ONLY an unanswered owner question (needs q),
+partial = in progress (answered/accepted, queued, no live job), running = a live job works on it now (needs job).
+Env FM_AUTO="<reason>" on set/field marks the card "auto-updated" (fm-autoclear); a manual set removes the mark.\nEvery write records `by` (who changed it): FM_BY, autoclear, run:<OMP_GATE_RUN>, pane:<HERDR_PANE_ID> or manual.
+Writes re-read the file first and change only one item, so parallel agents do not overwrite each other.
+"""
+import re
+import fcntl, json, os, sys, time
+
+# Kit settings (card sma-fm-set-cas, 2026-11-03): one source in git (kit/bin); ~/.local/bin links here.
+def _kit_env():
+    """Read the kit settings file (KEY=VALUE lines; the shell kit scripts read the same file).
+    File: $OMP_KIT_ENV, else ~/.config/omp-discord/kit.env. A variable that is already set in the environment wins."""
+    path = os.environ.get("OMP_KIT_ENV") or os.path.expanduser("~/.config/omp-discord/kit.env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or line.startswith("#") or not key.isidentifier() or key in os.environ:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] == "'":
+            val = val[1:-1]
+        else:
+            if len(val) >= 2 and val[0] == val[-1] == '"':
+                val = val[1:-1]
+            val = os.path.expanduser(os.path.expandvars(val))
+        os.environ[key] = val
+
+
+_kit_env()
+_FM_DIR = os.environ.get("FM_DIR") or os.path.join(os.environ.get("REPORTS_WEB_DIR") or os.path.expanduser("~/Documents/reports/web"), "firstmate")
+_FM_BIN = os.environ.get("FM_BIN") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "fm")
+F = os.environ.get("FM_ITEMS") or os.path.join(_FM_DIR, "items.json")
+DISCORD = "https://discord.com/channels/"
+
+# Contract C1 (deeplink-contract.md): a MESSAGE link. A channel link only opens the channel (148 cards had one,
+# pstack audit 2026-10-25), so it is refused too.
+MESSAGE_LINK = re.compile(r"^https://discord\.com/channels/(?:\d+|@me)/\d+/\d+(?:[/?#].*)?$")
+
+def need_discord(key, url):
+    """UI contract (owner 2026-10-19): a card click opens q/src, so both must be Discord message links."""
+    if url != "-" and not MESSAGE_LINK.match(url):
+        hint = ("This is a channel link (no message id). Use the message link: your run prompt has a "
+                "'Link to this owner message' line, or read message ids from the bot loopback "
+                "GET http://127.0.0.1:47821/messages?channel=<channel id>&limit=5 (main host)."
+                if url.startswith(DISCORD) else "Put GitHub/report/other links in the `l` field: fm field <id> l <url>")
+        sys.exit(f"{key} must be a Discord message link ({DISCORD}<guild>/<channel>/<message>); got {url[:120]!r}. {hint}")
+STATUSES = {"open", "waiting", "blocked", "partial", "running", "planned", "backlog", "done"}
+FIELDS = {"job", "l", "auto", "src", "task", "owner", "blockedBy", "blocks", "queued", "queuedFrom", "receipt", "stack", "bootGate",
+          "coord",  # coord: the coordinator's split/merge proposal (fm-coord, card agent-coordination-protocol)
+          "gate"}  # gate: a gate card stays an open blocker in backlog (card mainblocker-backlog)
+RECEIPTS = os.path.join(os.path.dirname(F), "receipts")
+RESULTS = ("done", "failed", "blocked")
+VERIFIED = ("live", "tests", "typecheck", "none")  # receipt --verified levels (pstack ledger verdict)
+OWNER_STATES = ("waiting", "open", "blocked")
+LISTS = {"job", "blockedBy", "blocks"}
+RUNNING = os.environ.get("FM_RUNNING") or os.path.join(os.path.dirname(F), "running.json")
+UNIT_RE = re.compile(r"^(?:(?:main|remote):)?[\w@.\-]+\.(?:service|timer)$", re.I)
+
+
+def is_gate(it):
+    """A gate card (card mainblocker-backlog; same rule as src/blockers.ts isGate): field gate true, a title "Gate: …",
+    or an id "gate-…". A backlog gate stays an open blocker; any other backlog card is parked."""
+    g = it.get("gate")
+    return g is True or (isinstance(g, str) and g.strip().lower() in ("1", "true", "yes")) \
+        or bool(re.match(r"(?i)\s*gate\s*:", str(it.get("t") or ""))) or str(it.get("id") or "").lower().startswith("gate-")
+
+
+def parked(it):
+    """A backlog card that is not a gate: no open blocker (src/blockers.ts parked)."""
+    return it.get("s") == "backlog" and not is_gate(it)
+
+
+def drop_parked_links(items, card):
+    """`fm set <id> backlog`: remove the parked card from every other card's blockedBy and note it there; also remove
+    those cards from the parked card's own `blocks`. A ref resolves like src/blockers.ts edges(): an exact card id
+    first, else a card title (case-insensitive). Returns the ids of the changed cards. Called under the tracker lock."""
+    by = {i.get("id"): i for i in items if i.get("id")}
+    titles = {}
+    for i in items:
+        if i.get("t") and i.get("id"):
+            titles[str(i["t"]).lower()] = i["id"]  # last one wins, like the Map in src/blockers.ts edges()
+    cid = card.get("id")
+    res = lambda r: (lambda s: s if s in by else titles.get(s.lower(), s))(str(r))  # no trimming, like edges()
+    mark = f"[parked blocker removed: {cid}]"
+    changed = []
+
+    def unblock(m):  # fm-autoclear R11 marker "[blocked by a, b]": the parked id goes; an empty marker goes too
+        rest = [x.strip() for x in m.group(1).split(",") if x.strip() and res(x.strip()) != cid]
+        return f" [blocked by {', '.join(rest)}]" if rest else ""
+
+    def note(it):
+        n = re.sub(r"\s*\[blocked by ([^\]]*)\]", unblock, str(it.get("n") or "")).strip()
+        it["n"] = n if mark in n else f"{n} {mark}".strip()
+        touch(it)
+        changed.append(it.get("id"))
+
+    for it in items:
+        if it is card or it.get("s") == "done":
+            continue
+        raw = it.get("blockedBy")
+        refs = raw if isinstance(raw, list) else [raw] if raw else []
+        keep = [r for r in refs if res(r) != cid]
+        if len(keep) == len(refs):
+            continue
+        if keep:
+            it["blockedBy"] = keep if isinstance(raw, list) or len(keep) > 1 else keep[0]
+        else:
+            it.pop("blockedBy", None)
+        note(it)
+    # The parked card's own reverse edges (`blocks`) to open cards go too; refs to done or unknown cards stay.
+    raw = card.get("blocks")
+    bl = raw if isinstance(raw, list) else [raw] if raw else []
+    gone = [r for r in bl if res(r) in by and by[res(r)] is not card and by[res(r)].get("s") != "done"]
+    if gone:
+        keep = [r for r in bl if r not in gone]
+        if keep:
+            card["blocks"] = keep if isinstance(raw, list) or len(keep) > 1 else keep[0]
+        else:
+            card.pop("blocks", None)
+        for r in gone:
+            if res(r) not in changed:
+                note(by[res(r)])
+    return changed
+
+def unit_key(name):
+    """Same as fm-autoclear: 'remote:x.service' -> ('remote', 'x'); timers map to their service."""
+    n, host = str(name).strip().lower(), None
+    if ":" in n and n.split(":", 1)[0] in ("main", "remote"):
+        host, n = n.split(":", 1)
+    return host, re.sub(r"\.(service|timer)$", "", n)
+
+def herdr_names():
+    """Live Herdr pane ids, tab ids and tab labels (lowercase), for a pane fm-spawn just made that running.json
+    does not list yet. Empty set when herdr fails."""
+    import subprocess
+    names = set()
+    for kind, key in (("pane", "panes"), ("tab", "tabs")):
+        try:
+            out = subprocess.run(["herdr", kind, "list"], capture_output=True, text=True, timeout=5).stdout
+            for x in json.loads(out).get("result", {}).get(key, []):
+                names |= {str(x[k]).lower() for k in ("pane_id", "tab_id", "label") if x.get(k)}
+        except Exception:
+            pass
+    return names
+
+def refuse_links(items, card, key, refs, force=False, why="written as given (--force)"):
+    """Card fm-blockedby-sanity: exit 2 (nothing written) on a self link, a cycle, or (without --force) an unknown id."""
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import fm_links
+    hard, missing = fm_links.check(items, card, key, refs)
+    if missing and force and not hard:
+        print(f"warning: {key}: {', '.join(map(repr, missing))} is no card id or title; {why}", file=sys.stderr)
+    if force:
+        missing = []
+    if missing:
+        hard.append(f"{', '.join(map(repr, missing))} is no card id or title (typed refs ext:/time:/ci:/job:/unit:/"
+                    "agent:/pane: and x.service/x.timer are allowed; --force writes it anyway)")
+    if hard:
+        print(f"refused: {card} {key}: " + "; ".join(hard) + f".\nNothing written. Note: {fm_links.HINT}.",
+              file=sys.stderr)
+        sys.exit(2)
+
+def check_job_tags(card, tags):
+    """fm-autoclear R5 matches job tags only against running.json, so a tag that matches nothing flags a live card
+    'job ended'. Exit 2 for such a tag; warn (do not block) when running.json is not usable."""
+    try:
+        with open(RUNNING) as f:
+            r = json.load(f)
+        if not r.get("jobsOk"):
+            raise ValueError("jobsOk is false")
+        jobs, services = r.get("jobs") or [], r.get("services") or []
+    except Exception as e:
+        print(f"warning: job tag not checked ({RUNNING}: {e}); written as given", file=sys.stderr)
+        return
+    names = {str(j.get(k)).lower() for j in jobs for k in ("id", "tab", "tabLabel", "code") if j.get(k)}
+    def known(t):
+        if t.lower() in names or UNIT_RE.match(t):
+            return True
+        h, b = unit_key(t)
+        return any(unit_key(s.get("unit", ""))[1] == b and h in (None, s.get("host")) for s in services)
+    bad = [t for t in tags if not known(t)]
+    if bad:
+        live = herdr_names()
+        bad = [t for t in bad if t.lower() not in live]
+    if bad:
+        msg = (f"job tag(s) {', '.join(repr(t) for t in bad)} match no running job: fm-autoclear would flag the card "
+               "'job ended'. Valid: Herdr pane id (wB:p..), tab id (wB:t..), tab label or title code from "
+               "running.json / herdr, or a unit name (x.service, x.timer, remote:x.service). "
+               "Use --force for a job that will exist later.")
+        if os.environ.get("HERDR_PANE_ID"):
+            msg += f"\nuse: fm field {card} job {os.environ['HERDR_PANE_ID']}"
+        print(msg, file=sys.stderr)
+        sys.exit(2)
+
+
+def who():
+    """Who changes the card (`by`), for the dashboard's ?by= filter: FM_BY, else fm-autoclear (FM_AUTO),
+    else the Discord bridge run (run:<OMP_GATE_RUN>), else the Herdr pane (pane:<id>), else manual."""
+    if os.environ.get("FM_BY"):
+        return os.environ["FM_BY"][:80]
+    if os.environ.get("FM_AUTO"):
+        return "autoclear"
+    if os.environ.get("OMP_GATE_RUN"):
+        return "run:" + os.environ["OMP_GATE_RUN"][:40]
+    if os.environ.get("HERDR_PANE_ID"):
+        return "pane:" + os.environ["HERDR_PANE_ID"][:40]
+    return "manual"
+
+def touch(it):
+    it["cts"] = int(time.time() * 1000)  # epoch ms, for dashboard ?since= deep links
+    it["by"] = who()
+    # Last 5 writers, so a run's change still shows after fm-autoclear touches the card a minute later.
+    h = [x for x in (it.get("hist") or []) if isinstance(x, dict)]
+    it["hist"] = (h + [{"by": it["by"], "cts": it["cts"]}])[-5:]
+
+def stamp(it):
+    it["changed"] = time.strftime("%Y-%m-%d %H:%M")
+    touch(it)
+
+def load():
+    with open(F) as f:
+        return json.load(f)
+
+TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+def norm_tag(t):
+    """A theme tag slug: lowercase, spaces/underscores -> '-'. None when it is not a valid slug."""
+    t = re.sub(r"[\s_]+", "-", str(t).strip().lower().lstrip("#"))
+    return t if TAG_RE.match(t) else None
+
+def tags_of(i):
+    v = i.get("tags")
+    return [t for t in v if isinstance(t, str)] if isinstance(v, list) else []
+
+def pop_opt(args, name):
+    """Remove `name value` from args; returns (args, value|None)."""
+    if name not in args:
+        return args, None
+    k = args.index(name)
+    if k + 1 >= len(args):
+        sys.exit(f"{name} needs a value")
+    return args[:k] + args[k + 2:], args[k + 1]
+
+def item_text(i):
+    return " ".join(str(i.get(k, "")) for k in ("id", "t", "n", "area")).lower()
+
+SPAWN = os.environ.get("FM_SPAWN_PATH") or os.path.expanduser("~/.local/bin/fm-spawn")
+_spawn = []  # cached fm-spawn module (or None when it does not load)
+
+def spawn_mod():
+    """fm-spawn loaded as a module, for its stack resolver (one copy of the rules). None when it does not load."""
+    if not _spawn:
+        keep = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True  # no .pyc next to fm-spawn (it lives in the bot repo)
+        try:
+            import importlib.machinery, importlib.util
+            loader = importlib.machinery.SourceFileLoader("fm_spawn", SPAWN)
+            mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("fm_spawn", loader))
+            loader.exec_module(mod)
+            _spawn.append(mod)
+        except Exception as e:
+            print(f"warning: stack resolver not loaded ({SPAWN}: {e}); stack not set", file=sys.stderr)
+            _spawn.append(None)
+        finally:
+            sys.dont_write_bytecode = keep
+    return _spawn[0]
+
+def auto_stack(it):
+    """Stack for a card with none: fm-spawn resolve_stack(create=False) over area, then title keywords.
+    A name that is not in the catalog/defaults becomes firstmate. None when the resolver fails (next write retries)."""
+    m = spawn_mod()
+    if m is None:
+        return None
+    try:
+        s = m.resolve_stack(area=it.get("area"), text=it.get("t"), create=False)
+    except Exception as e:
+        print(f"warning: stack resolver failed: {e}; stack not set", file=sys.stderr)
+        return None
+    return s if s in m.STACK_AREAS else "firstmate"
+
+def tidy(it):
+    """Every write: area lowercased and trimmed; a card with no stack gets one. An existing stack stays."""
+    if isinstance(it.get("area"), str):
+        it["area"] = it["area"].strip().lower()
+    if not it.get("stack"):
+        s = auto_stack(it)
+        if s:
+            it["stack"] = s
+
+a = sys.argv[1:]
+if not a:
+    sys.exit(__doc__)
+cmd = a[0]
+# Card dev-freeze-gate (owner 2026-11-01, stop-sync): a stop must end the job everywhere. `fm stop <id> [reason]`,
+# `fm set <id> stopped|paused [reason]` -> state partial, note "⏹️ Stopped: ..." (or Paused), job field removed (the
+# master queue and dashboard drop the row), queued fm-spawn entries for the card removed.
+STOP_JOB = False
+STOP_WORD = None
+# Card sma-fm-set-cas (2026-11-03): compare-and-set. `--from <s>[,<s>]` on set/stop writes only when the card's state,
+# read under the lock, is one of the given states; else nothing is written and fm exits MOVED (3). Automated writers
+# pass the state they decided from, so a write based on an older snapshot never overwrites a newer state.
+MOVED = 3
+FROM = None
+if cmd in ("set", "stop") and "--from" in a:
+    k = a.index("--from")
+    if k + 1 >= len(a) or not a[k + 1].strip():
+        sys.exit("--from needs the expected state(s), e.g. --from running or --from running,partial")
+    FROM = {x.strip() for x in a[k + 1].split(",") if x.strip()}
+    a = a[:k] + a[k + 2:]
+    if not FROM or FROM - set(STATUSES):
+        sys.exit(f"--from: unknown state(s) {', '.join(sorted(FROM - set(STATUSES))) or '(none)'}; use {'|'.join(STATUSES)}")
+if (cmd == "set" and len(a) >= 3 and a[2] in ("stopped", "paused")) or (cmd == "stop" and len(a) >= 2):
+    word = "Paused" if cmd == "set" and a[2] == "paused" else "Stopped"
+    reason = " ".join(a[3:] if cmd == "set" else a[2:]).strip() or "by owner"
+    a, cmd, STOP_JOB = ["set", a[1], "partial", f"⏹️ {word}: {reason}"], "set", True
+    STOP_WORD = word
+
+
+def coord_mod():
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import fm_coord
+    return fm_coord
+
+
+def coord_path():
+    return coord_mod().path_for(F)
+
+
+def live_panes():
+    """Lowercase live Herdr pane/tab ids and labels, or None when Herdr does not answer (then panes are not checked)."""
+    import subprocess
+    names, ok = set(), False
+    for kind, key in (("pane", "panes"), ("tab", "tabs")):
+        try:
+            out = subprocess.run(["herdr", kind, "list"], capture_output=True, text=True, timeout=5).stdout
+            for x in json.loads(out).get("result", {}).get(key, []):
+                names |= {str(x[k]).lower() for k in ("pane_id", "tab_id", "label") if x.get(k)}
+            ok = True
+        except Exception:
+            pass
+    return names if ok else None
+
+
+def coord_release(card):
+    """Drop every claim and wait of the card (receipt, stop). Never fails the caller. Returns the count."""
+    try:
+        fc = coord_mod()
+        if not os.path.exists(coord_path()):
+            return 0
+        with fc.locked(coord_path()) as cd:
+            return len(fc.release(cd, card))
+    except Exception as e:
+        print(f"warning: claims of {card} not released: {e}", file=sys.stderr)
+        return 0
+
+
+PANE_RE = re.compile(r"^w[A-Za-z0-9]+:p[A-Za-z0-9]+$")
+
+
+def coord_cmd(cmd, args):
+    """Claims and the live board (owner 2026-11-04, card agent-coordination-protocol). See fm_coord.py."""
+    fc = coord_mod()
+    now = fc.now_ms()
+    def opt(name):
+        nonlocal args
+        if name not in args:
+            return None
+        k = args.index(name)
+        if k + 1 >= len(args):
+            sys.exit(f"{name} needs a value")
+        v = args[k + 1]
+        args = args[:k] + args[k + 2:]
+        return v
+    pane_opt, stack_opt, tag_opt = opt("--pane"), opt("--stack"), opt("--tag")
+    if tag_opt is not None:
+        tag_opt = norm_tag(tag_opt) or sys.exit(f"--tag: {tag_opt!r} is no tag slug")
+    as_json = "--json" in args
+    args = [x for x in args if x != "--json"]
+    items = load()["items"]
+    cards = {i.get("id"): i for i in items if i.get("id")}
+    receipt = lambda c: fc.receipt_ms(RECEIPTS, c)
+    if cmd in ("claim", "release", "status"):
+        if not args or args[0] not in cards:
+            sys.exit(f"no item {args[0] if args else '(none)'}\nusage: fm {cmd} <card> " +
+                     {"claim": "<resource>... [--pane P]", "release": "[resource...]", "status": '"<one line>"'}[cmd])
+    if cmd == "status":
+        line = " ".join(args[1:]).strip()
+        if not line:
+            sys.exit('usage: fm status <card> "<one line>"')
+        with fc.locked(coord_path()) as cd:
+            fc.set_status(cd, args[0], line, pane_opt or os.environ.get("HERDR_PANE_ID", ""), now)
+        print(f"{args[0]} status set")
+        return
+    if cmd == "release":
+        try:
+            res = [fc.parse_resource(r) for r in args[1:]] or None
+        except ValueError as e:
+            sys.exit(str(e))
+        with fc.locked(coord_path()) as cd:
+            gone = fc.release(cd, args[0], res)
+        print(f"{args[0]}: released {', '.join(gone) if gone else 'nothing (no matching claim)'}")
+        return
+    if cmd == "claim":
+        card = args[0]
+        try:
+            res = list(dict.fromkeys(fc.parse_resource(r) for r in args[1:]))
+        except ValueError as e:
+            sys.exit(str(e))
+        if not res:
+            sys.exit(f"usage: fm claim <card> <resource>... [--pane P]; {fc.HELP}")
+        jobs = [t.strip() for t in str(cards[card].get("job") or "").split(",")]
+        # the job's pane first: a claim FIRSTMATE makes for a card must end with that job's pane, not FIRSTMATE's
+        me = os.environ.get("HERDR_PANE_ID", "")
+        pane = pane_opt or (me if me in jobs else "") or next((t for t in jobs if PANE_RE.match(t)), "") or me
+        panes = live_panes()
+        with fc.locked(coord_path()) as cd:
+            live, dead = fc.split_live(cd, cards, receipt, panes, now, fc.job_activity(RUNNING, now))
+            cd["claims"] = live  # dead claims leave the file on every claim
+            hits = fc.conflicts(live, card, res)
+            if hits:
+                for r, c in hits:
+                    fc.add_wait(cd, card, r, c["card"], now)
+            else:
+                fc.claim(cd, card, res, pane, now)
+        for c, why in dead:
+            print(f"expired claim dropped: {c['resource']} of card {c['card']} ({why})", file=sys.stderr)
+        if hits:
+            for r, c in hits:
+                print(f"refused: {r} conflicts with {c['resource']} held by " + fc.holder_text(c, cards, now),
+                      file=sys.stderr)
+            print("Nothing claimed. Wait for the holder (it ends with its receipt or 30 min after its last beat), "
+                  "or agree a split with it. The coordinator sees this wait.", file=sys.stderr)
+            sys.exit(4)
+        print(f"{card}: claimed {', '.join(res)}" + (f" (pane {pane})" if pane else ""))
+        return
+    cd = fc.read(coord_path())
+    live, dead = fc.split_live(cd, cards, receipt, live_panes(), now, fc.job_activity(RUNNING, now))
+    if cmd == "claims":
+        want = None
+        if args:
+            try:
+                want = fc.parse_resource(args[0])
+            except ValueError:
+                want = args[0].lower()  # a prefix such as pr: or file:repo
+        def match(c):
+            if want is None or c["resource"].startswith(want):
+                return True
+            try:
+                return fc.overlaps(fc.parse_resource(want), c["resource"])
+            except ValueError:
+                return False
+        sel = [c for c in live if match(c)]
+        if stack_opt:
+            sel = [c for c in sel if fc.stack_of(cards.get(c["card"]) or {}) == stack_opt]
+        if as_json:
+            print(json.dumps(sel, ensure_ascii=False))
+            return
+        for c in sel:
+            print(f"{c['resource']} | {c['card']} | pane {c.get('pane') or '-'} | {fc.age_min(c.get('ts'), now)}m")
+        if not sel:
+            print("no live claims")
+        return
+    rows = fc.board(items, cd, now, stack_opt, live)
+    if tag_opt:
+        rows = [r for r in rows if tag_opt in tags_of(cards.get(r["card"]) or {})]
+    print(json.dumps(rows, ensure_ascii=False) if as_json else fc.board_text(rows))
+
+
+def drop_spawn_queue(cid):
+    """Remove fm-spawn queue entries (queued.jsonl) for card cid; returns the count removed."""
+    q = os.path.join(os.environ.get("FM_SPAWN_STATE") or os.path.expanduser("~/.local/state/fm-spawn"), "queued.jsonl")
+    if not os.path.exists(q):
+        return 0
+    with open(os.path.join(os.path.dirname(q), "slots.lock"), "w") as lk:  # the fm-spawn queue lock
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        rows = [l for l in open(q) if l.strip()]
+        keep = [l for l in rows if (json.loads(l).get("card") if l.strip().startswith("{") else None) != cid]
+        if len(keep) != len(rows):
+            with open(q + ".tmp", "w") as f:
+                f.writelines(keep)
+            os.replace(q + ".tmp", q)
+        return len(rows) - len(keep)
+
+
+if cmd == "find":
+    a, tag = pop_opt(a, "--tag")
+    if tag is not None and not norm_tag(tag):
+        sys.exit(f"--tag: {tag!r} is no tag slug (a-z 0-9 -)")
+    kws = [k.lower() for k in a[1:]]
+    hits = [i for i in load()["items"] if all(k in item_text(i) for k in kws)
+            and (tag is None or norm_tag(tag) in tags_of(i))]
+    if tag is not None:
+        hits.sort(key=lambda i: i.get("s") == "done")  # open work first
+    for i in hits[:10]:
+        tg = (" | #" + " #".join(tags_of(i))) if tags_of(i) else ""
+        print(f"{i.get('id', '?')} | {i['s']} | {i['t'][:80]}{tg}")
+    if len(hits) > 10:
+        print(f"... {len(hits) - 10} more")
+elif cmd == "tags":
+    cnt = {}
+    for i in load()["items"]:
+        for t in tags_of(i):
+            cnt[t] = cnt.get(t, 0) + 1
+    for t, n in sorted(cnt.items(), key=lambda x: (-x[1], x[0])):
+        print(f"{t} | {n}")
+    if not cnt:
+        print("no tags")
+elif cmd == "tag" and len(a) >= 3:
+    add, rm = [], []
+    for x in a[2:]:
+        t = norm_tag(x[1:] if x[:1] in "+-" else x)
+        if not t:
+            sys.exit(f"bad tag {x!r}: use +slug / -slug (a-z 0-9 -, max 32)")
+        (rm if x.startswith("-") else add).append(t)
+    with open(F + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = load()
+        it = next((i for i in d["items"] if i.get("id") == a[1]), None)
+        if not it:
+            sys.exit(f"no item {a[1]}")
+        cur = [t for t in tags_of(it) if t not in rm]
+        for t in add:
+            if t not in cur:
+                cur.append(t)
+        if cur:
+            it["tags"] = cur
+        else:
+            it.pop("tags", None)
+        tidy(it)
+        touch(it)  # bookkeeping only, like fm field: `changed` stays the status time
+        d["updated"] = time.strftime("%Y-%m-%d %H:%M %Z")
+        tmp = F + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=0, ensure_ascii=False)
+        os.replace(tmp, F)
+    print(f"{a[1]} tags -> {', '.join(cur) or '(none)'}")
+elif cmd == "get" and len(a) == 2:
+    print(json.dumps(next((i for i in load()["items"] if i.get("id") == a[1]), None), ensure_ascii=False))
+elif cmd == "needs":
+    for i in load()["items"]:
+        if i["s"] in OWNER_STATES and str(i.get("action") or "").strip() and not i.get("queued"):
+            print(f"{i.get('id', '?')} | {i['s']} | {i['t'][:80]}")
+elif cmd == "set" and len(a) >= 3 and a[2] in STATUSES:
+    action = None
+    if "--action" in a:
+        k = a.index("--action")
+        if k + 1 >= len(a) or not a[k + 1].strip():
+            sys.exit("--action needs the owner's step(s)")
+        action = a[k + 1].strip(); a = a[:k] + a[k + 2:]
+    with open(F + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = load()
+        it = next((i for i in d["items"] if i.get("id") == a[1]), None)
+        if not it:
+            sys.exit(f"no item {a[1]}")
+        if FROM is not None and it.get("s") not in FROM:
+            print(f"card moved: {a[1]} is {it.get('s')}, expected {','.join(sorted(FROM))}; nothing written", file=sys.stderr)
+            sys.exit(MOVED)
+        # Guards apply only to a real state change, so note rewrites (fm-autoclear R5-R7) still work.
+        if a[2] == "open" and it.get("s") != "open" and not it.get("q"):
+            sys.exit("open = an unanswered owner question: set its link first with fm q <id> <discord-url>")
+        if a[2] == "waiting" and it.get("s") != "waiting" and not it.get("q"):
+            sys.exit("waiting = an owner action: it needs a menu or Approve button. Post an ask block (bot /post) and set fm q <id> <menu message url> first")
+        if a[2] in ("waiting", "open") and not (action or str(it.get("action") or "").strip()):
+            sys.exit(f"{a[2]} = the owner must act: give the concrete step(s) with --action \"<step>; <step>\" (owner 2026-10-25). Not for bug reports, FYIs or agent work")
+        if action:
+            it["action"] = action
+        if a[2] == "running" and it.get("s") != "running" and not it.get("job"):
+            sys.exit("running = a live job works on it: set fm field <id> job <tab label|code|unit> first")
+        if os.environ.get("FM_AUTO") and a[2] in OWNER_STATES and it.get("queued"):
+            sys.exit(f"{a[1]} is queued (the owner responded); fm-autoclear may not move it back to {a[2]}")
+        if a[2] == "partial":
+            if it.get("queued") and it.get("s") in OWNER_STATES:
+                it["queuedFrom"] = it["s"]
+        else:
+            it.pop("queued", None)  # done/running/new question: the queued badge ends
+            it.pop("queuedFrom", None)
+        it["s"] = a[2]
+        if len(a) > 3:
+            it["n"] = " ".join(a[3:])
+        if STOP_JOB:
+            it.pop("job", None)
+        if a[2] == "done":
+            it.pop("q", None)
+        if os.environ.get("FM_AUTO"):
+            it["auto"] = time.strftime("%Y-%m-%d %H:%M") + " " + os.environ["FM_AUTO"][:120]
+        else:
+            it.pop("auto", None)
+        tidy(it)
+        stamp(it)
+        # Card mainblocker-backlog (owner 2026-11-05): a parked card holds no parent, so its blockedBy links go.
+        unlinked = drop_parked_links(d["items"], it) if parked(it) else []
+        d["updated"] = time.strftime("%Y-%m-%d %H:%M %Z")
+        tmp = F + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=0, ensure_ascii=False)
+        os.replace(tmp, F)
+    print(f"{a[1]} -> {a[2]}")
+    if unlinked:
+        print(f"{a[1]}: parked; blocker link removed on {', '.join(map(str, unlinked))}")
+    if STOP_JOB:
+        n = drop_spawn_queue(a[1])
+        print(f"{a[1]}: job unlinked" + (f"; {n} queued spawn(s) removed" if n else ""))
+        # A stop ends the job: its claims end too. A pause (pause-all, finance yield) keeps them for the resume; they
+        # still expire 30 min after the last beat (card agent-coordination-protocol).
+        n = coord_release(a[1]) if STOP_WORD == "Stopped" else 0
+        if n:
+            print(f"{a[1]}: {n} claim(s) released")
+elif cmd == "q" and len(a) == 3:
+    need_discord("q", a[2])
+    with open(F + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = load()
+        it = next((i for i in d["items"] if i.get("id") == a[1]), None)
+        if not it:
+            sys.exit(f"no item {a[1]}")
+        if a[2] == "-":
+            it.pop("q", None)
+        else:
+            it["q"] = a[2]
+        tidy(it)
+        stamp(it)
+        d["updated"] = time.strftime("%Y-%m-%d %H:%M %Z")
+        tmp = F + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=0, ensure_ascii=False)
+        os.replace(tmp, F)
+    print(f"{a[1]} q -> {a[2]}")
+elif cmd == "action" and len(a) == 3:
+    with open(F + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = load()
+        it = next((i for i in d["items"] if i.get("id") == a[1]), None)
+        if not it:
+            sys.exit(f"no item {a[1]}")
+        if a[2] == "-":
+            if it.get("s") in ("waiting", "open"):
+                sys.exit(f"{a[1]} is {it['s']}: move it to another state before removing its action")
+            it.pop("action", None)
+        elif not a[2].strip():
+            sys.exit("action needs the owner's step(s)")
+        else:
+            it["action"] = a[2].strip()
+        tidy(it)
+        touch(it)
+        d["updated"] = time.strftime("%Y-%m-%d %H:%M %Z")
+        tmp = F + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=0, ensure_ascii=False)
+        os.replace(tmp, F)
+    print(f"{a[1]} action -> {a[2]}")
+elif cmd == "field" and len(a) == 4 and a[2] == "q":
+    sys.exit("set the question link with: fm q <id> <discord-url>")
+elif cmd == "field" and len([x for x in a if x != "--force"]) == 4 and a[2] in FIELDS:
+    force = "--force" in a
+    a = [x for x in a if x != "--force"]
+    if a[2] == "src":
+        need_discord("src", a[3])
+    if a[2] == "bootGate" and a[3] != "-":
+        if a[3] == "now":
+            try:
+                a[3] = open("/proc/sys/kernel/random/boot_id").read().strip()
+            except OSError as e:
+                sys.exit(f"bootGate now: cannot read the boot id ({e})")
+        if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", a[3]):
+            sys.exit("bootGate takes `now` or a boot id (/proc/sys/kernel/random/boot_id)")
+    if a[2] == "job" and a[3] != "-" and not force:
+        check_job_tags(a[1], [x.strip() for x in a[3].split(",") if x.strip()])
+    with open(F + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = load()
+        it = next((i for i in d["items"] if i.get("id") == a[1]), None)
+        if not it:
+            sys.exit(f"no item {a[1]}")
+        if a[2] in ("blockedBy", "blocks") and a[3] != "-":
+            refuse_links(d["items"], a[1], a[2], [x.strip() for x in a[3].split(",") if x.strip()], force)
+        if a[3] == "-":
+            it.pop(a[2], None)
+        elif a[2] in LISTS and "," in a[3]:
+            it[a[2]] = [x.strip() for x in a[3].split(",") if x.strip()]
+        elif a[2] in ("owner", "gate"):
+            it[a[2]] = a[3].lower() in ("1", "true", "yes")
+        else:
+            it[a[2]] = a[3]
+        tidy(it)
+        if a[2] != "auto":
+            touch(it)  # bookkeeping: only the ?since= stamp + by, so `changed` stays the status time (fm-autoclear R1)
+        if os.environ.get("FM_AUTO") and a[2] != "auto":
+            it["auto"] = time.strftime("%Y-%m-%d %H:%M") + " " + os.environ["FM_AUTO"][:120]
+        d["updated"] = time.strftime("%Y-%m-%d %H:%M %Z")
+        tmp = F + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=0, ensure_ascii=False)
+        os.replace(tmp, F)
+    print(f"{a[1]} {a[2]} -> {a[3]}")
+elif cmd == "add" and len(a) >= 5 and a[2] in STATUSES:
+    rest = a[4:]; note = ""; links = {}
+    if "--action" in rest:
+        k = rest.index("--action")
+        if k + 1 >= len(rest) or not rest[k + 1].strip():
+            sys.exit("--action needs the owner's step(s)")
+        links["action"] = rest[k + 1].strip(); rest = rest[:k] + rest[k + 2:]
+    for flag in ("--q", "--src"):
+        if flag in rest:
+            k = rest.index(flag)
+            if k + 1 >= len(rest):
+                sys.exit(f"{flag} needs a value")
+            links[flag[2:]] = rest[k+1]; rest = rest[:k] + rest[k+2:]
+    for k, v in links.items():
+        if k != "action":
+            need_discord(k, v)
+    if a[2] in ("waiting", "open") and "action" not in links:
+        sys.exit(f"{a[2]} cards need --action \"<step>; <step>\": the concrete step(s) only the owner can do (owner 2026-10-25)")
+    if a[2] == "waiting" and "q" not in links:
+        sys.exit("waiting cards need --q <menu message url> (an ask menu or Approve button; owner 2026-10-25)")
+    if a[2] == "blocked" and not ({"q", "src"} & links.keys()):
+        sys.exit("waiting/blocked cards need --q <question url> or --src <message url>")
+    if "--" in rest: k = rest.index("--"); note = " ".join(rest[k+1:]); rest = rest[:k]
+    with open(F + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = load()
+        if any(i.get("id") == a[1] for i in d["items"]): sys.exit(f"id exists: {a[1]}")
+        new = {"id": a[1], "t": " ".join(rest), "area": a[3], "s": a[2], "n": note, "changed": time.strftime("%Y-%m-%d %H:%M"), "cts": int(time.time() * 1000), "by": who(), **links}
+        tidy(new)
+        d["items"].insert(0, new)
+        d["updated"] = time.strftime("%Y-%m-%d %H:%M %Z")
+        tmp = F + ".tmp"
+        with open(tmp, "w") as f: json.dump(d, f, indent=0, ensure_ascii=False)
+        os.replace(tmp, F)
+    print(f"added {a[1]}")
+elif cmd == "receipt" and len(a) >= 4 and a[2] in RESULTS:
+    # Worker-done receipt (Orca #3, 2026-10-19). Only the receipt file is written here; fm-autoclear applies it to the card.
+    iid = a[1]
+    if not iid or "/" in iid or iid.startswith("."):
+        sys.exit(f"bad card id: {iid}")
+    if not any(i.get("id") == iid for i in load()["items"]):
+        sys.exit(f"no item {iid}")
+    rest, ev, extra = a[3:], [], {}
+    while "--evidence" in rest:
+        k = rest.index("--evidence")
+        if k + 1 >= len(rest):
+            sys.exit("--evidence needs a value")
+        ev.append(rest[k + 1][:300]); rest = rest[:k] + rest[k + 2:]
+    for flag, key in (("--q", "q"), ("--src", "src"), ("--blocked-by", "blockedBy"), ("--verified", "verified"),
+                      ("--flow", "flow")):
+        if flag in rest:
+            k = rest.index(flag)
+            if k + 1 >= len(rest):
+                sys.exit(f"{flag} needs a value")
+            extra[key] = rest[k + 1][:300]; rest = rest[:k] + rest[k + 2:]
+    if "verified" in extra and extra["verified"] not in VERIFIED:
+        sys.exit(f"--verified must be one of: {', '.join(VERIFIED)}")
+    if a[2] == "done":
+        # Standard flow gate (owner 2026-10-31, card sdlc-standard-flow, flow.md): live|tests + evidence; full flow
+        # also needs a CI/review item. Flow: --flow, else the card's task file / tasks/<id>.md `Flow:` line.
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        import fm_flow
+        flow = extra.get("flow")
+        if flow is not None and flow not in fm_flow.FLOWS:
+            sys.exit("--flow must be full or short")
+        if flow is None:
+            item = next((i for i in load()["items"] if i.get("id") == iid), {})
+            tdir = os.path.join(os.path.dirname(F), "tasks")
+            flow = fm_flow.flow_from_files([os.path.expanduser(item.get("task") or ""),
+                                            os.path.join(tdir, iid + ".md"), os.path.join(tdir, iid + "-task.md")])
+        refusal = fm_flow.done_gate(extra.get("verified"), ev, flow)
+        if refusal:
+            sys.exit(refusal)
+        if flow:
+            extra["flow"] = flow
+    for key in ("q", "src"):
+        if key in extra:
+            need_discord("--" + key, extra[key])
+    if "blockedBy" in extra:
+        extra["blockedBy"] = [x.strip() for x in extra["blockedBy"].split(",") if x.strip()]
+        refuse_links(load()["items"], iid, "blockedBy", extra["blockedBy"], force=True,
+                     why="kept in the receipt; fm-autoclear will not copy it onto the card")  # missing id: warn only
+    dnone = "--decisions-none" in rest
+    rest = [x for x in rest if x != "--decisions-none"]
+    summary = " ".join(rest).strip()
+    if not summary:
+        sys.exit("a receipt needs a summary")
+    if a[2] == "done" and not dnone and not extra.get("q"):
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        try:
+            import fm_decisions
+            open_d = fm_decisions.receipt_decisions({"summary": summary, "evidence": ev})
+        except Exception as e:  # never block a receipt on a broken checker
+            print(f"warning: decisions check skipped: {e}", file=sys.stderr); open_d = []
+        if open_d:
+            sys.exit(fm_decisions.REFUSE.format(where=f"{len(open_d)} item(s), first: {open_d[0][:120]}"))
+    if dnone:
+        extra["decisionsNone"] = True
+    now = time.time()
+    rec = {"card": iid, "result": a[2], "summary": summary[:600], "evidence": ev[:20],
+           "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)), "tsMs": int(now * 1000),
+           "pane": os.environ.get("HERDR_PANE_ID", ""), "by": who(), **extra}
+    os.makedirs(RECEIPTS, exist_ok=True)
+    path = os.path.join(RECEIPTS, iid + ".json")
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(rec, f, indent=1, ensure_ascii=False)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, path)
+    print(f"receipt {iid} {a[2]} -> {path}")
+    n = coord_release(iid)  # the job ended: its claims and waits end too (card agent-coordination-protocol)
+    if n:
+        print(f"{iid}: {n} claim(s) released")
+elif cmd == "why" and len(a) == 2:
+    # Dependency track (owner 2026-10-23, card blocker-tracks): blockedBy chain to its root leaves + root class.
+    # Same rules as src/blockers.ts: owner | bot | external | unknown.
+    items = load()["items"]
+    by = {i.get("id"): i for i in items}
+    title = {str(i.get("t", "")).lower(): i.get("id") for i in items if i.get("t")}
+    now = time.time()
+    def gate(i):  # until as epoch seconds, or None
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(str(i["until"]).replace("Z", "+00:00")).timestamp() if i.get("until") else None
+        except ValueError:
+            return None
+    def cleared(i):
+        g = gate(i)
+        return i.get("s") == "done" or (g is not None and g <= now)
+    def lst(v):
+        return [str(x) for x in (v if isinstance(v, list) else [v] if v else []) if x]
+    res = lambda r: r if r in by else title.get(r.lower(), r)
+    edges = {i.get("id"): [res(r) for r in lst(i.get("blockedBy")) if res(r) != i.get("id")] for i in items}
+    for i in items:  # reverse `blocks` edges, as on the dashboard
+        for d in map(res, lst(i.get("blocks"))):
+            if d in edges and d != i.get("id") and i.get("id") not in edges[d]:
+                edges[d].append(i.get("id"))
+    def open_refs(it):  # a parked backlog card (not a gate) is no open blocker (card mainblocker-backlog)
+        return [r for r in edges.get(it.get("id"), []) if r not in by or not (cleared(by[r]) or parked(by[r]))]
+    def ref_class(ref):
+        if re.match(r"(?i)(ext|time):", ref): return "external"
+        if re.match(r"(?i)(ci|job|unit|agent|pane):", ref) or re.search(r"\.(timer|service)$", ref): return "bot"
+        return "unknown"
+    def leaf_class(it):
+        if str(it.get("action") or "").strip() and not it.get("queued") and (it.get("s") in ("waiting", "open") or (it.get("s") == "blocked" and (it.get("q") or it.get("src")))): return "owner"
+        if it.get("queued") and it.get("s") != "done": return "bot"
+        g = gate(it)
+        if it.get("ext") or (g is not None and g > now): return "external"
+        if it.get("s") == "running" or it.get("job"): return "bot"
+        return "unknown"
+    if a[1] not in by:
+        sys.exit(f"no item {a[1]}")
+    leaves = {}
+    def walk(cur, chain, seen):
+        it = by.get(cur)
+        if it is None:
+            leaves.setdefault(cur, (ref_class(cur), chain)); return
+        nxt = open_refs(it)
+        own = leaf_class(it)
+        if not nxt or (len(chain) > 1 and own in ("owner", "external")):
+            leaves.setdefault(cur, (own, chain))
+            if not nxt: return
+        for r in nxt:
+            if r in seen:
+                leaves.setdefault(r, ("unknown (cycle)", chain + [r])); continue
+            walk(r, chain + [r], seen | {r})
+    walk(a[1], [a[1]], {a[1]})
+    for r in edges.get(a[1], []):
+        if r in by and not cleared(by[r]) and parked(by[r]):
+            print(f"parked: {r} (backlog; no blocker)")
+    for lid, (cls, chain) in leaves.items():
+        if chain == [a[1]]:
+            print(f"{a[1]}: no open blockers ({cls})"); continue
+        it = by.get(lid) or {}
+        link = it.get("q") or it.get("src") or it.get("job") or ""
+        print(f"{cls:8} {' <- '.join(reversed(chain))}" + (f"  [{link}]" if link else ""))
+elif cmd == "beat" and len(a) >= 2:
+    with open(F + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = load()
+        it = next((i for i in d["items"] if i.get("id") == a[1]), None)
+        if not it:
+            sys.exit(f"no item {a[1]}")
+        it["beat"] = int(time.time() * 1000)  # heartbeat only: changed/cts/by/hist stay as they are
+        tidy(it)
+        if len(a) > 2:
+            it["beatNote"] = " ".join(a[2:])[:160]
+        tmp = F + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=0, ensure_ascii=False)
+        os.replace(tmp, F)
+    if len(a) > 2:  # a beat note is also the job's board status (card agent-coordination-protocol)
+        try:
+            fc = coord_mod()
+            with fc.locked(coord_path()) as cd:
+                fc.set_status(cd, a[1], " ".join(a[2:]), os.environ.get("HERDR_PANE_ID", ""), fc.now_ms())
+        except Exception as e:  # the beat is saved; a board write must never fail it
+            print(f"warning: board status not written: {e}", file=sys.stderr)
+    print(f"{a[1]} beat")
+elif cmd in ("claim", "release", "claims", "status", "board"):
+    coord_cmd(cmd, a[1:])
+else:
+    sys.exit(__doc__)

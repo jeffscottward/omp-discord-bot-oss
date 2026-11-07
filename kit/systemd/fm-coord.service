@@ -1,0 +1,8 @@
+[Unit]
+Description=FIRSTMATE per-stack coordinator: claims, overlaps, waits (no LLM; card agent-coordination-protocol)
+[Service]
+Type=oneshot
+Nice=10
+TimeoutStartSec=120
+Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env python3 @KIT@/bin/fm-coord

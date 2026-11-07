@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh FIRSTMATE running.json every 30 s
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30s
+AccuracySec=5s
+[Install]
+WantedBy=timers.target

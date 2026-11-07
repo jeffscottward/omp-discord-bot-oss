@@ -1,0 +1,22 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Test environment (models fixture, git identity, headless Chrome)
+        run: |
+          mkdir -p ~/.omp/agent && cp test/fixtures/ci-models.yml ~/.omp/agent/models.yml
+          git config --global user.email ci@example.local && git config --global user.name ci
+          # CI only: the runner's Chrome may lack a usable sandbox; never use --no-sandbox on a real host.
+          printf '#!/bin/sh\nexec %s --no-sandbox "$@"\n' "$(command -v google-chrome || command -v chromium)" > "$RUNNER_TEMP/ci-chrome"
+          chmod +x "$RUNNER_TEMP/ci-chrome" && echo "OMP_TABLES_CHROME=$RUNNER_TEMP/ci-chrome" >> "$GITHUB_ENV"
+      - run: bun install --frozen-lockfile
+      - run: bunx tsc --noEmit -p .
+      - run: bun test test/
+      - run: bun test src/
+      - run: bun run lint:mentions

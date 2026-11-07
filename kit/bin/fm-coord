@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""fm-coord: the per-stack coordinator (owner 2026-11-04, card agent-coordination-protocol).
+
+A timer loop (fm-coord.timer, every 5 min), never a Herdr tab or agent session: it takes no stack slot and does not
+count toward the 30-tab cap. No LLM. One pass handles every active stack (a stack with a running card) on its own.
+
+Per stack it reads the live board (items.json running cards, coord.json claims/status/waits, running.json jobs) and
+finds:
+  overlap    two running jobs in the same checkout folder (not separate worktrees), or overlapping live claims
+  duplicate  one card with two live job panes
+  stale      a claim whose job ended (receipt, card done, pane closed, 30 min without beat or pane activity):
+             it is dropped from coord.json
+  wait       a job waits on a resource (refused fm claim) that another live job holds
+  free       a job waited on a resource that is free now (the wait is removed)
+Then, once per incident (ledger ~/.cache/fm-coord/ledger.json; a resolved incident is not raised again for 24 h):
+  (a) ONE line per stack per run in the stack's thread under FIRSTMATE (bot /post), listing the new incidents;
+  (b) one prompt to each affected job pane, only through the safe path: a pane fm-spawn started (spawned.jsonl), an
+      OMP agent, not focused, not blocked on input, not the owner's FIRSTMATE pane (herdr agent prompt);
+  (c) a split/merge proposal on the card (`fm field <card> coord "🤝 ..."`), removed when the incident ends.
+It never starts, stops or changes jobs, never touches finance, and does nothing while pause-all or the maintenance
+pause is on; cards paused/stopped by the owner or yielded to a finance request are never prompted or annotated.
+Usage: fm-coord [--dry-run] [--json] [--stack S]
+"""
+import json, os, re, subprocess, sys, time, urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import fm_coord as fc  # noqa: E402
+
+HOME = os.path.expanduser("~")
+FM_DIR = os.environ.get("FM_DIR") or os.path.join(os.environ.get("REPORTS_WEB_DIR") or os.path.join(HOME, "Documents/reports/web"), "firstmate")
+ITEMS = os.environ.get("FM_ITEMS") or os.path.join(FM_DIR, "items.json")
+RUNNING = os.environ.get("FM_RUNNING") or os.path.join(os.path.dirname(ITEMS), "running.json")
+RECEIPTS = os.path.join(os.path.dirname(ITEMS), "receipts")
+COORD = fc.path_for(ITEMS)
+RUN_OUT = os.path.join(os.path.dirname(ITEMS), "coord-run.json")
+STATE = os.environ.get("FM_COORD_STATE") or os.path.join(HOME, ".cache/fm-coord")
+LEDGER = os.path.join(STATE, "ledger.json")
+LOG = os.path.join(STATE, "fm-coord.log")
+BOT_STATE = os.path.join(HOME, ".local/share/omp-discord-bot")
+ROUTER = os.environ.get("FM_COORD_ROUTER") or os.path.join(BOT_STATE, "router/state.json")
+PAUSE_ALL = os.environ.get("FM_COORD_PAUSE") or os.path.join(BOT_STATE, "pause-all.json")
+YIELD = os.environ.get("FM_COORD_YIELD") or os.path.join(BOT_STATE, "finance-yield.json")
+MAINT = os.environ.get("FM_COORD_MAINT") or os.path.join(HOME, ".local/state/omp-maintenance/paused.json")
+SPAWNED = os.path.join(os.environ.get("FM_SPAWN_STATE") or os.path.join(HOME, ".local/state/fm-spawn"), "spawned.jsonl")
+POST_URL = os.environ.get("FM_COORD_POST_URL") or f"http://127.0.0.1:{os.environ.get('OMP_BOT_HTTP_PORT') or 47821}/post"
+HERDR = os.environ.get("FM_COORD_HERDR") or "herdr"
+FM = os.path.join(HERE, "fm")
+KEEP_MS = 24 * 3600 * 1000
+KEEP_LABELS = {"firstmate"}  # the owner's pane: never prompted
+STOPNOTE = re.compile(r"⏹️ ?(Stopped|Paused)|⏸️ ?frozen|stopped by (the )?owner", re.I)  # fm-autoclear R13
+FIN_RE = re.compile(r"[$€£]\s?\d|\b\d{1,3}(?:,\d{3})+|\b\d[\d,.]*\s?(?:shares?|contracts?|usd|dollars?)\b"
+                    r"|\b(?:sell|buy|short|cover)\s+\d|\b[Uu]\d{6,}\b|\bacct\b|\baccount\b", re.I)  # = fm-overseer
+PROPOSAL = "🤝 "
+
+
+def jload(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def jsave(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def log(msg):
+    os.makedirs(STATE, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+
+
+def herdr_panes():
+    """Live Herdr panes (dicts), or None when Herdr does not answer."""
+    try:
+        out = subprocess.run([HERDR, "pane", "list"], capture_output=True, text=True, timeout=5).stdout
+        return json.loads(out)["result"]["panes"]
+    except Exception:
+        return None
+
+
+def realdir(p):
+    p = os.path.expanduser(str(p or ""))
+    return os.path.realpath(p) if p else ""
+
+
+# ---- detection (pure) ----
+def detect(stack, cards, d, live, dead, jobs, now):
+    """Incidents of one stack: [{key, kind, cards, text, proposal?, prompt: {card: text}}]."""
+    inc = []
+    run_cards = {c["id"] for c in cards.values() if c.get("s") == "running" and fc.stack_of(c) == stack}
+    # working job panes per card from running.json (one card may name several panes). Idle/done panes are not jobs
+    # that clash; several cards on ONE pane are one job.
+    panes_of, pane_cwd = {}, {}
+    for j in jobs:
+        if j.get("status") != "working":
+            continue
+        for cid in j.get("items") or []:
+            if cid in run_cards:
+                panes_of.setdefault(cid, []).append(j.get("id"))
+                pane_cwd[j.get("id")] = realdir(j.get("cwd"))
+    for cid, ps in sorted(panes_of.items()):
+        if len(set(ps)) > 1:
+            inc.append({"key": f"duplicate:{cid}", "kind": "duplicate", "cards": [cid],
+                        "text": f"card `{cid}` has {len(set(ps))} live job panes ({', '.join(sorted(set(ps)))})",
+                        "proposal": f"{PROPOSAL}two live jobs on this card ({', '.join(sorted(set(ps)))}): merge into one, stop the other",
+                        "prompt": {cid: f"card {cid} has two live job panes ({', '.join(sorted(set(ps)))}). Agree which one continues; "
+                                        "the other writes its receipt (fm receipt ... blocked --blocked-by) and stops."}})
+    by_cwd = {}  # cwd -> {pane: [cards]}
+    for cid, ps in panes_of.items():
+        for p in set(ps):
+            if pane_cwd.get(p):
+                by_cwd.setdefault(pane_cwd[p], {}).setdefault(p, []).append(cid)
+    for cwd, per_pane in sorted(by_cwd.items()):
+        if len(per_pane) < 2:
+            continue
+        cids = sorted({c for cs in per_pane.values() for c in cs})
+        other = lambda me: ", ".join(x for x in cids if x != me)
+        inc.append({"key": f"overlap:{cwd}:{','.join(cids)}", "kind": "overlap", "cards": cids,
+                    "text": f"{' + '.join(f'`{c}`' for c in cids)} work in the same checkout `{cwd}`",
+                    "proposal": None, "proposals": {c: f"{PROPOSAL}same checkout as {other(c)} ({cwd}): split (own worktree, "
+                                                       f"fm claim the file area) or merge into one job" for c in cids},
+                    "prompt": {c: f"jobs {', '.join(cids)} work in the same checkout {cwd}. Before your next step run "
+                                  f"`fm board --stack {stack}`, claim your file area (`fm claim {c} file:<repo>:<glob>`) and "
+                                  "agree with the other job who edits what, or move to your own worktree." for c in cids}})
+    mine = [c for c in live if c["card"] in run_cards]
+    seen = set()
+    for i, a in enumerate(mine):
+        for b in mine[i + 1:]:
+            if a["card"] != b["card"] and fc.overlaps(a["resource"], b["resource"]):
+                pair = tuple(sorted((a["card"], b["card"])))
+                k = f"overlap-claim:{pair[0]},{pair[1]}:{min(a['resource'], b['resource'])}"
+                if k in seen:
+                    continue
+                seen.add(k)
+                inc.append({"key": k, "kind": "overlap", "cards": list(pair),
+                            "text": f"`{a['card']}` holds {a['resource']} and `{b['card']}` holds {b['resource']}",
+                            "proposal": None, "proposals": {c: f"{PROPOSAL}claim overlap with {pair[1] if c == pair[0] else pair[0]}: split the area" for c in pair},
+                            "prompt": {c: f"your claim overlaps the claim of card {pair[1] if c == pair[0] else pair[0]} "
+                                          f"({a['resource']} / {b['resource']}). Agree a split and fm release what you do not need." for c in pair}})
+    for c, why in dead:
+        if fc.stack_of(cards.get(c["card"]) or {}) != stack:
+            continue
+        inc.append({"key": f"stale:{c['card']}:{c['resource']}:{c.get('ts')}", "kind": "stale", "cards": [c["card"]],
+                    "text": f"stale claim {c['resource']} of `{c['card']}` dropped ({why})", "prompt": {}})
+    for w in d.get("waits") or []:
+        waiter = w.get("card")
+        if waiter not in run_cards:
+            continue
+        holder = next((c for c in live if c["card"] != waiter and fc.overlaps(w["resource"], c["resource"])), None)
+        if holder:
+            inc.append({"key": f"wait:{waiter}:{w['resource']}:{holder['card']}", "kind": "wait",
+                        "cards": [waiter, holder["card"]],
+                        "text": f"`{waiter}` waits on {w['resource']} held by `{holder['card']}`",
+                        "prompt": {holder["card"]: f"card {waiter} waits on {w['resource']}, which you hold "
+                                                   f"({holder['resource']}). When you are done with it run "
+                                                   f"`fm release {holder['card']} {holder['resource']}`; if you need it "
+                                                   "longer, say so in your status (fm status)."}})
+        else:
+            inc.append({"key": f"free:{waiter}:{w['resource']}:{w.get('ts')}", "kind": "free", "cards": [waiter],
+                        "text": f"{w['resource']} is free again (`{waiter}` waited on it)", "drop_wait": w,
+                        "prompt": {waiter: f"{w['resource']} is free now: claim it with `fm claim {waiter} {w['resource']}`."}})
+    return inc
+
+
+def safe(text, stack):
+    return "details on the card (finance stack)" if stack == "finance" and FIN_RE.search(text) else text
+
+
+def post(channel, text):
+    try:
+        req = urllib.request.Request(POST_URL, data=json.dumps({"channel": channel, "text": text}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return True, (json.loads(r.read() or b"{}") or {}).get("url", "")
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def prompt_ok(pane, panes, spawned, card, cards, yielded):
+    """(ok, why): only fm-spawned OMP panes of a card the owner did not pause, and only when typing is safe (the
+    same rule as the bot's JobQueue #idle, src/jobqueue.ts + src/firstmate.ts): the agent is idle/done, the pane is
+    not focused, its session's last turn is a finished assistant turn (no open ask menu, no tool running), and the
+    input box is empty (no owner draft). Herdr may call a working pane idle, so the session and screen decide."""
+    c = cards.get(card) or {}
+    if STOPNOTE.search(str(c.get("n") or "")) or card in yielded:
+        return False, "card paused/stopped/yielded by the owner"
+    if pane not in spawned:
+        return False, "not an fm-spawn pane"
+    p = next((x for x in panes or [] if x.get("pane_id") == pane), None)
+    if p is None:
+        return False, "pane gone or Herdr unavailable"
+    if p.get("focused"):
+        return False, "pane focused; not typing into it"
+    if p.get("agent") != "omp":
+        return False, "pane is not an OMP agent"
+    try:
+        a = json.loads(subprocess.run([HERDR, "agent", "get", pane], capture_output=True, text=True, timeout=5).stdout)["result"]["agent"]
+        tab = json.loads(subprocess.run([HERDR, "tab", "get", str(a.get("tab_id") or p.get("tab_id"))], capture_output=True,
+                                        text=True, timeout=5).stdout)["result"]["tab"]
+    except Exception:
+        return False, "agent state unreadable"
+    if str(tab.get("label") or "").strip().lower() in KEEP_LABELS:
+        return False, "owner pane"
+    if a.get("agent_status") not in ("idle", "done"):
+        return False, f"agent {a.get('agent_status')}; prompt waits for an idle turn"
+    sess = (a.get("agent_session") or {}).get("value")
+    if (a.get("agent_session") or {}).get("kind") != "path" or not str(sess or "").endswith(".jsonl"):
+        return False, "no session file"
+    ok, why = session_idle(read_tail(sess))
+    if not ok:
+        return False, why
+    try:
+        screen = subprocess.run([HERDR, "agent", "read", pane, "--source", "visible", "--lines", "6"], capture_output=True,
+                                text=True, timeout=5)
+    except Exception:
+        return False, "input box unreadable"
+    if screen.returncode != 0:
+        return False, "input box unreadable"
+    return editor_empty(screen.stdout)
+
+
+AFTER_TURN = {"model_usage", "title_change", "thinking_level_change", "model_change", "service_tier_change",
+              "custom:todo_hud_state", "credential_pin", "mode_change", "custom_message:advisor"}  # = src/firstmate.ts
+
+
+def read_tail(path, size=1024 * 1024):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            n = f.tell()
+            f.seek(max(0, n - size))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def session_idle(tail):
+    """Port of src/firstmate.ts sessionIdle: the last turn entry must be a finished assistant turn."""
+    if tail is None:
+        return False, "session unreadable"
+    if not tail.endswith("\n"):
+        return False, "session is being written"
+    for line in reversed([l for l in tail.split("\n") if l.strip()]):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            return False, "session unreadable"
+        kind = f"{e.get('type')}:{e['customType']}" if e.get("customType") else str(e.get("type"))
+        if kind in AFTER_TURN:
+            continue
+        m = e.get("message") or {}
+        if e.get("type") == "message" and m.get("role") == "assistant" and m.get("stopReason") == "stop":
+            return True, ""
+        return False, "turn in progress"
+    return False, "no completed turn"
+
+
+_STATUS_BAR = re.compile("^\ue0b6.*\ue0b0")
+_EMPTY_HINT = re.compile(r"^\s{10,}(?:←\s*)*to see \d+ running agents?\s*$")
+
+
+def editor_empty(screen):
+    """Port of src/firstmate.ts editorEmpty: OMP's status bar, then an editor line '╰─' with nothing typed."""
+    lines = screen.replace("\r", "").rstrip("\n").split("\n")
+    i = len(lines) - 1
+    while i >= 0 and not lines[i].startswith("╰─"):
+        i -= 1
+    if i < 1 or not _STATUS_BAR.search(lines[i - 1]):
+        return False, "input box not recognized"
+    rest = lines[i][2:]
+    if (rest.strip() and not _EMPTY_HINT.match(rest)) or any(l.strip() for l in lines[i + 1:]):
+        return False, "input box not empty"
+    return True, ""
+
+
+def fm_field(card, value, dry):
+    if dry:
+        return True
+    r = subprocess.run([FM, "field", card, "coord", value], capture_output=True, text=True, timeout=30,
+                       env={**os.environ, "FM_AUTO": "fm-coord"})
+    return r.returncode == 0
+
+
+def main(argv):
+    dry, as_json = "--dry-run" in argv, "--json" in argv
+    only = argv[argv.index("--stack") + 1] if "--stack" in argv and argv.index("--stack") + 1 < len(argv) else None
+    now = fc.now_ms()
+    out = {"at": now, "dryRun": dry, "stacks": {}}
+    pa = jload(PAUSE_ALL, None)
+    if os.path.exists(MAINT) or (isinstance(pa, dict) and pa.get("kind", "all") == "all"):
+        out["skipped"] = "paused (pause-all)" if os.path.exists(PAUSE_ALL) else "paused (maintenance)"
+        print(json.dumps(out) if as_json else out["skipped"])
+        return 0
+    yielded = {c.get("id") for c in (pa or {}).get("cards") or []} if isinstance(pa, dict) else set()
+    items = (jload(ITEMS, {}) or {}).get("items") or []
+    cards = {i["id"]: i for i in items if isinstance(i, dict) and i.get("id")}
+    ys = jload(YIELD, None)
+    if isinstance(ys, dict):
+        yielded |= {c.get("id") for c in ys.get("cards") or []}
+    running = jload(RUNNING, {})
+    jobs = running.get("jobs") or [] if isinstance(running, dict) and running.get("jobsOk") else []
+    panes = herdr_panes()
+    live_p = None if panes is None else {str(v).lower() for p in panes for v in (p.get("pane_id"), p.get("tab_id")) if v}
+    receipt = lambda c: fc.receipt_ms(RECEIPTS, c)
+    active = fc.job_activity(RUNNING, now)
+    if dry:
+        d = fc.read(COORD)
+        live, dead = fc.split_live(d, cards, receipt, live_p, now, active)
+    else:
+        with fc.locked(COORD) as d:  # stale claims leave the file here
+            live, dead = fc.split_live(d, cards, receipt, live_p, now, active)
+            d["claims"] = live
+    spawned = set()
+    for line in open(SPAWNED) if os.path.exists(SPAWNED) else []:
+        try:
+            spawned.add(json.loads(line).get("pane"))
+        except ValueError:
+            pass
+    threads = (jload(ROUTER, {}) or {}).get("threads") or {}
+    ledger = jload(LEDGER, {"incidents": {}})
+    seen_now, drop_waits = set(), []
+    stacks = sorted({fc.stack_of(c) for c in cards.values() if c.get("s") == "running"} |
+                    {fc.stack_of(cards.get(c["card"]) or {}) for c, _ in dead})
+    for stack in stacks:
+        if only and stack != only:
+            continue
+        incs = detect(stack, cards, d, live, dead, jobs, now)
+        res = {"incidents": [{k: v for k, v in i.items() if k in ("key", "kind", "cards", "text")} for i in incs],
+               "posts": [], "prompts": [], "proposals": {}, "posted": None}
+        new = []
+        for i in incs:
+            seen_now.add(i["key"])
+            led = ledger["incidents"].setdefault(i["key"], {"first": now, "stack": stack, "prompted": []})
+            led["last"] = now
+            if not led.get("posted"):
+                new.append(i)
+            if i.get("drop_wait"):
+                drop_waits.append(i["drop_wait"])
+            for cid, text in (i.get("prompt") or {}).items():
+                if cid in led["prompted"]:
+                    continue
+                for pane in [t.strip() for t in str((cards.get(cid) or {}).get("job") or "").split(",") if t.strip()]:
+                    ok, why = prompt_ok(pane, panes, spawned, cid, cards, yielded)
+                    entry = {"card": cid, "pane": pane, "ok": ok, "why": why}
+                    if ok and not dry:
+                        msg = f"Coordinator (stack {stack}, card {cid}): {safe(text, stack)}"
+                        try:
+                            ok = subprocess.run([HERDR, "agent", "prompt", pane, msg], capture_output=True, timeout=15).returncode == 0
+                        except Exception:
+                            ok = False
+                        entry["ok"] = ok
+                        if ok:
+                            led["prompted"].append(cid)
+                        log(f"prompt {pane} card {cid} ({i['kind']}): {'ok' if ok else 'FAILED'}")
+                    res["prompts"].append(entry)
+            for cid, text in ((i.get("proposals") or {}) | ({i["cards"][0]: i["proposal"]} if i.get("proposal") else {})).items():
+                if cid not in cards or cid in yielded or STOPNOTE.search(str(cards[cid].get("n") or "")):
+                    continue
+                text = safe(text, stack)[:300]
+                res["proposals"][cid] = text
+                if cards[cid].get("coord") != text and fm_field(cid, text, dry):
+                    cards[cid]["coord"] = text
+        if new:
+            line = f"🤝 Coordinator · {stack}: " + " · ".join(safe(i["text"], stack) for i in new[:6])
+            if len(new) > 6:
+                line += f" · +{len(new) - 6} more"
+            line += " ⚓ item:" + ",".join(sorted({c for i in new for c in i["cards"]}))
+            ch = str(threads.get(stack) or "")
+            res["posts"].append({"channel": ch, "text": line})
+            if dry or not ch:
+                res["posted"] = False
+                if not ch and not dry:
+                    log(f"{stack}: no stack thread; not posted: {line}")
+            else:
+                ok, detail = post(ch, line)
+                res["posted"] = ok
+                log(f"{stack}: post {'ok ' + detail if ok else 'FAILED ' + detail}: {line}")
+                if ok:
+                    for i in new:
+                        ledger["incidents"][i["key"]]["posted"] = now
+            if not ch and not dry:  # no thread: mark posted so the line is not retried every 5 min
+                for i in new:
+                    ledger["incidents"][i["key"]]["posted"] = now
+        out["stacks"][stack] = res
+    # resolved incidents: remove their card proposals; forget them after KEEP_MS
+    for k, led in list(ledger["incidents"].items()):
+        if k in seen_now or (only and led.get("stack") != only):  # --stack S: other stacks' incidents stay as they are
+            continue
+        led.setdefault("resolved", now)
+        if now - led["resolved"] > KEEP_MS:
+            del ledger["incidents"][k]
+    open_cards = {c for s in out["stacks"].values() for c in s["proposals"]}
+    for cid, c in cards.items():
+        if str(c.get("coord") or "").startswith(PROPOSAL) and cid not in open_cards and (not only or fc.stack_of(c) == only):
+            fm_field(cid, "-", dry)
+    if not dry:
+        if drop_waits:
+            with fc.locked(COORD) as d2:
+                d2["waits"] = [w for w in d2.get("waits") or [] if w not in drop_waits]
+        jsave(LEDGER, ledger)
+        jsave(RUN_OUT, out)
+    if as_json:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        for s, r in out["stacks"].items():
+            print(f"{s}: {len(r['incidents'])} incident(s), {len(r['posts'])} post(s), "
+                  f"{sum(p['ok'] for p in r['prompts'])} prompt(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,14 @@
+# CI only: the Venice model ids tests expect (copied from the main host's ~/.omp/agent/models.yml, no keys).
+providers:
+  venice:
+    baseUrl: https://api.venice.ai/api/v1
+    api: openai-completions
+    models:
+      - id: zai-org-glm-5-2
+        name: GLM 5.2 (Venice)
+      - id: venice-uncensored-1-2
+        name: Venice Uncensored 1.2 (Venice)
+      - id: gemma-4-uncensored
+        name: Gemma 4 Uncensored (Venice)
+      - id: deepseek-v4-1-flash-1017
+        name: DeepSeek V4.1 Flash 1017 (Venice)

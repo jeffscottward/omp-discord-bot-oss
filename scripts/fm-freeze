@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""fm-freeze (card dev-freeze-gate, owner 2026-11-01): stop regular work until the dev setup is clean.
+
+  fm-freeze on [reason]   write the freeze flag (fm-spawn then holds every stack except firstmate and infra in its queue)
+  fm-freeze off           remove the flag (fm-tick starts the held spawns again)
+  fm-freeze status        print the flag and the last checker lines
+  fm-freeze check [--dry-run]
+                          run by fm-freeze-check.timer (every 2 min). While the flag is set: every RUNNING card of a
+                          regular stack whose job is a Herdr pane gets Escape (only when the pane is not focused) and
+                          `fm set <id> partial "⏸️ frozen by dev-freeze-gate ..."`; fm-autoclear R13 then unlinks the job.
+                          Never touched: firstmate/infra stacks, cards whose job is a unit (.service/.timer, remote:...;
+                          finance services such as a budget monitor), and the update cards.
+Flag: ~/.local/state/dev-freeze/frozen.json (FM_DEV_FREEZE). Log: ~/.local/state/dev-freeze/checker.log.
+"""
+import json, os, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+FLAG = os.environ.get("FM_DEV_FREEZE") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "dev-freeze", "frozen.json")
+LOG = os.path.join(os.path.dirname(FLAG), "checker.log")
+ITEMS = os.environ.get("FM_ITEMS") or os.path.join(HOME, "Documents/reports/web/firstmate/items.json")
+RUNNING = os.environ.get("FM_RUNNING") or os.path.join(os.path.dirname(ITEMS), "running.json")
+FM = os.environ.get("FM_BIN") or os.path.join(HOME, ".local/bin/fm")
+ALLOWED = {"firstmate", "infra"}
+PROTECTED = {"dev-freeze-gate", "herdr-unit-handoff", "herdr-095", "dev-stack-full-update"}
+NOTE = "⏸️ frozen by dev-freeze-gate: regular work waits until the dev setup is clean"
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+
+
+def tags(job):
+    return [t.strip() for t in (job if isinstance(job, list) else str(job or "").split(",")) if t.strip()]
+
+
+def is_unit(t):
+    return t.endswith((".service", ".timer")) or t.startswith("remote:") or ":" in t and t.split(":", 1)[1].endswith((".service", ".timer"))
+
+
+def panes_of(t, jobs):
+    """Pane ids for one job tag: the pane id itself, or ONE running.json job matched by pane id, tab id or tab label.
+    Codes (WEBAPP, FILTER) repeat across panes and never match; an ambiguous label matches nothing (review 2026-11-01)."""
+    low = t.lower()
+    hit = [j["id"] for j in jobs if low in {str(j.get(k) or "").lower() for k in ("id", "tab", "tabLabel")}]
+    if len(hit) == 1:
+        return hit
+    return [t] if not hit and ":p" in t else []
+
+
+def safe_to_interrupt(pane):
+    """True only when Herdr answers, the pane runs omp and is not focused. Unknown: never send keys."""
+    try:
+        r = subprocess.run(["herdr", "pane", "get", pane], capture_output=True, text=True, timeout=10)
+        p = json.loads(r.stdout)["result"]["pane"]
+        return r.returncode == 0 and p.get("agent") == "omp" and p.get("focused") is False
+    except Exception:
+        return False
+
+
+def plan(cards, jobs):
+    """[(card, [panes])] of running regular-stack cards to stop."""
+    out = []
+    for c in cards:
+        if c.get("s") != "running" or c.get("id") in PROTECTED or (c.get("stack") or "firstmate") in ALLOWED:
+            continue
+        ts = tags(c.get("job"))
+        if not ts or any(is_unit(t) for t in ts):
+            continue
+        out.append((c, sorted({p for t in ts for p in panes_of(t, jobs)})))
+    return out
+
+
+def check(dry):
+    if not os.path.exists(FLAG):
+        return 0
+    cards = json.load(open(ITEMS)).get("items", [])
+    try:
+        jobs = json.load(open(RUNNING)).get("jobs") or []
+    except Exception:
+        jobs = []
+    todo = plan(cards, jobs)
+    for c, panes in todo:
+        if dry:
+            print(f"DRY would stop {c['id']} (stack {c.get('stack')}, panes {panes or '-'})")
+            continue
+        sent = []
+        for p in panes:
+            if not safe_to_interrupt(p):
+                log(f"skip keys {p} ({c['id']}): pane focused, not omp or unknown")
+                continue
+            r = subprocess.run(["herdr", "agent", "send-keys", p, "esc"], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                sent.append(p)
+        if not sent:
+            # review 2026-11-01: a card whose pane still works would flip back to running (fm-autoclear R3); leave it
+            log(f"HELD-OVER {c['id']}: no Esc sent ({panes or 'no pane'}); card unchanged, next check retries")
+            continue
+        env = dict(os.environ, FM_BY="fm-freeze")
+        r = subprocess.run([FM, "set", c["id"], "partial", f"{NOTE} (job {','.join(tags(c.get('job')))})."],
+                           env=env, capture_output=True, text=True, timeout=20)
+        log(f"STOPPED {c['id']} stack {c.get('stack')} panes {panes} escape {sent} fm rc {r.returncode}")
+        print(f"stopped {c['id']}")
+    if not todo:
+        log("check: no regular-stack jobs running")
+    return 0
+
+
+def main():
+    a = sys.argv[1:] or ["status"]
+    if a[0] == "on":
+        os.makedirs(os.path.dirname(FLAG), exist_ok=True)
+        reason = " ".join(a[1:]) or "dev-freeze-gate"
+        with open(FLAG + ".tmp", "w") as f:
+            json.dump({"reason": reason, "since": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, f)
+        os.replace(FLAG + ".tmp", FLAG)
+        log(f"FREEZE ON: {reason}")
+        print(f"freeze on: {reason}")
+    elif a[0] == "off":
+        if os.path.exists(FLAG):
+            os.remove(FLAG)
+        log("FREEZE OFF")
+        print("freeze off")
+    elif a[0] == "check":
+        return check("--dry-run" in a)
+    elif a[0] == "status":
+        print(open(FLAG).read() if os.path.exists(FLAG) else "not frozen")
+        if os.path.exists(LOG):
+            print("".join(open(LOG).readlines()[-10:]), end="")
+    else:
+        sys.exit(__doc__)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

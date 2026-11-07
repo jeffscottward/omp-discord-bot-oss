@@ -1,0 +1,186 @@
+[
+ {
+  "__typename": "CheckRun",
+  "name": "Changes",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569369339/job/125698442472"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Changes",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698592475"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (${{ matrix.shard }})",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SKIPPED",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569369339/job/125698491564"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (1/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641391"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (2/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641515"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (3/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641499"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (4/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641442"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (5/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641500"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (6/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641463"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (7/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641549"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (8/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641525"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (9/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641422"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (10/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641487"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (11/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641522"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (12/12)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641545"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Coverage shard (acceptance)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641618"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Verification (core)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "CANCELLED",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569369339/job/125698489961"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Verification (core)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641277"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Verification (integration)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125698641246"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Verification (${{ matrix.lane }})",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SKIPPED",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569369339/job/125698491863"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "Verification (coverage)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125718258859"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "ci-gate (draft)",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "FAILURE",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569369339/job/125698515243"
+ },
+ {
+  "__typename": "CheckRun",
+  "name": "ci-gate",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "detailsUrl": "https://github.com/example-org/webapp-research/actions/runs/41569392453/job/125719866251"
+ }
+]

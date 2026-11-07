@@ -1,0 +1,10 @@
+[Unit]
+Description=Archive finished idle Discord mirror channels, close their idle Herdr tabs, ask the owner about unsure ones
+After=omp-discord-bot.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Github/tools/omp-discord-bot
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+Environment=CLEANUP_THRESHOLD_H=24
+ExecStart=/usr/bin/flock -n %t/channel-cleanup.lock %h/.local/share/mise/shims/bun scripts/channel-cleanup.ts --apply

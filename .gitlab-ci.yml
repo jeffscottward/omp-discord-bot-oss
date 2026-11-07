@@ -1,0 +1,28 @@
+# Optional GitLab CI (self-hosted runner). The GitHub workflow in .github/workflows/ci.yml runs the same checks.
+stages: [test]
+test:
+  stage: test
+  image: docker.io/oven/bun:1
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git python3 jq ca-certificates chromium procps curl nodejs >/dev/null
+    - git config --global user.email ci@main.local && git config --global user.name ci
+    - mkdir -p ~/.omp/agent && cp test/fixtures/ci-models.yml ~/.omp/agent/models.yml
+    # CI runs as root in a container: Chrome needs --no-sandbox there (never on the main host).
+    - printf '#!/bin/sh\nexec chromium --no-sandbox "$@"\n' > /usr/local/bin/ci-chrome && chmod +x /usr/local/bin/ci-chrome
+  variables:
+    OMP_TABLES_CHROME: ci-chrome
+  script:
+    - bun install --frozen-lockfile
+    - bunx tsc --noEmit -p .
+    # The whole suite, as the restart gate runs it (card bot-gate-flake): `test/` alone skipped the 15 src/*.test.ts
+    # files, so a failure there showed only at restart time.
+    - bun test --timeout 20000
+    - python3 scripts/test_fm_flow.py
+    - python3 scripts/fm_audit_jev_test.py
+    - python3 scripts/fm-audit --test
+    - bun run lint:mentions
+    # Card ci-kit-test-browser: the kit self-tests, including the dashboard browser e2e suites (puppeteer-core + chromium).
+    # CHROME_BIN must be an absolute path (lib.cjs checks it exists). The `has node` check needs real Node.js (apt nodejs above); bun's node fallback is not enough for puppeteer.
+    # kit/test.sh only skips the browser suites when node/puppeteer/Chrome is missing; CI fails on that skip.
+    - CHROME_BIN=/usr/local/bin/ci-chrome PUPPETEER_CORE="$CI_PROJECT_DIR/node_modules/puppeteer-core" bash -o pipefail -c 'bash kit/test.sh | tee /tmp/kit-test.log'
+    - if grep -q '^skip browser tests' /tmp/kit-test.log; then echo "browser tests were skipped"; exit 1; fi
