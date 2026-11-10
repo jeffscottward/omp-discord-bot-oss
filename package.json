@@ -6,7 +6,7 @@
   "scripts": {
     "start": "bun src/main.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit -p .",
+    "typecheck": "tsrs --noEmit -p .",
     "lint:mentions": "bash scripts/check-mentions.sh"
   },
   "devDependencies": {
